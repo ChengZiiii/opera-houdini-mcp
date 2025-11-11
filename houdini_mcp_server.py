@@ -8,22 +8,6 @@ and relays each command to the local Houdini plugin on port 9876.
 """
 import sys
 import os
-import site
-
-# Get the directory where the script is located
-script_dir = os.path.dirname(os.path.abspath(__file__))
-
-# Add the virtual environment's site-packages to Python's path
-venv_site_packages = os.path.join(script_dir, '.venv', 'Lib', 'site-packages')
-if os.path.exists(venv_site_packages):
-    sys.path.insert(0, venv_site_packages)
-    print(f"Added {venv_site_packages} to sys.path", file=sys.stderr)
-else:
-    print(f"Warning: Virtual environment site-packages not found at {venv_site_packages}", file=sys.stderr)
-
-
-# For debugging
-print("Python path:", sys.path, file=sys.stderr)
 import json
 import socket
 import logging
@@ -32,6 +16,9 @@ from typing import Dict, Any, List
 from contextlib import asynccontextmanager
 from mcp.server.fastmcp import FastMCP, Context
 import asyncio
+
+# Get the directory where the script is located (needed for dotenv path)
+script_dir = os.path.dirname(os.path.abspath(__file__))
 
 # --- OPUS Imports and Setup ---
 import requests
@@ -67,7 +54,12 @@ GET_JOB_RESULT_PATH = "/get_opus_job_result"
 TIMEOUT = 15 # seconds
 
 if not RAPIDAPI_HOST_URL or not RAPIDAPI_HOST or not RAPIDAPI_KEY:
-    print("Error: RAPIDAPI_HOST_URL, RAPIDAPI_HOST, and RAPIDAPI_KEY environment variables must be set in urls.env", file=sys.stderr)
+    print("Warning: RAPIDAPI_HOST_URL, RAPIDAPI_HOST, or RAPIDAPI_KEY not configured. OPUS API features will be disabled.", file=sys.stderr)
+    # Set URL variables to None for safety
+    GET_ATTRIBUTES_URL = None
+    CREATE_COMPONENT_URL = None
+    VARIATE_URL = None
+    GET_JOB_RESULT_URL = None
 else:
     # Construct full URLs
     GET_ATTRIBUTES_URL = urljoin(RAPIDAPI_HOST_URL, GET_ATTRIBUTES_PATH)
@@ -891,12 +883,13 @@ def main():
     """Run the MCP server on stdio."""
     # Check necessary RapidAPI variables are set before running
     if not RAPIDAPI_HOST_URL or not RAPIDAPI_HOST or not RAPIDAPI_KEY:
-         logger.critical("RAPIDAPI_HOST_URL, RAPIDAPI_HOST, and RAPIDAPI_KEY environment variables are not set. Please configure urls.env.")
-         logger.critical("Server will not start.")
-         sys.exit(1) # Exit if critical configuration is missing
-         
-    logger.info(f"Using RapidAPI Host URL: {RAPIDAPI_HOST_URL}")
-    logger.info(f"Using RapidAPI Host Header: {RAPIDAPI_HOST}")
+         logger.warning("RAPIDAPI_HOST_URL, RAPIDAPI_HOST, or RAPIDAPI_KEY not configured. OPUS API features will be disabled.")
+         logger.warning("To enable OPUS features, configure your RapidAPI key in urls.env")
+         # Don't exit - allow server to start without OPUS features
+    else:
+        logger.info(f"Using RapidAPI Host URL: {RAPIDAPI_HOST_URL}")
+        logger.info(f"Using RapidAPI Host Header: {RAPIDAPI_HOST}")
+
     logger.info(f"Langchain available: {LANGCHAIN_AVAILABLE}")
     mcp.run()
 

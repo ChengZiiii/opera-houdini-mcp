@@ -9,7 +9,21 @@ import traceback
 import os
 import shutil
 import sys
-from PySide2 import QtWidgets, QtCore
+# Try PySide6 first (Houdini 21.0+), fall back to PySide2 (older versions)
+try:
+    from PySide6 import QtWidgets, QtCore
+    print("Using PySide6 (Houdini 21.0+)")
+except ImportError:
+    try:
+        from PySide2 import QtWidgets, QtCore
+        print("Using PySide2 (Houdini 19.5-20.x)")
+    except ImportError:
+        print("Warning: Neither PySide6 nor PySide2 found. Some features may not work.")
+        # Create dummy classes to prevent import errors
+        class QtCore:
+            class QTimer:
+                pass
+        QtWidgets = None
 import io
 from contextlib import redirect_stdout, redirect_stderr
 import base64 # Added for encoding
