@@ -12,7 +12,6 @@ import sys
 from PySide2 import QtWidgets, QtCore
 import io
 from contextlib import redirect_stdout, redirect_stderr
-import base64 # Added for encoding
 
 # Imports for OPUS import
 import zipfile
@@ -202,43 +201,40 @@ class HoudiniMCPServer:
         return {"enabled": use_assetlib, "message": msg}
 
     def get_scene_info(self):
-        """Returns basic info about the current .hip file and a few top-level nodes."""
+        """Returns basic info about the current .hip file and top-level nodes per context."""
         try:
             hip_file = hou.hipFile.name()
             scene_info = {
                 "name": os.path.basename(hip_file) if hip_file else "Untitled",
                 "filepath": hip_file or "",
-                "node_count": len(hou.node("/").allSubChildren()),
-                "nodes": [],
                 "fps": hou.fps(),
                 "start_frame": hou.playbar.frameRange()[0],
                 "end_frame": hou.playbar.frameRange()[1],
+                "contexts": {},
             }
-            
-            # Collect limited node info from key contexts
+
+            # Collect per-context node summaries (avoids expensive allSubChildren traversal)
             root = hou.node("/")
             contexts = ["obj", "shop", "out", "ch", "vex", "stage"]
-            top_nodes = []
-            
+
             for ctx_name in contexts:
                 ctx_node = root.node(ctx_name)
                 if ctx_node:
                     children = ctx_node.children()
-                    for node in children:
-                        if len(top_nodes) >= 10:
-                            break
-                        top_nodes.append({
-                            "name": node.name(),
-                            "path": node.path(),
-                            "type": node.type().name(),
-                            "category": ctx_name,
-                        })
-                    if len(top_nodes) >= 10:
-                        break
-            
-            scene_info["nodes"] = top_nodes
+                    scene_info["contexts"][ctx_name] = {
+                        "count": len(children),
+                        "nodes": [
+                            {
+                                "name": node.name(),
+                                "path": node.path(),
+                                "type": node.type().name(),
+                            }
+                            for node in children[:20]
+                        ],
+                    }
+
             return scene_info
-        
+
         except Exception as e:
             traceback.print_exc()
             return {"error": str(e)}
@@ -332,9 +328,7 @@ class HoudiniMCPServer:
                 break
             node_info["parameters"].append({
                 "name": parm.name(),
-                "label": parm.label(),
                 "value": str(parm.eval()),
-                "raw_value": parm.rawValue(),
                 "type": parm.parmTemplate().type().name()
             })
 
@@ -666,42 +660,33 @@ class HoudiniMCPServer:
 
     def _process_rendered_image(self, filepath, camera_path=None, view_name=None):
         """
-        Helper to read, encode, get metadata, and clean up a rendered image file.
-        Returns a dictionary compatible with the expected tool output.
+        Helper to validate and return metadata for a rendered image file.
+        Returns the file path so the caller can open it directly — avoids
+        base64-encoding large image data into the response.
         """
         if not filepath or not os.path.exists(filepath):
             return {"status": "error", "message": f"Rendered file not found: {filepath}", "origin": "_process_rendered_image"}
-        
 
         # Determine format from extension
         _, ext = os.path.splitext(filepath)
-        format = ext[1:].lower() if ext else 'unknown'
+        fmt = ext[1:].lower() if ext else 'unknown'
 
         # Get resolution from the camera if possible
         resolution = [0, 0]
         if camera_path:
-                cam_node = hou.node(camera_path)
-                if cam_node and cam_node.parm("resx") and cam_node.parm("resy"):
-                    resolution = [cam_node.parm("resx").eval(), cam_node.parm("resy").eval()]
-                else: # Fallback for camera not found or no res parms
-                    print(f"Warning: Could not get resolution from camera {camera_path}")
-                    # Could try to get from image header, but complex. Returning 0,0
-                    pass
-        
-        # Read file and encode
-        with open(filepath, "rb") as image_file:
-            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-        
+            cam_node = hou.node(camera_path)
+            if cam_node and cam_node.parm("resx") and cam_node.parm("resy"):
+                resolution = [cam_node.parm("resx").eval(), cam_node.parm("resy").eval()]
+
         result_data = {
             "status": "success",
-            "format": format,
-            "resolution": resolution, 
-            "image_base64": encoded_string,
-            "filepath_on_server": filepath # For debugging, maybe remove later
+            "format": fmt,
+            "resolution": resolution,
+            "filepath": filepath,
         }
         if view_name:
-                result_data["view_name"] = view_name
-                
+            result_data["view_name"] = view_name
+
         return result_data
 
         # except Exception as e:
