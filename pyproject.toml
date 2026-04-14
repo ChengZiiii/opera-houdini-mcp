@@ -1,7 +1,7 @@
 [project]
 name = "houdinimcp"
 version = "0.1.0"
-description = "Add your description here"
+description = "MCP server enabling Claude Desktop to control SideFX Houdini via natural language"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
