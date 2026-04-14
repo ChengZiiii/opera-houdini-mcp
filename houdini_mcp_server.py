@@ -8,6 +8,11 @@ and relays each command to the local Houdini plugin on port 9876.
 """
 import sys
 import os
+import time
+
+# Get the directory where the script is located (needed for dotenv path)
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
 import json
 import socket
 import logging
@@ -17,19 +22,20 @@ from contextlib import asynccontextmanager
 from mcp.server.fastmcp import FastMCP, Context
 import asyncio
 
-# Get the directory where the script is located (needed for dotenv path)
-script_dir = os.path.dirname(os.path.abspath(__file__))
-
 # --- OPUS Imports and Setup ---
 import requests
 from dotenv import load_dotenv
 from urllib.parse import urljoin # To construct RapidAPI URLs
 try:
-    from langchain.output_parsers import ResponseSchema, StructuredOutputParser
+    from langchain_classic.output_parsers import ResponseSchema, StructuredOutputParser
     LANGCHAIN_AVAILABLE = True
 except ImportError:
-    LANGCHAIN_AVAILABLE = False
-    print("Warning: Langchain not found. opus_get_model_params_schema tool will be limited.", file=sys.stderr)
+    try:
+        from langchain.output_parsers import ResponseSchema, StructuredOutputParser
+        LANGCHAIN_AVAILABLE = True
+    except ImportError:
+        LANGCHAIN_AVAILABLE = False
+        print("Warning: Langchain not found. opus_get_model_params_schema tool will be limited.", file=sys.stderr)
 
 # Load environment variables from urls.env located in the script's directory
 dotenv_path = os.path.join(script_dir, 'urls.env')
@@ -51,7 +57,8 @@ CREATE_COMPONENT_PATH = "/create_opus_component" # Keep old path if needed elsew
 VARIATE_PATH = "/variate_opus_result"
 GET_JOB_RESULT_PATH = "/get_opus_job_result"
 
-TIMEOUT = 15 # seconds
+TIMEOUT = 15 # seconds for RapidAPI
+HOUDINI_CONNECTION_TIMEOUT = 300 # 5 minutes for Houdini operations (rendering can be slow)
 
 if not RAPIDAPI_HOST_URL or not RAPIDAPI_HOST or not RAPIDAPI_KEY:
     print("Warning: RAPIDAPI_HOST_URL, RAPIDAPI_HOST, or RAPIDAPI_KEY not configured. OPUS API features will be disabled.", file=sys.stderr)
@@ -407,7 +414,13 @@ class HoudiniConnection:
     def connect(self) -> bool:
         """Connect to the Houdini plugin (which is listening on self.host:self.port)."""
         if self.sock is not None:
-            return True  # Already connected
+            try:
+                self.sock.getpeername()
+                return True
+            except (OSError, socket.error):
+                logger.info("Stale socket detected, reconnecting...")
+                self.disconnect()
+
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.connect((self.host, self.port))
@@ -434,11 +447,10 @@ class HoudiniConnection:
         """
         if not self.connect():
             # Instead of raising, return an error dict consistent with API errors
-            error_msg = "Could not connect to Houdini on port 9876."
+            error_msg = f"Could not connect to Houdini on {self.host}:{self.port}."
             logger.error(error_msg)
             # Return structure similar to API failures
             return {"status": "error", "message": error_msg, "origin": "mcp_server_connection"}
-            # raise ConnectionError("Could not connect to Houdini on port 9876.") # Original way
 
         command = {"type": cmd_type, "params": params or {}}
         data_out = json.dumps(command).encode("utf-8")
@@ -450,12 +462,12 @@ class HoudiniConnection:
 
             # Read response. We'll accumulate chunks until we can parse a full JSON.
             chunks = []
-            self.sock.settimeout(10.0) # Use TIMEOUT? Or keep specific timeout for Houdini comms?
+            self.sock.settimeout(HOUDINI_CONNECTION_TIMEOUT) # Use longer timeout for Houdini comms
             buffer = b""
-            start_time = asyncio.get_event_loop().time()
+            start_time = time.time()
             while True:
                  # Check for timeout
-                if asyncio.get_event_loop().time() - start_time > 10.0: # Use same timeout value
+                if time.time() - start_time > HOUDINI_CONNECTION_TIMEOUT: 
                      raise socket.timeout("Timeout waiting for Houdini response")
                      
                 # Non-blocking read if possible, or use select/poll?
@@ -511,13 +523,14 @@ def get_houdini_connection() -> HoudiniConnection:
     global _houdini_connection
     if _houdini_connection is None:
         logger.info("Creating new HoudiniConnection.")
-        _houdini_connection = HoudiniConnection(host="localhost", port=9876)
+        _houdini_connection = HoudiniConnection(host="127.0.0.1", port=9876)
 
     # Always try to connect, returns True if already connected or successful now
     if not _houdini_connection.connect():
          # Connection failed, reset _houdini_connection to allow retry next time?
+         host, port = _houdini_connection.host, _houdini_connection.port
          _houdini_connection = None
-         raise ConnectionError("Could not connect to Houdini on localhost:9876. Is the plugin running?")
+         raise ConnectionError(f"Could not connect to Houdini on {host}:{port}. Is the plugin running?")
          
     return _houdini_connection
 

@@ -49,31 +49,38 @@ EXTENSION_VERSION = (0, 1)
 EXTENSION_DESCRIPTION = "Connect Houdini to Claude via MCP"
 
 class HoudiniMCPServer:
-    def __init__(self, host='localhost', port=9876):
+    def __init__(self, host='127.0.0.1', port=9876):
         self.host = host
         self.port = port
         self.running = False
-        self.socket = None
+        self.server_socket = None
         self.client = None
-        self.buffer = b''  # Buffer for incomplete data
+        self.buffer = b''
         self.timer = None
 
     def start(self):
         """Begin listening on the given port; sets up a QTimer to poll for data."""
-        self.running = True
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if self.running:
+            print(f"HoudiniMCP server is already running on {self.host}:{self.port}")
+            return
+
+        self._cleanup_client()
+        self._cleanup_socket()
+        self._cleanup_timer()
+
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         
         try:
-            self.socket.bind((self.host, self.port))
-            self.socket.listen(1)
-            self.socket.setblocking(False)
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(1)
+            self.server_socket.setblocking(False)
             
-            # Create a timer in the main thread to process server events
             self.timer = QtCore.QTimer()
             self.timer.timeout.connect(self._process_server)
-            self.timer.start(100)  # 100ms interval
-            
+            self.timer.start(100)
+
+            self.running = True
             print(f"HoudiniMCP server started on {self.host}:{self.port}")
         except Exception as e:
             print(f"Failed to start server: {str(e)}")
@@ -82,16 +89,35 @@ class HoudiniMCPServer:
     def stop(self):
         """Stop listening; close sockets and timers."""
         self.running = False
-        if self.timer:
-            self.timer.stop()
-            self.timer = None
-        if self.socket:
-            self.socket.close()
-        if self.client:
-            self.client.close()
-        self.socket = None
-        self.client = None
+        self._cleanup_timer()
+        self._cleanup_client()
+        self._cleanup_socket()
         print("HoudiniMCP server stopped")
+
+    def _cleanup_timer(self):
+        if self.timer is not None:
+            try:
+                self.timer.stop()
+            except Exception:
+                pass
+            self.timer = None
+
+    def _cleanup_client(self):
+        if self.client is not None:
+            try:
+                self.client.close()
+            except Exception:
+                pass
+            self.client = None
+        self.buffer = b''
+
+    def _cleanup_socket(self):
+        if self.server_socket is not None:
+            try:
+                self.server_socket.close()
+            except Exception:
+                pass
+            self.server_socket = None
 
     def _process_server(self):
         """
@@ -103,9 +129,9 @@ class HoudiniMCPServer:
         
         try:
             # Accept new connections if we don't already have a client
-            if not self.client and self.socket:
+            if not self.client and self.server_socket:
                 try:
-                    self.client, address = self.socket.accept()
+                    self.client, address = self.server_socket.accept()
                     self.client.setblocking(False)
                     print(f"Connected to client: {address}")
                 except BlockingIOError:
@@ -120,29 +146,25 @@ class HoudiniMCPServer:
                     if data:
                         self.buffer += data
                         try:
-                            # Attempt to parse JSON
                             command = json.loads(self.buffer.decode('utf-8'))
-                            # If successful, clear the buffer and process
                             self.buffer = b''
                             response = self.execute_command(command)
                             response_json = json.dumps(response)
-                            self.client.sendall(response_json.encode('utf-8'))
+                            try:
+                                self.client.sendall(response_json.encode('utf-8'))
+                            except (BrokenPipeError, ConnectionResetError, OSError) as send_err:
+                                print(f"Failed to send response (client likely disconnected): {send_err}")
+                                self._cleanup_client()
                         except json.JSONDecodeError:
-                            # Incomplete data; keep appending to buffer
                             pass
                     else:
-                        # Connection closed by client
-                        print("Client disconnected")
-                        self.client.close()
-                        self.client = None
-                        self.buffer = b''
+                        print("Client disconnected (empty recv)")
+                        self._cleanup_client()
                 except BlockingIOError:
-                    pass  # No data available
-                except Exception as e:
-                    print(f"Error receiving data: {str(e)}")
-                    self.client.close()
-                    self.client = None
-                    self.buffer = b''
+                    pass
+                except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                    print(f"Client connection lost: {str(e)}")
+                    self._cleanup_client()
 
         except Exception as e:
             print(f"Server error: {str(e)}")
