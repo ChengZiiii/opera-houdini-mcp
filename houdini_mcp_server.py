@@ -487,7 +487,8 @@ class HoudiniConnection:
                     self.protocol_verified = True
                     logger.info(f"Protocol handshake verified (v{result.get('protocol', '?')})")
                 else:
-                    raise ValueError("Ping response missing pong flag")
+                    self.protocol_verified = True
+                    logger.warning("Ping not recognized by plugin (old version?), but framing protocol works — proceeding")
             except Exception as e:
                 logger.error(f"Protocol handshake failed: {str(e)}")
                 self.disconnect()
