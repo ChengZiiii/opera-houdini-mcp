@@ -4,6 +4,10 @@ import struct
 import threading
 import socket
 import time
+import difflib
+import fnmatch
+from itertools import islice
+from contextlib import contextmanager
 import requests
 import tempfile
 import traceback
@@ -73,7 +77,7 @@ class HoudiniMCPServer:
         
         try:
             self.server_socket.bind((self.host, self.port))
-            self.server_socket.listen(1)
+            self.server_socket.listen(4)
             self.server_socket.setblocking(False)
             
             self.timer = QtCore.QTimer()
@@ -131,15 +135,24 @@ class HoudiniMCPServer:
             return
         
         try:
-            if not self.client and self.server_socket:
-                try:
-                    self.client, address = self.server_socket.accept()
-                    self.client.setblocking(False)
+            # Accept all pending connections; the newest client wins. A stale
+            # idle client (e.g. an abandoned bridge process) must never be able
+            # to hold the slot and lock new clients out of the server.
+            if self.server_socket:
+                while True:
+                    try:
+                        new_client, address = self.server_socket.accept()
+                    except BlockingIOError:
+                        break
+                    except Exception as e:
+                        print(f"Error accepting connection: {str(e)}")
+                        break
+                    if self.client is not None:
+                        print(f"New connection from {address}; replacing existing client")
+                        self._cleanup_client()
+                    new_client.setblocking(False)
+                    self.client = new_client
                     print(f"Connected to client: {address}")
-                except BlockingIOError:
-                    pass
-                except Exception as e:
-                    print(f"Error accepting connection: {str(e)}")
             
             if self.client:
                 try:
@@ -216,6 +229,21 @@ class HoudiniMCPServer:
             "set_material": self.set_material,
             "get_asset_lib_status": self.get_asset_lib_status,
             "import_opus_url": self.handle_import_opus_url,
+            # Graph editing & introspection
+            "connect_nodes": self.connect_nodes,
+            "disconnect_input": self.disconnect_input,
+            "set_parameters": self.set_parameters,
+            "get_parameter_schema": self.get_parameter_schema,
+            "set_node_flags": self.set_node_flags,
+            "layout_children": self.layout_children,
+            "find_error_nodes": self.find_error_nodes,
+            "cook_node": self.cook_node,
+            # VEX wrangles
+            "create_wrangle": self.create_wrangle,
+            "set_wrangle_code": self.set_wrangle_code,
+            # Geometry introspection
+            "get_geometry_info": self.get_geometry_info,
+            "get_geometry_data": self.get_geometry_data,
             # Add new render handlers
             "render_single_view": self.handle_render_single_view,
             "render_quad_view": self.handle_render_quad_view,
@@ -235,11 +263,29 @@ class HoudiniMCPServer:
         handler = handlers.get(cmd_type)
         if not handler:
             return {"status": "error", "message": f"Unknown command type: {cmd_type}"}
-        
+
         print(f"Executing handler for {cmd_type}")
-        result = handler(**params)
+        with self._undo_group(cmd_type):
+            result = handler(**params)
         print(f"Handler execution complete for {cmd_type}")
         return {"status": "success", "result": result}
+
+    # Commands that mutate the scene get wrapped in a single undo group so the
+    # artist can Ctrl+Z any agent action as one step.
+    MUTATING_COMMANDS = frozenset({
+        "create_node", "modify_node", "delete_node", "set_material",
+        "import_opus_url", "import_asset", "connect_nodes", "disconnect_input",
+        "set_parameters", "set_node_flags", "layout_children",
+        "create_wrangle", "set_wrangle_code",
+    })
+
+    @contextmanager
+    def _undo_group(self, cmd_type):
+        if cmd_type in self.MUTATING_COMMANDS and hasattr(hou, "undos"):
+            with hou.undos.group(f"MCP: {cmd_type}"):
+                yield
+        else:
+            yield
 
     def _handle_ping(self):
         return {"pong": True, "protocol": 1}
@@ -435,6 +481,474 @@ class HoudiniMCPServer:
             # Re-raise the exception so it's caught by execute_command
             # and reported back as a standard error message.
             raise Exception(f"Code execution error: {str(e)}")
+
+    # -------------------------------------------------------------------------
+    # Graph Editing & Introspection
+    # -------------------------------------------------------------------------
+
+    def _resolve_node(self, path):
+        """Return the hou.Node at 'path' or raise a clear error."""
+        node = hou.node(path)
+        if not node:
+            raise ValueError(f"Node not found: {path}")
+        return node
+
+    def _resolve_geometry_node(self, path):
+        """
+        Resolve 'path' to a SOP node that owns geometry. Accepts a SOP path
+        directly, or a geometry container (OBJ node) whose display SOP is used.
+        """
+        node = self._resolve_node(path)
+        if isinstance(node, hou.SopNode):
+            return node
+        display = getattr(node, "displayNode", lambda: None)()
+        if display is not None:
+            return display
+        raise ValueError(
+            f"{path} has no geometry. Pass a SOP path or a geometry container "
+            f"(got {node.type().category().name()} node '{node.type().name()}')."
+        )
+
+    @staticmethod
+    def _jsonable(value):
+        """Convert HOM values (vectors, tuples, ...) to JSON-friendly types."""
+        if isinstance(value, (bool, int, float, str)) or value is None:
+            return value
+        if isinstance(value, (hou.Vector2, hou.Vector3, hou.Vector4, hou.Quaternion)):
+            return list(value)
+        if isinstance(value, (tuple, list)):
+            return [HoudiniMCPServer._jsonable(v) for v in value]
+        return str(value)
+
+    @staticmethod
+    def _parm_value(parm_tuple):
+        """Evaluate a parm tuple; single-component parms come back as scalars."""
+        value = HoudiniMCPServer._jsonable(parm_tuple.eval())
+        if isinstance(value, list) and len(parm_tuple) == 1:
+            return value[0]
+        return value
+
+    def _cook_and_report(self, node):
+        """Force-cook a node and return a structured pass/fail report."""
+        start = time.time()
+        cook_exception = None
+        try:
+            node.cook(force=True)
+        except hou.OperationFailed as e:
+            cook_exception = str(e)
+        elapsed_ms = round((time.time() - start) * 1000.0, 1)
+
+        errors = [e.strip() for e in node.errors() if e.strip()]
+        warnings = [w.strip() for w in node.warnings() if w.strip()]
+        if cook_exception and not errors:
+            errors.append(cook_exception)
+
+        return {
+            "node": node.path(),
+            "cooked": not errors,
+            "cook_time_ms": elapsed_ms,
+            "errors": errors,
+            "warnings": warnings,
+        }
+
+    def connect_nodes(self, from_path, to_path, input_index=0, output_index=0):
+        """Wire from_path's output into to_path's input."""
+        src = self._resolve_node(from_path)
+        dst = self._resolve_node(to_path)
+        if src.parent() != dst.parent():
+            raise ValueError(
+                f"Nodes must share a parent network: {src.parent().path()} != {dst.parent().path()}"
+            )
+        dst.setInput(input_index, src, output_index)
+        return {
+            "from": src.path(),
+            "to": dst.path(),
+            "input_index": input_index,
+            "output_index": output_index,
+        }
+
+    def disconnect_input(self, path, input_index=0):
+        """Disconnect one input of a node."""
+        node = self._resolve_node(path)
+        previous = None
+        for connection in node.inputConnections():
+            if connection.inputIndex() == input_index:
+                previous = connection.inputNode()
+                break
+        node.setInput(input_index, None)
+        return {
+            "node": node.path(),
+            "input_index": input_index,
+            "was_connected_to": previous.path() if previous else None,
+        }
+
+    def _set_one_parm(self, node, name, value):
+        """
+        Set a single parameter (or parm tuple). Returns (previous, new).
+        Resolves menu tokens/labels for string values on menu parms, and
+        suggests close parameter names when the name doesn't exist.
+        """
+        parm_tuple = node.parmTuple(name)
+        if parm_tuple is None:
+            candidates = [pt.name() for pt in node.parmTuples()]
+            close = difflib.get_close_matches(name, candidates, n=3, cutoff=0.5)
+            hint = f" Did you mean: {', '.join(close)}?" if close else ""
+            raise ValueError(f"Parameter '{name}' not found on {node.path()}.{hint}")
+
+        previous = self._parm_value(parm_tuple)
+
+        if isinstance(value, (list, tuple)):
+            if len(value) != len(parm_tuple):
+                raise ValueError(
+                    f"'{name}' has {len(parm_tuple)} component(s), got {len(value)} values"
+                )
+            parm_tuple.set(tuple(value))
+        else:
+            if len(parm_tuple) != 1:
+                raise ValueError(
+                    f"'{name}' has {len(parm_tuple)} components; pass a list of {len(parm_tuple)} values"
+                )
+            parm = parm_tuple[0]
+            try:
+                parm.set(value)
+            except (TypeError, hou.OperationFailed):
+                # A string that isn't a valid menu token: resolve label to index.
+                if not isinstance(value, str):
+                    raise
+                try:
+                    tokens = list(parm.menuItems())
+                    labels = list(parm.menuLabels())
+                except hou.OperationFailed:
+                    raise TypeError(
+                        f"'{name}' does not accept a string value on {node.path()}"
+                    )
+                if value in tokens:
+                    parm.set(tokens.index(value))
+                elif value in labels:
+                    parm.set(labels.index(value))
+                else:
+                    raise ValueError(
+                        f"'{value}' is not a menu token or label of '{name}'. "
+                        f"Tokens: {tokens[:20]}"
+                    )
+
+        return previous, self._parm_value(parm_tuple)
+
+    def set_parameters(self, path, parameters):
+        """
+        Set multiple parameters on a node in one call.
+        Values: scalar for single parms, list for tuples (e.g. "t": [0, 1, 0]),
+        menu token/label strings for menu parms.
+        """
+        node = self._resolve_node(path)
+        if not isinstance(parameters, dict) or not parameters:
+            raise ValueError("'parameters' must be a non-empty dict of {name: value}")
+
+        applied, failed = [], []
+        for name, value in parameters.items():
+            try:
+                previous, new = self._set_one_parm(node, name, value)
+                applied.append({"name": name, "previous": previous, "value": new})
+            except Exception as e:
+                failed.append({"name": name, "error": str(e)})
+
+        return {"node": node.path(), "set": applied, "failed": failed}
+
+    def get_parameter_schema(self, path, pattern=None, offset=0, limit=50):
+        """
+        Describe a node's parameters: name, label, type, size, current value,
+        defaults, ranges and menu options. Filter with a glob 'pattern'
+        (matched against name and label), paginate with offset/limit.
+        """
+        node = self._resolve_node(path)
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+
+        parm_tuples = node.parmTuples()
+        if pattern:
+            pat = pattern.lower()
+            parm_tuples = [
+                pt for pt in parm_tuples
+                if fnmatch.fnmatch(pt.name().lower(), pat)
+                or fnmatch.fnmatch(pt.parmTemplate().label().lower(), pat)
+            ]
+
+        entries = []
+        for pt in parm_tuples[offset:offset + limit]:
+            template = pt.parmTemplate()
+            entry = {
+                "name": pt.name(),
+                "label": template.label(),
+                "type": template.type().name(),
+                "size": len(pt),
+                "value": self._parm_value(pt),
+            }
+            try:
+                default = self._jsonable(template.defaultValue())
+                if isinstance(default, list) and len(default) == 1:
+                    default = default[0]
+                entry["default"] = default
+            except AttributeError:
+                pass
+            if isinstance(template, (hou.FloatParmTemplate, hou.IntParmTemplate)):
+                entry["min"] = template.minValue()
+                entry["max"] = template.maxValue()
+            menu_items = getattr(template, "menuItems", lambda: ())()
+            if menu_items:
+                menu_labels = template.menuLabels()
+                entry["menu"] = [
+                    {"token": t, "label": l}
+                    for t, l in islice(zip(menu_items, menu_labels), 30)
+                ]
+                if len(menu_items) > 30:
+                    entry["menu_truncated"] = len(menu_items)
+            entries.append(entry)
+
+        return {
+            "node": node.path(),
+            "node_type": node.type().name(),
+            "total": len(parm_tuples),
+            "offset": offset,
+            "parameters": entries,
+        }
+
+    def set_node_flags(self, path, display=None, render=None, bypass=None, template=None):
+        """Set node flags; only the flags passed (non-None) are touched."""
+        node = self._resolve_node(path)
+        requested = {
+            "display": (display, "setDisplayFlag"),
+            "render": (render, "setRenderFlag"),
+            "bypass": (bypass, "bypass"),
+            "template": (template, "setTemplateFlag"),
+        }
+        applied, unsupported = {}, []
+        for flag, (value, method_name) in requested.items():
+            if value is None:
+                continue
+            method = getattr(node, method_name, None)
+            if method is None:
+                unsupported.append(flag)
+                continue
+            method(bool(value))
+            applied[flag] = bool(value)
+
+        return {"node": node.path(), "applied": applied, "unsupported": unsupported}
+
+    def layout_children(self, path):
+        """Auto-layout all children of a network node."""
+        node = self._resolve_node(path)
+        node.layoutChildren()
+        return {"node": node.path(), "children_laid_out": len(node.children())}
+
+    def find_error_nodes(self, root_path="/obj", include_warnings=False,
+                         max_nodes=2000, limit=50):
+        """
+        Walk the network under root_path and report nodes whose last cook
+        produced errors (and optionally warnings). Does not force cooks.
+        """
+        root = self._resolve_node(root_path)
+        found = []
+        scanned = 0
+        truncated = False
+        stack = [root]
+
+        while stack:
+            if scanned >= max_nodes or len(found) >= limit:
+                truncated = True
+                break
+            node = stack.pop()
+            scanned += 1
+            errors = [e.strip() for e in node.errors() if e.strip()]
+            warnings = []
+            if include_warnings:
+                warnings = [w.strip() for w in node.warnings() if w.strip()]
+            if errors or warnings:
+                entry = {"path": node.path(), "type": node.type().name(), "errors": errors}
+                if include_warnings:
+                    entry["warnings"] = warnings
+                found.append(entry)
+            stack.extend(node.children())
+
+        return {
+            "root": root.path(),
+            "scanned": scanned,
+            "truncated": truncated,
+            "error_node_count": len(found),
+            "nodes": found,
+        }
+
+    def cook_node(self, path):
+        """Force-cook a node and report errors, warnings and cook time."""
+        return self._cook_and_report(self._resolve_node(path))
+
+    # -------------------------------------------------------------------------
+    # VEX Wrangles
+    # -------------------------------------------------------------------------
+
+    def _set_run_over(self, node, run_over):
+        """Match 'run_over' against the wrangle's class menu (token or label)."""
+        class_parm = node.parm("class")
+        if class_parm is None:
+            return None  # e.g. volumewrangle has no class parm
+        want = run_over.lower().rstrip("s")
+        tokens = list(class_parm.menuItems())
+        labels = list(class_parm.menuLabels())
+        for index, (token, label) in enumerate(zip(tokens, labels)):
+            if want in (token.lower().rstrip("s"), label.lower().rstrip("s")):
+                class_parm.set(index)
+                return token
+        raise ValueError(
+            f"Unknown run_over '{run_over}'. Valid options: {tokens}"
+        )
+
+    def create_wrangle(self, parent_path, vex_code, name=None, run_over="points",
+                       input_node=None, wrangle_type="attribwrangle"):
+        """
+        Create a wrangle SOP, set its VEX snippet, optionally wire an input,
+        then cook it so VEX compile errors are reported immediately.
+        """
+        parent = self._resolve_node(parent_path)
+        if parent.childTypeCategory() != hou.sopNodeTypeCategory():
+            raise ValueError(
+                f"{parent_path} is not a SOP network (cannot contain wrangles). "
+                f"Pass a geometry container or SOP subnet."
+            )
+
+        node = parent.createNode(wrangle_type, node_name=name)
+        try:
+            snippet = node.parm("snippet")
+            if snippet is None:
+                raise ValueError(f"'{wrangle_type}' has no 'snippet' parameter")
+            snippet.set(vex_code)
+            run_over_token = self._set_run_over(node, run_over)
+            if input_node:
+                node.setInput(0, self._resolve_node(input_node))
+            node.moveToGoodPosition()
+        except Exception:
+            node.destroy()  # don't leave a half-configured node behind
+            raise
+
+        return {
+            "path": node.path(),
+            "type": wrangle_type,
+            "run_over": run_over_token,
+            "validation": self._cook_and_report(node),
+        }
+
+    def set_wrangle_code(self, path, vex_code, validate=True):
+        """Replace the VEX snippet on an existing wrangle and re-validate."""
+        node = self._resolve_node(path)
+        snippet = node.parm("snippet")
+        if snippet is None:
+            raise ValueError(f"{path} has no 'snippet' parameter (not a wrangle)")
+        snippet.set(vex_code)
+        result = {"path": node.path(), "code_length": len(vex_code)}
+        if validate:
+            result["validation"] = self._cook_and_report(node)
+        return result
+
+    # -------------------------------------------------------------------------
+    # Geometry Introspection
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _attrib_summary(attribs):
+        return [
+            {"name": a.name(), "type": a.dataType().name(), "size": a.size()}
+            for a in attribs
+        ]
+
+    def get_geometry_info(self, path):
+        """
+        Summarize a node's geometry: element counts, bounding box, attributes
+        and group names. Accepts a SOP or a geometry container path.
+        """
+        sop = self._resolve_geometry_node(path)
+        geo = sop.geometry()
+        if geo is None:
+            report = self._cook_and_report(sop)
+            raise ValueError(
+                f"{sop.path()} produced no geometry. Cook errors: {report['errors']}"
+            )
+
+        bbox = geo.boundingBox()
+        return {
+            "node": sop.path(),
+            "point_count": geo.intrinsicValue("pointcount"),
+            "primitive_count": geo.intrinsicValue("primitivecount"),
+            "vertex_count": geo.intrinsicValue("vertexcount"),
+            "bounding_box": {
+                "min": list(bbox.minvec()),
+                "max": list(bbox.maxvec()),
+                "size": list(bbox.sizevec()),
+                "center": list(bbox.center()),
+            },
+            "attributes": {
+                "point": self._attrib_summary(geo.pointAttribs()),
+                "primitive": self._attrib_summary(geo.primAttribs()),
+                "vertex": self._attrib_summary(geo.vertexAttribs()),
+                "detail": self._attrib_summary(geo.globalAttribs()),
+            },
+            "groups": {
+                "point": [g.name() for g in geo.pointGroups()],
+                "primitive": [g.name() for g in geo.primGroups()],
+            },
+        }
+
+    def get_geometry_data(self, path, element="points", attributes=None,
+                          start=0, limit=100):
+        """
+        Read actual attribute values from geometry, paginated.
+        element: 'points' or 'primitives'. attributes: list of names
+        (default: position for points, type info for prims).
+        """
+        sop = self._resolve_geometry_node(path)
+        geo = sop.geometry()
+        if geo is None:
+            raise ValueError(f"{sop.path()} has no geometry (node may not cook)")
+
+        start = max(0, int(start))
+        limit = max(1, min(int(limit), 500))
+
+        if element == "points":
+            total = geo.intrinsicValue("pointcount")
+            available = {a.name(): a for a in geo.pointAttribs()}
+            iterator = geo.iterPoints()
+        elif element == "primitives":
+            total = geo.intrinsicValue("primitivecount")
+            available = {a.name(): a for a in geo.primAttribs()}
+            iterator = geo.iterPrims()
+        else:
+            raise ValueError(f"element must be 'points' or 'primitives', got '{element}'")
+
+        if attributes:
+            missing = [a for a in attributes if a not in available]
+            if missing:
+                raise ValueError(
+                    f"Attribute(s) {missing} not found on {element}. "
+                    f"Available: {sorted(available)}"
+                )
+            selected = [available[a] for a in attributes]
+        else:
+            selected = [available["P"]] if "P" in available else []
+
+        rows = []
+        for elem in islice(iterator, start, start + limit):
+            row = {"number": elem.number()}
+            if element == "primitives":
+                row["type"] = elem.type().name()
+            for attrib in selected:
+                row[attrib.name()] = self._jsonable(elem.attribValue(attrib))
+            rows.append(row)
+
+        return {
+            "node": sop.path(),
+            "element": element,
+            "total": total,
+            "start": start,
+            "count": len(rows),
+            "data": rows,
+        }
 
     # -------------------------------------------------------------------------
     # set_material (now completed)
