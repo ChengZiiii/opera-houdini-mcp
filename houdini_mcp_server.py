@@ -9,6 +9,7 @@ and relays each command to the local Houdini plugin on port 9876.
 import sys
 import os
 import time
+import argparse
 
 # Get the directory where the script is located (needed for dotenv path)
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -545,13 +546,14 @@ class HoudiniConnection:
 
 # A global Houdini connection object
 _houdini_connection: HoudiniConnection = None
+_houdini_port: int = 9876  # Default port; override with --port
 
 def get_houdini_connection() -> HoudiniConnection:
     """Get or create a persistent HoudiniConnection object."""
     global _houdini_connection
     if _houdini_connection is None:
-        logger.info("Creating new HoudiniConnection.")
-        _houdini_connection = HoudiniConnection(host="127.0.0.1", port=9876)
+        logger.info(f"Creating new HoudiniConnection on port {_houdini_port}.")
+        _houdini_connection = HoudiniConnection(host="127.0.0.1", port=_houdini_port)
 
     # Always try to connect, returns True if already connected or successful now
     if not _houdini_connection.connect():
@@ -922,6 +924,15 @@ def get_opus_job_result(batch_job_id: str) -> dict:
 
 def main():
     """Run the MCP server on stdio."""
+    global _houdini_port
+
+    parser = argparse.ArgumentParser(description='Houdini MCP Server Bridge')
+    parser.add_argument('--port', type=int, default=9876,
+                        help='Port to connect to Houdini (default: 9876)')
+    args = parser.parse_args()
+    _houdini_port = args.port
+    logger.info(f"Configured to connect to Houdini on port {_houdini_port}")
+
     # Check necessary RapidAPI variables are set before running
     if not RAPIDAPI_HOST_URL or not RAPIDAPI_HOST or not RAPIDAPI_KEY:
          logger.warning("RAPIDAPI_HOST_URL, RAPIDAPI_HOST, or RAPIDAPI_KEY not configured. OPUS API features will be disabled.")
