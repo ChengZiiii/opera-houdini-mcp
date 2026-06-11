@@ -8,24 +8,14 @@ and relays each command to the local Houdini plugin on port 9876.
 """
 import sys
 import os
-import site
+import time
 
-# Get the directory where the script is located
+# Get the directory where the script is located (needed for dotenv path)
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
-# Add the virtual environment's site-packages to Python's path
-venv_site_packages = os.path.join(script_dir, '.venv', 'Lib', 'site-packages')
-if os.path.exists(venv_site_packages):
-    sys.path.insert(0, venv_site_packages)
-    print(f"Added {venv_site_packages} to sys.path", file=sys.stderr)
-else:
-    print(f"Warning: Virtual environment site-packages not found at {venv_site_packages}", file=sys.stderr)
-
-
-# For debugging
-print("Python path:", sys.path, file=sys.stderr)
 import json
 import socket
+import struct
 import logging
 from dataclasses import dataclass
 from typing import Dict, Any, List
@@ -38,11 +28,15 @@ import requests
 from dotenv import load_dotenv
 from urllib.parse import urljoin # To construct RapidAPI URLs
 try:
-    from langchain.output_parsers import ResponseSchema, StructuredOutputParser
+    from langchain_classic.output_parsers import ResponseSchema, StructuredOutputParser
     LANGCHAIN_AVAILABLE = True
 except ImportError:
-    LANGCHAIN_AVAILABLE = False
-    print("Warning: Langchain not found. opus_get_model_params_schema tool will be limited.", file=sys.stderr)
+    try:
+        from langchain.output_parsers import ResponseSchema, StructuredOutputParser
+        LANGCHAIN_AVAILABLE = True
+    except ImportError:
+        LANGCHAIN_AVAILABLE = False
+        print("Warning: Langchain not found. opus_get_model_params_schema tool will be limited.", file=sys.stderr)
 
 # Load environment variables from urls.env located in the script's directory
 dotenv_path = os.path.join(script_dir, 'urls.env')
@@ -64,10 +58,16 @@ CREATE_COMPONENT_PATH = "/create_opus_component" # Keep old path if needed elsew
 VARIATE_PATH = "/variate_opus_result"
 GET_JOB_RESULT_PATH = "/get_opus_job_result"
 
-TIMEOUT = 15 # seconds
+TIMEOUT = 15 # seconds for RapidAPI
+HOUDINI_CONNECTION_TIMEOUT = 300 # 5 minutes for Houdini operations (rendering can be slow)
 
 if not RAPIDAPI_HOST_URL or not RAPIDAPI_HOST or not RAPIDAPI_KEY:
-    print("Error: RAPIDAPI_HOST_URL, RAPIDAPI_HOST, and RAPIDAPI_KEY environment variables must be set in urls.env", file=sys.stderr)
+    print("Warning: RAPIDAPI_HOST_URL, RAPIDAPI_HOST, or RAPIDAPI_KEY not configured. OPUS API features will be disabled.", file=sys.stderr)
+    # Set URL variables to None for safety
+    GET_ATTRIBUTES_URL = None
+    CREATE_COMPONENT_URL = None
+    VARIATE_URL = None
+    GET_JOB_RESULT_URL = None
 else:
     # Construct full URLs
     GET_ATTRIBUTES_URL = urljoin(RAPIDAPI_HOST_URL, GET_ATTRIBUTES_PATH)
@@ -411,11 +411,18 @@ class HoudiniConnection:
     host: str
     port: int
     sock: socket.socket = None
+    protocol_verified: bool = False
 
     def connect(self) -> bool:
         """Connect to the Houdini plugin (which is listening on self.host:self.port)."""
         if self.sock is not None:
-            return True  # Already connected
+            try:
+                self.sock.getpeername()
+                return True
+            except (OSError, socket.error):
+                logger.info("Stale socket detected, reconnecting...")
+                self.disconnect()
+
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.connect((self.host, self.port))
@@ -434,69 +441,97 @@ class HoudiniConnection:
             except Exception as e:
                 logger.error(f"Error disconnecting from Houdini: {str(e)}")
             self.sock = None
+        self.protocol_verified = False
 
     def send_command(self, cmd_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
         """
         Send a JSON command to Houdini's server and wait for the JSON response.
+        
+        Protocol: each message is a 4-byte big-endian length prefix
+        followed by that many bytes of UTF-8 JSON.
+        
         Returns the parsed Python dict (e.g. {"status": "success", "result": {...}})
         """
         if not self.connect():
-            # Instead of raising, return an error dict consistent with API errors
-            error_msg = "Could not connect to Houdini on port 9876."
+            error_msg = f"Could not connect to Houdini on {self.host}:{self.port}."
             logger.error(error_msg)
-            # Return structure similar to API failures
             return {"status": "error", "message": error_msg, "origin": "mcp_server_connection"}
-            # raise ConnectionError("Could not connect to Houdini on port 9876.") # Original way
+
+        if not self.protocol_verified:
+            try:
+                ping_cmd = {"type": "ping", "params": {}}
+                ping_data = json.dumps(ping_cmd).encode("utf-8")
+                ping_frame = struct.pack('>I', len(ping_data)) + ping_data
+                self.sock.sendall(ping_frame)
+
+                self.sock.settimeout(HOUDINI_CONNECTION_TIMEOUT)
+                hdr = b""
+                while len(hdr) < 4:
+                    chunk = self.sock.recv(4 - len(hdr))
+                    if not chunk:
+                        raise ConnectionAbortedError("Connection closed during ping handshake.")
+                    hdr += chunk
+                resp_len = struct.unpack('>I', hdr)[0]
+                MAX_MSG_LEN = 50 * 1024 * 1024
+                if resp_len > MAX_MSG_LEN:
+                    raise ValueError(f"Ping response too large ({resp_len} bytes)")
+                resp_payload = b""
+                while len(resp_payload) < resp_len:
+                    chunk = self.sock.recv(min(resp_len - len(resp_payload), 65536))
+                    if not chunk:
+                        raise ConnectionAbortedError("Connection closed during ping response transfer.")
+                    resp_payload += chunk
+                resp = json.loads(resp_payload.decode("utf-8"))
+                result = resp.get("result", {})
+                if result.get("pong"):
+                    self.protocol_verified = True
+                    logger.info(f"Protocol handshake verified (v{result.get('protocol', '?')})")
+                else:
+                    self.protocol_verified = True
+                    logger.warning("Ping not recognized by plugin (old version?), but framing protocol works — proceeding")
+            except Exception as e:
+                logger.error(f"Protocol handshake failed: {str(e)}")
+                self.disconnect()
+                return {
+                    "status": "error",
+                    "message": "Houdini plugin protocol mismatch. Please restart the HoudiniMCP server in Houdini using the shelf tool, then retry.",
+                    "origin": "mcp_server_protocol_handshake",
+                }
 
         command = {"type": cmd_type, "params": params or {}}
         data_out = json.dumps(command).encode("utf-8")
+        frame_out = struct.pack('>I', len(data_out)) + data_out
 
         try:
-            # Send the command
-            self.sock.sendall(data_out)
+            self.sock.sendall(frame_out)
             logger.info(f"Sent command to Houdini: {command}")
 
-            # Read response. We'll accumulate chunks until we can parse a full JSON.
-            chunks = []
-            self.sock.settimeout(10.0) # Use TIMEOUT? Or keep specific timeout for Houdini comms?
-            buffer = b""
-            start_time = asyncio.get_event_loop().time()
-            while True:
-                 # Check for timeout
-                if asyncio.get_event_loop().time() - start_time > 10.0: # Use same timeout value
-                     raise socket.timeout("Timeout waiting for Houdini response")
-                     
-                # Non-blocking read if possible, or use select/poll?
-                # Sticking with blocking recv with timeout for now
-                chunk = self.sock.recv(8192)
+            self.sock.settimeout(HOUDINI_CONNECTION_TIMEOUT)
+            header = b""
+            while len(header) < 4:
+                chunk = self.sock.recv(4 - len(header))
                 if not chunk:
-                    # Connection closed gracefully by Houdini?
-                    if buffer: # If we have partial data, it's an error
-                         raise ConnectionAbortedError("Connection closed by Houdini with incomplete data.")
-                    else: # No data received and socket closed -> Houdini might have crashed?
-                         raise ConnectionAbortedError("Connection closed by Houdini before sending data.")
-                         
-                buffer += chunk
-                # Try to decode the accumulated buffer
-                try:
-                    decoded_string = buffer.decode("utf-8")
-                    # Attempt to load JSON from the decoded string
-                    parsed = json.loads(decoded_string)
-                    # If successful, we have a complete JSON object
-                    logger.info(f"Received response from Houdini: {parsed}")
-                    return parsed
-                except json.JSONDecodeError:
-                    # Not a complete JSON object yet, continue receiving
-                    continue
-                except UnicodeDecodeError:
-                    # Data received is not valid UTF-8
-                     logger.error("Received non-UTF-8 data from Houdini")
-                     raise ValueError("Received non-UTF-8 data from Houdini")
+                    raise ConnectionAbortedError("Connection closed by Houdini before sending response header.")
+                header += chunk
 
-            # Should not be reached if loop exits via return or exception
-            # raise Exception("No (or incomplete) data from Houdini; EOF reached without valid JSON.")
+            msg_len = struct.unpack('>I', header)[0]
+            MAX_MSG_LEN = 50 * 1024 * 1024
+            if msg_len > MAX_MSG_LEN:
+                raise ValueError(f"Response too large ({msg_len} bytes)")
 
-        except socket.timeout: # Explicitly catch socket timeout
+            payload = b""
+            while len(payload) < msg_len:
+                chunk = self.sock.recv(min(msg_len - len(payload), 65536))
+                if not chunk:
+                    raise ConnectionAbortedError("Connection closed by Houdini during response transfer.")
+                payload += chunk
+
+            decoded = payload.decode("utf-8")
+            parsed = json.loads(decoded)
+            logger.info(f"Received response from Houdini: {parsed}")
+            return parsed
+
+        except socket.timeout:
             error_msg = "Timeout receiving data from Houdini."
             logger.error(error_msg)
             self.disconnect()
@@ -504,11 +539,8 @@ class HoudiniConnection:
         except Exception as e:
             error_msg = f"Error during Houdini communication for command '{cmd_type}': {str(e)}"
             logger.error(error_msg)
-            # Invalidate socket so we reconnect next time
             self.disconnect()
-            # Return error dict consistent with API failures
             return {"status": "error", "message": error_msg, "origin": "mcp_server_send_command"}
-            # raise # Re-raise original exception? Or return dict? Returning dict.
 
 
 # A global Houdini connection object
@@ -519,13 +551,14 @@ def get_houdini_connection() -> HoudiniConnection:
     global _houdini_connection
     if _houdini_connection is None:
         logger.info("Creating new HoudiniConnection.")
-        _houdini_connection = HoudiniConnection(host="localhost", port=9876)
+        _houdini_connection = HoudiniConnection(host="127.0.0.1", port=9876)
 
     # Always try to connect, returns True if already connected or successful now
     if not _houdini_connection.connect():
          # Connection failed, reset _houdini_connection to allow retry next time?
+         host, port = _houdini_connection.host, _houdini_connection.port
          _houdini_connection = None
-         raise ConnectionError("Could not connect to Houdini on localhost:9876. Is the plugin running?")
+         raise ConnectionError(f"Could not connect to Houdini on {host}:{port}. Is the plugin running?")
          
     return _houdini_connection
 
@@ -818,12 +851,12 @@ def opus_import_model_url(ctx: Context, download_url: str, node_name: str = None
         if node_name:
              params["node_name"] = node_name
         else:
-             # Basic name generation from URL
              try:
-                 parsed_name = os.path.splitext(os.path.basename(urlparse(download_url).path))[0]
-                 params["node_name"] = hou.nodeType(hou.nodeTypeCategories()["Object"], "subnet").instance(parsed_name) # Generate unique name
+                 from urllib.parse import urlparse as _urlparse
+                 parsed_name = os.path.splitext(os.path.basename(_urlparse(download_url).path))[0]
+                 params["node_name"] = parsed_name if parsed_name else "opus_import"
              except Exception:
-                 params["node_name"] = "opus_import" # Fallback name
+                 params["node_name"] = "opus_import"
              
         logger.info(f"Requesting Houdini import: URL={download_url}, NodeName={params['node_name']}")
         # Send command to Houdini's server.py
@@ -891,12 +924,13 @@ def main():
     """Run the MCP server on stdio."""
     # Check necessary RapidAPI variables are set before running
     if not RAPIDAPI_HOST_URL or not RAPIDAPI_HOST or not RAPIDAPI_KEY:
-         logger.critical("RAPIDAPI_HOST_URL, RAPIDAPI_HOST, and RAPIDAPI_KEY environment variables are not set. Please configure urls.env.")
-         logger.critical("Server will not start.")
-         sys.exit(1) # Exit if critical configuration is missing
-         
-    logger.info(f"Using RapidAPI Host URL: {RAPIDAPI_HOST_URL}")
-    logger.info(f"Using RapidAPI Host Header: {RAPIDAPI_HOST}")
+         logger.warning("RAPIDAPI_HOST_URL, RAPIDAPI_HOST, or RAPIDAPI_KEY not configured. OPUS API features will be disabled.")
+         logger.warning("To enable OPUS features, configure your RapidAPI key in urls.env")
+         # Don't exit - allow server to start without OPUS features
+    else:
+        logger.info(f"Using RapidAPI Host URL: {RAPIDAPI_HOST_URL}")
+        logger.info(f"Using RapidAPI Host Header: {RAPIDAPI_HOST}")
+
     logger.info(f"Langchain available: {LANGCHAIN_AVAILABLE}")
     mcp.run()
 

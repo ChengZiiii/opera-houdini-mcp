@@ -1,5 +1,6 @@
 import hou
 import json
+import struct
 import threading
 import socket
 import time
@@ -9,7 +10,21 @@ import traceback
 import os
 import shutil
 import sys
-from PySide2 import QtWidgets, QtCore
+# Try PySide6 first (Houdini 21.0+), fall back to PySide2 (older versions)
+try:
+    from PySide6 import QtWidgets, QtCore
+    print("Using PySide6 (Houdini 21.0+)")
+except ImportError:
+    try:
+        from PySide2 import QtWidgets, QtCore
+        print("Using PySide2 (Houdini 19.5-20.x)")
+    except ImportError:
+        print("Warning: Neither PySide6 nor PySide2 found. Some features may not work.")
+        # Create dummy classes to prevent import errors
+        class QtCore:
+            class QTimer:
+                pass
+        QtWidgets = None
 import io
 from contextlib import redirect_stdout, redirect_stderr
 
@@ -34,31 +49,38 @@ EXTENSION_VERSION = (0, 1)
 EXTENSION_DESCRIPTION = "Connect Houdini to Claude via MCP"
 
 class HoudiniMCPServer:
-    def __init__(self, host='localhost', port=9876):
+    def __init__(self, host='127.0.0.1', port=9876):
         self.host = host
         self.port = port
         self.running = False
-        self.socket = None
+        self.server_socket = None
         self.client = None
-        self.buffer = b''  # Buffer for incomplete data
+        self.buffer = b''
         self.timer = None
 
     def start(self):
         """Begin listening on the given port; sets up a QTimer to poll for data."""
-        self.running = True
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if self.running:
+            print(f"HoudiniMCP server is already running on {self.host}:{self.port}")
+            return
+
+        self._cleanup_client()
+        self._cleanup_socket()
+        self._cleanup_timer()
+
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         
         try:
-            self.socket.bind((self.host, self.port))
-            self.socket.listen(1)
-            self.socket.setblocking(False)
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(1)
+            self.server_socket.setblocking(False)
             
-            # Create a timer in the main thread to process server events
             self.timer = QtCore.QTimer()
             self.timer.timeout.connect(self._process_server)
-            self.timer.start(100)  # 100ms interval
-            
+            self.timer.start(100)
+
+            self.running = True
             print(f"HoudiniMCP server started on {self.host}:{self.port}")
         except Exception as e:
             print(f"Failed to start server: {str(e)}")
@@ -67,67 +89,97 @@ class HoudiniMCPServer:
     def stop(self):
         """Stop listening; close sockets and timers."""
         self.running = False
-        if self.timer:
-            self.timer.stop()
-            self.timer = None
-        if self.socket:
-            self.socket.close()
-        if self.client:
-            self.client.close()
-        self.socket = None
-        self.client = None
+        self._cleanup_timer()
+        self._cleanup_client()
+        self._cleanup_socket()
         print("HoudiniMCP server stopped")
+
+    def _cleanup_timer(self):
+        if self.timer is not None:
+            try:
+                self.timer.stop()
+            except Exception:
+                pass
+            self.timer = None
+
+    def _cleanup_client(self):
+        if self.client is not None:
+            try:
+                self.client.close()
+            except Exception:
+                pass
+            self.client = None
+        self.buffer = b''
+
+    def _cleanup_socket(self):
+        if self.server_socket is not None:
+            try:
+                self.server_socket.close()
+            except Exception:
+                pass
+            self.server_socket = None
 
     def _process_server(self):
         """
         Timer callback to accept connections and process any incoming data.
         This runs in the main Houdini thread to avoid concurrency issues.
+        
+        Protocol: each message is a 4-byte big-endian length prefix
+        followed by that many bytes of UTF-8 JSON.
         """
         if not self.running:
             return
         
         try:
-            # Accept new connections if we don't already have a client
-            if not self.client and self.socket:
+            if not self.client and self.server_socket:
                 try:
-                    self.client, address = self.socket.accept()
+                    self.client, address = self.server_socket.accept()
                     self.client.setblocking(False)
                     print(f"Connected to client: {address}")
                 except BlockingIOError:
-                    pass  # No connection waiting
+                    pass
                 except Exception as e:
                     print(f"Error accepting connection: {str(e)}")
             
-            # Process data from existing client
             if self.client:
                 try:
                     data = self.client.recv(8192)
                     if data:
                         self.buffer += data
-                        try:
-                            # Attempt to parse JSON
-                            command = json.loads(self.buffer.decode('utf-8'))
-                            # If successful, clear the buffer and process
-                            self.buffer = b''
-                            response = self.execute_command(command)
-                            response_json = json.dumps(response)
-                            self.client.sendall(response_json.encode('utf-8'))
-                        except json.JSONDecodeError:
-                            # Incomplete data; keep appending to buffer
-                            pass
+                        while True:
+                            if len(self.buffer) < 4:
+                                break
+                            msg_len = struct.unpack('>I', self.buffer[:4])[0]
+                            MAX_MSG_LEN = 50 * 1024 * 1024
+                            if msg_len > MAX_MSG_LEN:
+                                print(f"Message too large ({msg_len} bytes), disconnecting client")
+                                self._cleanup_client()
+                                break
+                            if len(self.buffer) < 4 + msg_len:
+                                break
+                            payload = self.buffer[4:4 + msg_len]
+                            self.buffer = self.buffer[4 + msg_len:]
+                            try:
+                                command = json.loads(payload.decode('utf-8'))
+                                response = self.execute_command(command)
+                                response_bytes = json.dumps(response).encode('utf-8')
+                                response_frame = struct.pack('>I', len(response_bytes)) + response_bytes
+                                try:
+                                    self.client.sendall(response_frame)
+                                except (BrokenPipeError, ConnectionResetError, OSError) as send_err:
+                                    print(f"Failed to send response (client likely disconnected): {send_err}")
+                                    self._cleanup_client()
+                                    break
+                            except json.JSONDecodeError as e:
+                                print(f"Invalid JSON in message: {e}")
                     else:
-                        # Connection closed by client
-                        print("Client disconnected")
-                        self.client.close()
-                        self.client = None
-                        self.buffer = b''
+                        print("Client disconnected (empty recv)")
+                        self._cleanup_client()
                 except BlockingIOError:
-                    pass  # No data available
-                except Exception as e:
-                    print(f"Error receiving data: {str(e)}")
-                    self.client.close()
-                    self.client = None
-                    self.buffer = b''
+                    pass
+                except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                    print(f"Client connection lost: {str(e)}")
+                    self._cleanup_client()
 
         except Exception as e:
             print(f"Server error: {str(e)}")
@@ -168,6 +220,7 @@ class HoudiniMCPServer:
             "render_single_view": self.handle_render_single_view,
             "render_quad_view": self.handle_render_quad_view,
             "render_specific_camera": self.handle_render_specific_camera,
+            "ping": self._handle_ping,
         }
         
         # If user has toggled asset library usage
@@ -187,6 +240,9 @@ class HoudiniMCPServer:
         result = handler(**params)
         print(f"Handler execution complete for {cmd_type}")
         return {"status": "success", "result": result}
+
+    def _handle_ping(self):
+        return {"pong": True, "protocol": 1}
 
     # -------------------------------------------------------------------------
     # Basic Info & Node Operations
@@ -517,13 +573,19 @@ class HoudiniMCPServer:
         """
         Unzip 'zip_path' into 'dest_folder'. Return list of extracted file paths.
         Helper for import_opus_url.
+        
+        Validates each entry to prevent ZipSlip (path traversal) attacks.
         """
         extracted_files = []
+        dest_folder = os.path.realpath(dest_folder)
         print(f"  Unzipping {zip_path} => {dest_folder}")
         try:
             with zipfile.ZipFile(zip_path, 'r') as z:
+                for info in z.infolist():
+                    extracted_path = os.path.realpath(os.path.join(dest_folder, info.filename))
+                    if not extracted_path.startswith(dest_folder + os.sep) and extracted_path != dest_folder:
+                        raise ValueError(f"ZipSlip detected: entry '{info.filename}' escapes destination folder")
                 z.extractall(dest_folder)
-                # Ensure forward slashes in extracted paths
                 extracted_files = [os.path.join(dest_folder, p).replace('\\', '/') for p in z.namelist()]
             print(f"  Unzip complete. Extracted {len(extracted_files)} files.")
             return extracted_files
@@ -540,6 +602,7 @@ class HoudiniMCPServer:
         and imports it into a new subnet in Houdini.
         """
         temp_dir = None
+        zip_filepath = None
         try:
             # Create a unique temporary directory for download and extraction
             temp_dir = tempfile.mkdtemp(prefix="houdini_opus_import_")
