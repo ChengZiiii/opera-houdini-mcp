@@ -151,7 +151,8 @@ OPUS provide a large set of furniture and environmental procedural assets.
 you will need a Rapid API key to log in. Create an account at: [RapidAPI](https://rapidapi.com/)
 Subscribe to OPUS API at: [OPUS API Subscribe](https://rapidapi.com/genel-gi78OM1rB/api/opus5/pricing)
 Get your Rapid API key at [OPUS API](https://rapidapi.com/genel-gi78OM1rB/api/opus5)
-add the key to urls.env
-### 4 Acknowledgement
+copy `urls.env.example` to `urls.env` and add your key (the file is gitignored).
+OPUS integration is optional — without a key the server still starts, only the OPUS tools are disabled.
+### 6 Acknowledgement
 
 Houdini-MCP was built following [blender-mcp](https://github.com/ahujasid/blender-mcp). We thank them for the contribution.
