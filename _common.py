@@ -56,6 +56,7 @@ __all__ = [
     "check_execute_code_policy",
     "_build_audit",
     "serialize_scene_state",
+    "invalidate_all_caches",
     "_run_code_thread",
 ]
 
@@ -785,28 +786,30 @@ def _build_audit(policy, bypass_used, dangerous_hits, heavy_hits,
     return audit
 
 
-def serialize_scene_state(hou, root_path=None, max_depth=2):
-    """PLACEHOLDER — PR 5 will replace.
+def serialize_scene_state(hou, root_path=None, include_params=False, max_depth=3):
+    """递归序列化 hou 场景子树，输出 JSON-safe 节点摘要（PR 5 完整实现）。
 
-    PR 4 仅返回最小摘要：节点数 + 顶层节点列表。完整序列化（参数 / 属性 /
-    max_depth 递归等）由 PR 5 `_scene.py` 提供。hou 参数由调用方注入。
+    - hou 参数由调用方注入（本模块不顶层 import hou）
+    - root_path 缺省 "/" 即整个场景
+    - include_params=True 时附加每个节点的 parm eval 值（过 _json_safe_hou_value）
+    - max_depth 截断：到深度后只返当前节点 summary，不继续递归子节点
+    - 返回 dict：root_path / node_count / nodes[ {path,type,category,
+      children_count[, parameters]} ]
     """
     if root_path is None:
         root_path = "/"
     try:
         root = hou.node(root_path)
     except Exception:
-        return {"root_path": root_path, "error": "failed to resolve root"}
+        return {"root_path": root_path, "error": "failed to resolve root",
+                "node_count": 0, "nodes": []}
     if root is None:
         return {"root_path": root_path, "node_count": 0, "nodes": []}
 
     nodes = []
 
     def _walk(node, depth):
-        if depth > max_depth:
-            return
         try:
-            name = node.name()
             path = node.path()
         except Exception:
             return
@@ -814,10 +817,43 @@ def serialize_scene_state(hou, root_path=None, max_depth=2):
             type_name = node.type().name()
         except Exception:
             type_name = "unknown"
-        nodes.append({"name": name, "path": path, "type": type_name})
+        try:
+            type_category = node.type().category().name()
+        except Exception:
+            type_category = "unknown"
         try:
             children = node.children()
+            children_count = len(children)
         except Exception:
+            children_count = 0
+            children = []
+
+        entry = {
+            "path": path,
+            "type": type_name,
+            "category": type_category,
+            "children_count": children_count,
+        }
+        if include_params:
+            try:
+                parms = node.parms() or []
+            except Exception:
+                parms = []
+            parm_dict = {}
+            for p in parms:
+                try:
+                    pname = p.name()
+                    pval = p.eval()
+                    parm_dict[pname] = _json_safe_hou_value(hou, pval, max_depth=2)
+                except Exception:
+                    # 单个 parm 失败不影响整体
+                    continue
+            entry["parameters"] = parm_dict
+
+        nodes.append(entry)
+
+        # depth limit: max_depth=0 表示仅 root；>0 继续递归
+        if depth >= max_depth:
             return
         for child in children:
             _walk(child, depth + 1)
@@ -828,6 +864,18 @@ def serialize_scene_state(hou, root_path=None, max_depth=2):
         "node_count": len(nodes),
         "nodes": nodes,
     }
+
+
+# ---------------------------------------------------------------------------
+# Section 11: cache invalidation placeholder (PR 5 -> PR 6 NodeTypeCache)
+# ---------------------------------------------------------------------------
+def invalidate_all_caches():
+    """清除所有节点类型缓存。PR 6 will replace with NodeTypeCache-aware version.
+
+    PR 5 占位实现：当前无缓存层，no-op。后续 _scene.load_scene / new_scene
+    等场景突变操作仍调用本函数，PR 6 会替换为遍历 _cache_registry 的实现。
+    """
+    return None
 
 
 def _run_code_thread(code, namespace, timeout=30):

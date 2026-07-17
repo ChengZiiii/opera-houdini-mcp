@@ -32,6 +32,7 @@ except ImportError:
 import io
 from contextlib import redirect_stdout, redirect_stderr
 from . import _common as cmn
+from . import _scene as scn
 
 # PR 4 scene-diff cache：execute_code(capture_diff=True) 时填充；get_last_scene_diff 读取。
 _before_scene = None
@@ -226,6 +227,9 @@ class HoudiniMCPServer:
         # Always-available handlers
         handlers = {
             "get_scene_info": self.get_scene_info,
+            "save_scene": self.save_scene,
+            "load_scene": self.load_scene,
+            "new_scene": self.new_scene,
             "create_node": self.create_node,
             "modify_node": self.modify_node,
             "delete_node": self.delete_node,
@@ -309,15 +313,24 @@ class HoudiniMCPServer:
         return {"enabled": use_assetlib, "message": msg}
 
     def get_scene_info(self):
-        """Returns basic info about the current .hip file and top-level nodes per context."""
+        """Returns basic info about the current .hip file and top-level nodes per context.
+
+        PR 5 增强：合并 _scene.get_scene_info(hou) 输出，新增 houdini_version /
+        node_count / file_path 字段；保留旧的 name / filepath / fps / frames / contexts。
+        """
         try:
             hip_file = hou.hipFile.name()
+            # PR 5: 先拿 _scene.get_scene_info 提供的版本 / 节点数 / file_path
+            scene_meta = scn.get_scene_info(hou)
             scene_info = {
                 "name": os.path.basename(hip_file) if hip_file else "Untitled",
                 "filepath": hip_file or "",
-                "fps": hou.fps(),
-                "start_frame": hou.playbar.frameRange()[0],
-                "end_frame": hou.playbar.frameRange()[1],
+                "houdini_version": scene_meta.get("houdini_version", ""),
+                "node_count": scene_meta.get("node_count", 0),
+                "file_path": scene_meta.get("file_path", ""),
+                "fps": scene_meta.get("fps", hou.fps()),
+                "start_frame": scene_meta.get("start_frame", hou.playbar.frameRange()[0]),
+                "end_frame": scene_meta.get("end_frame", hou.playbar.frameRange()[1]),
                 "contexts": {},
             }
 
@@ -346,6 +359,21 @@ class HoudiniMCPServer:
         except Exception as e:
             traceback.print_exc()
             return {"error": str(e)}
+
+    def save_scene(self, file_path):
+        """PR 5: 保存当前 .hip 文件到 file_path。thin wrapper around scn.save_scene."""
+        return scn.save_scene(hou, file_path)
+
+    def load_scene(self, file_path):
+        """PR 5: 加载 file_path 为当前 .hip 文件；自动调用 cmn.invalidate_all_caches()。
+
+        不在 MUTATING_COMMANDS 内（由 _scene 层负责 cache 失效）。
+        """
+        return scn.load_scene(hou, file_path)
+
+    def new_scene(self):
+        """PR 5: 新建空白场景（suppress_save_prompt=True）；自动调用 invalidate_all_caches()。"""
+        return scn.new_scene(hou)
 
     def create_node(self, node_type, parent_path="/obj", name=None, position=None, parameters=None):
         """Creates a new node in the specified parent."""
