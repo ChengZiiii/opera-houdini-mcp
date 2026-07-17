@@ -976,6 +976,29 @@ def find_error_nodes(ctx, root_path="/", include_warnings=True,
     })
 
 
+# ---------------------------------------------------------------------------
+# PR 12 Geometry Summary (thin relay to server-side _geo_summary)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def get_geo_summary(ctx, node_path, max_points_for_full=1000000,
+                    sample_size=10):
+    """获取几何节点的轻量级概要信息。
+
+    返回 SOP 节点的 point / primitive / vertex 计数、bbox 6 元、attributes /
+    groups 列表（带 name/type/size），以及前 sample_size 个点的属性采样。
+    point_count 超过 max_points_for_full 时自动降级 — 跳过 sample_points 与
+    详细 attributes/groups，避免大几何撑爆 MCP。比 get_geometry_info 更轻，
+    比 get_geometry_data 更结构化。适用于“先看看节点生成了什么规模的几何”。
+    """
+    return _houdini_call("get_geo_summary", {
+        "node_path": node_path,
+        "max_points_for_full": max_points_for_full,
+        "sample_size": sample_size,
+    })
+
+
 @mcp.tool()
 def cook_node(ctx: Context, path: str) -> dict:
     """

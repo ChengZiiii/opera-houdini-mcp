@@ -39,6 +39,7 @@ from . import _materials as mats
 from . import _hscript as hsc
 from . import _graph_edit as ge
 from . import _node_info as ni
+from . import _geo_summary as gs
 
 # PR 4 scene-diff cache：execute_code(capture_diff=True) 时填充；get_last_scene_diff 读取。
 _before_scene = None
@@ -259,6 +260,8 @@ class HoudiniMCPServer:
             "create_network_box": self.create_network_box,
             "find_error_nodes": self.find_error_nodes,
             "cook_node": self.cook_node,
+            # PR 12: 轻量级几何概要 + 大几何降级
+            "get_geo_summary": self.get_geo_summary,
             # VEX wrangles
             "create_wrangle": self.create_wrangle,
             "set_wrangle_code": self.set_wrangle_code,
@@ -973,6 +976,20 @@ class HoudiniMCPServer:
         return en.find_error_nodes(
             hou, root_path=root_path, include_warnings=include_warnings,
             max_warnings=max_warnings, max_errors=max_errors)
+
+    def get_geo_summary(self, node_path, max_points_for_full=1000000,
+                        sample_size=10):
+        """PR 12：获取几何节点的轻量级概要信息。
+
+        薄封装到 _geo_summary.get_geo_summary，复用 server.py 的
+        _resolve_geometry_node 解析 OBJ/SOP 路径。point_count 超过
+        max_points_for_full 时自动降级（跳过 sample_points 与详细
+        attributes/groups）。
+        """
+        return gs.get_geo_summary(
+            hou, node_path=node_path,
+            max_points_for_full=max_points_for_full,
+            sample_size=sample_size)
 
     def cook_node(self, path):
         """Force-cook a node and report errors, warnings and cook time."""
