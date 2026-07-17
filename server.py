@@ -35,6 +35,7 @@ from . import _common as cmn
 from . import _scene as scn
 from . import _discovery as disc
 from . import _materials as mats
+from . import _hscript as hsc
 
 # PR 4 scene-diff cache：execute_code(capture_diff=True) 时填充；get_last_scene_diff 读取。
 _before_scene = None
@@ -270,6 +271,8 @@ class HoudiniMCPServer:
             "create_material": self.create_material,
             "assign_material": self.assign_material,
             "get_material_info": self.get_material_info,
+            # PR 8: HScript 执行包装（薄封装到 _hscript.execute_hscript）
+            "execute_hscript": self.execute_hscript,
         }
         
         # If user has toggled asset library usage
@@ -426,6 +429,15 @@ class HoudiniMCPServer:
         """PR 7: 查询材质节点详细参数 + texture 引用列表。
         thin wrapper to mats.get_material_info."""
         return mats.get_material_info(hou, material_path)
+
+    def execute_hscript(self, code):
+        """PR 8: 在 Houdini 端执行 HScript 命令字符串。thin wrapper to hsc.execute_hscript.
+
+        HScript 是 Houdini 传统脚本语言，可能修改场景（与 execute_code 同级别
+        风险），但用户已显式调用 HScript，风险自担，因此不在
+        MUTATING_COMMANDS 集合内。
+        """
+        return hsc.execute_hscript(hou, code)
 
     def create_node(self, node_type, parent_path="/obj", name=None, position=None, parameters=None):
         """Creates a new node in the specified parent."""

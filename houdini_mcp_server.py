@@ -1281,6 +1281,50 @@ def get_opus_job_result(batch_job_id: str) -> dict:
 
 
 # -------------------------------------------------------------------
+# PR 8 HScript Tools (thin relay to server-side _hscript)
+# -------------------------------------------------------------------
+@mcp.tool()
+def execute_hscript(ctx, code):
+    """在 Houdini 中执行 HScript 命令字符串。
+
+    HScript 是 Houdini 的传统脚本语言（与 Python/HScript 两套接口并存），
+    适合执行 `ls`、`cd`、`opset` 等内建命令。调用结果以 stdout / stderr
+    形式返回。
+
+    参数说明：
+    - code: HScript 命令字符串（如 "cd /obj; ls"）。空字符串 / 纯空白
+      会被服务端拒绝并返回错误。
+
+    返回字符串包含 stdout / stderr 两段；连接或服务端出错时返回
+    "Error (...): ..." 形式的提示。
+    """
+    try:
+        conn = get_houdini_connection()
+        response = conn.send_command("execute_hscript", {"code": code})
+
+        if response.get("status") == "error":
+            origin = response.get('origin', 'houdini')
+            return "Error ({0}): {1}".format(
+                origin, response.get('message', 'Unknown error'))
+
+        result = response.get("result", {}) or {}
+        stdout = (result.get("stdout") or "").rstrip()
+        stderr = (result.get("stderr") or "").rstrip()
+        output_message = "HScript executed."
+        if stdout:
+            output_message += "\n--- Stdout ---\n{0}".format(stdout)
+        if stderr:
+            output_message += "\n--- Stderr ---\n{0}".format(stderr)
+        return output_message
+    except ConnectionError as e:
+        return "Connection Error executing HScript: {0}".format(e)
+    except Exception as e:
+        logger.error("Unexpected error in execute_hscript tool: {0}".format(e),
+                     exc_info=True)
+        return "Server Error executing HScript: {0}".format(e)
+
+
+# -------------------------------------------------------------------
 # PR 7 Materials Tools (thin relay to server-side _materials)
 # -------------------------------------------------------------------
 @mcp.tool()
