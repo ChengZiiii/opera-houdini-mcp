@@ -80,10 +80,13 @@ class _FakeNode(object):
     """
 
     def __init__(self, name, errors=None, warnings=None,
-                 sub_children=None, parent=None):
+                 sub_children=None, parent=None,
+                 errors_exc=None, warnings_exc=None):
         self._name = name
         self._errors = list(errors) if errors else []
         self._warnings = list(warnings) if warnings else []
+        self._errors_exc = errors_exc
+        self._warnings_exc = warnings_exc
         self._parent = parent
         self._path = None
         self._type_name = name
@@ -116,10 +119,14 @@ class _FakeNode(object):
         return _FakeNodeType(self._type_name)
 
     def errors(self):
+        if self._errors_exc is not None:
+            raise self._errors_exc
         # Return a fresh list each call to mimic hou.Node.
         return list(self._errors)
 
     def warnings(self):
+        if self._warnings_exc is not None:
+            raise self._warnings_exc
         return list(self._warnings)
 
     def allSubChildren(self):
@@ -644,6 +651,198 @@ class PR11BridgeBehaviorTests(unittest.TestCase):
         self.assertEqual(len(server_calls), 1)
         self.assertEqual(server_calls[0]["root_path"], "/obj")
         self.assertTrue(server_calls[0]["include_warnings"])
+
+
+# ===========================================================================
+# Section H: back-compat aliases (error_node_count / nodes) — PR 11 fix
+# ===========================================================================
+class BackCompatAliasTests(unittest.TestCase):
+    """PR 11 reviewer finding (Critical): the previous contract returned
+    `error_node_count` (int) and `nodes` (list of error-node dicts). Those
+    fields were dropped by PR 11, breaking `tests/test_tools.py:74-86`
+    which still reads them. They must be restored as compat aliases.
+
+    Semantic decision: BOTH `error_node_count` and `nodes` reference error
+    nodes only (consistent with the function name `find_error_nodes` and
+    with the legacy variable naming). This means:
+        error_node_count == len(error_nodes)
+        nodes == error_nodes  (same list object)
+    Warnings are still surfaced via the dedicated `warning_nodes` field.
+    """
+
+    def test_error_node_count_present_and_matches_error_nodes(self):
+        hou, obj, clean, broken, noisy, warny = _make_simple_hou()
+        result = en.find_error_nodes(hou, "/obj")
+        self.assertIn("error_node_count", result,
+                      "missing back-compat field 'error_node_count'")
+        # broken (2 err) + noisy (1 err) = 2 error nodes; warny/clean no err
+        self.assertEqual(result["error_node_count"], 2)
+        self.assertEqual(result["error_node_count"],
+                         len(result["error_nodes"]))
+
+    def test_nodes_field_present_and_is_error_nodes(self):
+        hou, obj, clean, broken, noisy, warny = _make_simple_hou()
+        result = en.find_error_nodes(hou, "/obj")
+        self.assertIn("nodes", result,
+                      "missing back-compat field 'nodes'")
+        # `nodes` must be the error_nodes list (same content, same order).
+        paths = [n["path"] for n in result["nodes"]]
+        self.assertIn("/obj/broken", paths)
+        self.assertIn("/obj/noisy", paths)
+        self.assertNotIn("/obj/warny", paths,
+                         "nodes alias must NOT include warning-only nodes")
+        self.assertNotIn("/obj/clean", paths)
+        # Same dicts as error_nodes entry-for-entry.
+        self.assertEqual(result["nodes"], result["error_nodes"])
+
+    def test_aliases_hold_when_scene_is_clean(self):
+        """When no nodes have errors, error_node_count must be 0 and
+        `nodes` must be an empty list (so existing assertions like
+        `r["error_node_count"] == 0` keep working)."""
+        clean_only = _FakeNode("clean")
+        obj = _FakeNode("obj", sub_children=[clean_only])
+        obj._path = "/obj"
+        clean_only._path = "/obj/clean"
+        hou = _FakeHou(obj)
+        result = en.find_error_nodes(hou, "/obj")
+        self.assertEqual(result["error_node_count"], 0)
+        self.assertEqual(result["nodes"], [])
+
+
+# ===========================================================================
+# Section I: node-level errors()/warnings() exception propagation — PR 11 fix
+# ===========================================================================
+class NodeLevelExceptionPropagationTests(unittest.TestCase):
+    """PR 11 reviewer finding (Important 1): the previous implementation
+    silently turned any Exception from node.errors()/warnings() into an
+    empty list, so a corrupt HOM call would look like a clean scene. The
+    fix records per-node failures in `_scan_errors` (so callers can see
+    something went wrong) but does NOT abort the whole scan.
+    """
+
+    def test_errors_exception_does_not_abort_scan(self):
+        """One node's errors() raising must not stop siblings from being
+        classified. After scan, the OTHER error nodes are still present."""
+        good = _FakeNode("good", errors=["real error"])
+        bad = _FakeNode("bad", errors_exc=RuntimeError("hom hiccup"))
+        obj = _FakeNode("obj", sub_children=[good, bad])
+        obj._path = "/obj"
+        good._path = "/obj/good"
+        bad._path = "/obj/bad"
+        hou = _FakeHou(obj)
+        result = en.find_error_nodes(hou, "/obj")
+        paths = [n["path"] for n in result["error_nodes"]]
+        self.assertIn("/obj/good", paths,
+                      "sibling node must still be reported even when a "
+                      "neighbor's errors() raised")
+
+    def test_errors_exception_recorded_in_scan_errors(self):
+        bad = _FakeNode("bad", errors_exc=RuntimeError("hom hiccup"))
+        obj = _FakeNode("obj", sub_children=[bad])
+        obj._path = "/obj"
+        bad._path = "/obj/bad"
+        hou = _FakeHou(obj)
+        result = en.find_error_nodes(hou, "/obj")
+        self.assertIn("_scan_errors", result,
+                      "missing _scan_errors field for per-node failures")
+        self.assertEqual(len(result["_scan_errors"]), 1)
+        entry = result["_scan_errors"][0]
+        self.assertEqual(entry["path"], "/obj/bad")
+        self.assertEqual(entry["phase"], "errors")
+        self.assertIn("hom hiccup", entry["error"])
+
+    def test_warnings_exception_recorded_in_scan_errors(self):
+        bad = _FakeNode("bad", warnings_exc=RuntimeError("warn fail"))
+        obj = _FakeNode("obj", sub_children=[bad])
+        obj._path = "/obj"
+        bad._path = "/obj/bad"
+        hou = _FakeHou(obj)
+        result = en.find_error_nodes(hou, "/obj",
+                                     include_warnings=True)
+        self.assertEqual(len(result["_scan_errors"]), 1)
+        entry = result["_scan_errors"][0]
+        self.assertEqual(entry["phase"], "warnings")
+
+    def test_clean_scan_has_empty_scan_errors(self):
+        hou, obj, clean, broken, noisy, warny = _make_simple_hou()
+        result = en.find_error_nodes(hou, "/obj")
+        self.assertIn("_scan_errors", result)
+        self.assertEqual(result["_scan_errors"], [])
+
+    def test_errors_exception_does_not_double_count_in_error_nodes(self):
+        """A node whose errors() raised must NOT appear in error_nodes
+        (we have no actual error messages to report), but it MUST appear
+        in _scan_errors."""
+        bad = _FakeNode("bad", errors_exc=RuntimeError("boom"))
+        obj = _FakeNode("obj", sub_children=[bad])
+        obj._path = "/obj"
+        bad._path = "/obj/bad"
+        hou = _FakeHou(obj)
+        result = en.find_error_nodes(hou, "/obj")
+        paths = [n["path"] for n in result["error_nodes"]]
+        self.assertNotIn("/obj/bad", paths)
+        self.assertEqual(len(result["_scan_errors"]), 1)
+
+
+# ===========================================================================
+# Section J: bridge error envelope passthrough — PR 11 fix
+# ===========================================================================
+class PR11BridgeErrorPassthroughTests(unittest.TestCase):
+    """PR 11 reviewer finding (Important 2): no test covered the case where
+    `_houdini_call` returns a status="error" envelope. The bridge tool must
+    propagate the envelope verbatim so the agent sees the real error
+    instead of a fake success. Mirrors `tests/test_node_info.py:715-737`.
+    """
+
+    def setUp(self):
+        self.fn = _find_pr11_tool_nodes()["find_error_nodes"]
+
+    def test_bridge_propagates_error_envelope(self):
+        """When _houdini_call returns status='error', the bridge returns
+        that envelope unchanged (so callers see the real error)."""
+        def _houdini_call(command, params):
+            return {
+                "status": "error",
+                "message": "节点不存在: " + params.get("root_path", ""),
+                "origin": "houdini",
+            }
+
+        _FakeMcp = type(
+            "_FakeMcp", (), {"tool": staticmethod(lambda: lambda f: f)})
+        namespace = {"_houdini_call": _houdini_call, "mcp": _FakeMcp()}
+        module = ast.Module(body=[self.fn], type_ignores=[])
+        ast.fix_missing_locations(module)
+        exec(compile(module, SERVER_PY, "exec"), namespace)
+
+        result = namespace["find_error_nodes"](object(), "/obj/missing")
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["origin"], "houdini")
+        self.assertIn("节点不存在", result["message"])
+        self.assertIn("/obj/missing", result["message"])
+
+    def test_bridge_propagates_success_envelope(self):
+        """Sanity: when _houdini_call returns success, the bridge returns
+        that dict unchanged."""
+        success_payload = {
+            "status": "success",
+            "result": {"error_nodes": [], "warning_nodes": []},
+        }
+
+        def _houdini_call(command, params):
+            return success_payload
+
+        _FakeMcp = type(
+            "_FakeMcp", (), {"tool": staticmethod(lambda: lambda f: f)})
+        namespace = {"_houdini_call": _houdini_call, "mcp": _FakeMcp()}
+        module = ast.Module(body=[self.fn], type_ignores=[])
+        ast.fix_missing_locations(module)
+        exec(compile(module, SERVER_PY, "exec"), namespace)
+
+        result = namespace["find_error_nodes"](object(), "/obj")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(
+            result["result"]["error_nodes"],
+            success_payload["result"]["error_nodes"])
 
 
 if __name__ == "__main__":

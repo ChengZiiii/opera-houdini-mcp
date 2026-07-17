@@ -38,7 +38,14 @@ def find_error_nodes(hou, root_path="/", include_warnings=True,
             ],
             "_warnings_truncated": bool,  # True if warnings 超过 max_warnings
             "_errors_truncated": bool,    # True if errors 超过 max_errors
-            "scan_root": str              # root.path()
+            "_scan_errors": [             # 节点级 errors()/warnings() 失败明细
+                {"path": str, "phase": "errors"|"warnings", "error": str},
+                ...
+            ],
+            "scan_root": str,             # root.path()
+            # --- 旧契约兼容别名（PR 11 reviewer Critical finding）---
+            "error_node_count": int,      # == len(error_nodes)
+            "nodes": [error_node_dict, ...]  # == error_nodes（仅 error）
         }
 
     Raises:
@@ -55,11 +62,19 @@ def find_error_nodes(hou, root_path="/", include_warnings=True,
     warning_nodes = []
     _warnings_truncated = False
     _errors_truncated = False
+    _scan_errors = []
 
     for node in all_nodes:
         try:
             errs = node.errors()
-        except Exception:
+        except Exception as exc:
+            # PR 11 reviewer (Important 1): 节点级 errors() 异常不再静默转空，
+            # 记录到 _scan_errors 让调用方看见扫描失败节点；扫描整体继续。
+            _scan_errors.append({
+                "path": node.path(),
+                "phase": "errors",
+                "error": str(exc),
+            })
             errs = []
         errs_clean = [str(e) for e in errs if str(e).strip()]
         if errs_clean:
@@ -75,7 +90,12 @@ def find_error_nodes(hou, root_path="/", include_warnings=True,
         if include_warnings:
             try:
                 warns = node.warnings()
-            except Exception:
+            except Exception as exc:
+                _scan_errors.append({
+                    "path": node.path(),
+                    "phase": "warnings",
+                    "error": str(exc),
+                })
                 warns = []
             warns_clean = [str(w) for w in warns if str(w).strip()]
             if warns_clean:
@@ -93,5 +113,9 @@ def find_error_nodes(hou, root_path="/", include_warnings=True,
         "warning_nodes": warning_nodes,
         "_warnings_truncated": _warnings_truncated,
         "_errors_truncated": _errors_truncated,
+        "_scan_errors": _scan_errors,
         "scan_root": root.path(),
+        # --- 旧契约兼容别名（PR 11 reviewer Critical finding）---
+        "error_node_count": len(error_nodes),
+        "nodes": error_nodes,
     }
