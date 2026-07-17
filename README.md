@@ -1,36 +1,50 @@
-# HoudiniMCP – Connect Houdini to Claude via Model Context Protocol
+# opera-houdini-mcp · Houdini MCP 的 Opera Fork
 
-**HoudiniMCP** allows you to control **SideFX Houdini** from **Claude** using the **Model Context Protocol (MCP)**. It consists of:
+> 本仓库是 [`capoomgit/houdini-mcp`](https://github.com/capoomgit/houdini-mcp) 的独立 fork，面向 [CsrLib-Houdini](https://github.com/ChengZiiii/CsrLib-Houdini) 的生产使用。MIT 协议完整保留，Capoom 2025 原版权声明与致谢保留在最末。
+>
+> 上游基线：`capoomgit/houdini-mcp` @ `de4fd93`（2026-07-17 同步）。
+> 同步策略：以 cherry-pick 为主，禁止 merge（避免污染 opera 自己的提交图）。
 
-1. A **Houdini plugin** (Python package) that listens on a local port (default `localhost:9876`) and handles commands (creating and modifying nodes, executing code, etc.).  
-2. An **MCP bridge script** you run via **uv** (or system Python) that communicates via **std**in/**std**out with Claude and **TCP** with Houdini.
+---
 
-Below are the complete instructions for setting up Houdini, uv, and Claude Desktop.
+## 关于本 Fork
+
+`opera-houdini-mcp` 是为 [CsrLib-Houdini](https://github.com/ChengZiiii/CsrLib-Houdini) 工作流量身定制的 Houdini MCP 服务端。它在功能上与上游完全兼容，但额外提供：
+
+- **Tier 1 工具集**（13 个独立模块，详见 `Tier 1 工具清单`）：
+  场景 CRUD、节点发现、图编辑增强、`get_node_info` 增强、材质、几何摘要、错误节点扫描（含 warnings）、`execute_code` 安全护栏、pane 截图与 base64 渲染、SideFX 在线文档查询、连接诊断、缓存管理、基础设施（`_common.py`）。
+- **execute_code 安全模型**：三档 policy（read-only / normal / privileged）+ dangerous / heavy / mutation 三套模式黑名单（正则 + AST 别名双检）+ 双开关 bypass（请求端 `allow_dangerous` 配服务端环境变量 `HOUDINI_MCP_ALLOW_BYPASS`）+ 结构化 audit。
+- **零新增 pip 依赖**：`get_houdini_help` 用 stdlib `html.parser` 替代 `beautifulsoup4`，仍然保持 `mcp[cli]==1.12.2 + requests + python-dotenv` 三件套。
+
+老用户升级路径：在 CsrLib-Houdini 仓库根目录执行 `git submodule update --remote external/houdinimcp && git submodule sync`，无需重装 env、无需改动 AI 工具 JSON。
 
 ---
 
 ## Table of Contents
 
-1. [Requirements](#requirements)  
-2. [Houdini MCP Plugin Installation](#houdini-mcp-plugin-installation)  
-   1. [Folder Layout](#folder-layout)  
-   2. [Shelf Tool (Optional)](#shelf-tool-optional)  
-   3. [Packages Integration (Optional)](#packages-integration-optional)  
-3. [Installing the `mcp` Python Package](#installing-the-mcp-python-package)  
-   1. [Using uv on Windows](#using-uv-on-windows)  
-   2. [Using pip Directly](#using-pip-directly)  
-4. [Bridging Script and Claude for Desktop](#bridging-script-and-claude-for-desktop)  
-   1. [The Bridging Script](#the-bridging-script)  
-   2. [Telling Claude Desktop to Use Your Script](#telling-claude-desktop-to-use-your-script)  
-5. [Testing & Usage](#testing--usage)  
-6. [Troubleshooting](#troubleshooting)
+1. [Requirements](#requirements)
+2. [Houdini MCP Plugin Installation](#houdini-mcp-plugin-installation)
+   1. [Folder Layout](#folder-layout)
+   2. [Shelf Tool (Optional)](#shelf-tool-optional)
+   3. [Packages Integration (Optional)](#packages-integration-optional)
+3. [Installing the `mcp` Python Package](#installing-the-mcp-python-package)
+   1. [Using uv on Windows](#using-uv-on-windows)
+   2. [Using pip Directly](#using-pip-directly)
+4. [Bridging Script and Claude for Desktop](#bridging-script-and-claude-for-desktop)
+   1. [The Bridging Script](#the-bridging-script)
+   2. [Telling Claude Desktop to Use Your Script](#telling-claude-desktop-to-use-your-script)
+5. [Testing & Usage](#testing--usage)
+6. [Tier 1 工具清单](#tier-1-工具清单)
+7. [execute_code 安全模型](#execute_code-安全模型)
+8. [Troubleshooting](#troubleshooting)
+9. [Acknowledgement](#acknowledgement)
 
 ---
 
 ## Requirements
 
-- **SideFX Houdini**  
-- **uv** 
+- **SideFX Houdini**
+- **uv**
 - **Claude Desktop** (latest version)
 
 ---
@@ -40,31 +54,28 @@ Below are the complete instructions for setting up Houdini, uv, and Claude Deskt
 ### 1.1 Folder Layout
 
 Create a folder in your Houdini scripts directory:
-C:/Users/YourUserName/Documents/houdini19.5/scripts/python/houdinimcp/
+`C:/Users/YourUserName/Documents/houdini19.5/scripts/python/houdinimcp/`
 
 Inside **`houdinimcp/`**, place:
 
-- **`__init__.py`** – handles plugin initialization (start/stop server)  
-- **`server.py`** – defines the `HoudiniMCPServer` (listening on port `9876`)  
+- **`__init__.py`** – handles plugin initialization (start/stop server)
+- **`server.py`** – defines the `HoudiniMCPServer` (listening on port `9876`)
 - **`houdini_mcp_server.py`** – optional bridging script (some prefer a separate location)
 - **`pyproject.toml`**
 
-
 *(If you prefer, `houdini_mcp_server.py` can live elsewhere. As long as you know its path for running with `uv`.)*
 
-### 1.2 Shelf Tool 
+### 1.2 Shelf Tool
 
 create a **Shelf Tool** to toggle the server in Houdini:
 
-1. **Right-click** a shelf → **"New Shelf..."** 
+1. **Right-click** a shelf → **"New Shelf..."**
 
-Name it "MCP" or something similar
+   Name it "MCP" or something similar
 
-
-
-2. **Right-click** again → **"New Tool..."** 
-Name: "Toggle MCP Server"
-Label: "MCP"
+2. **Right-click** again → **"New Tool..."**
+   Name: "Toggle MCP Server"
+   Label: "MCP"
 
 3. Under **Script**, insert something like:
 
@@ -78,13 +89,12 @@ Label: "MCP"
    else:
        houdinimcp.start_server()
        hou.ui.displayMessage("Houdini MCP Server started on localhost:9876")
-
 ```
 
+### 1.3 Packages Integration
 
-### 1.3 Packages Integration 
+If you want Houdini to auto-load your plugin at startup, create a package file named `houdinimcp.json` in the Houdini packages folder (e.g. `C:/Users/YourUserName/Documents/houdini19.5/packages/`):
 
-If you want Houdini to auto-load your plugin at startup, create a package file named houdinimcp.json in the Houdini packages folder (e.g. C:/Users/YourUserName/Documents/houdini19.5/packages/):
 ```json
 {
   "path": "$HOME/houdini19.5/scripts/python/houdinimcp",
@@ -99,8 +109,9 @@ If you want Houdini to auto-load your plugin at startup, create a package file n
 ```
 
 ### 2 Using uv on Windows
+
 ```powershell
-  # 1) Install uv 
+  # 1) Install uv
   powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
   # 2) add uv to your PATH (depends on the user instructions) from cmd
@@ -113,10 +124,11 @@ If you want Houdini to auto-load your plugin at startup, create a package file n
   # 4) Verify
   uv run python -c "import mcp.server.fastmcp; print('MCP is installed!')"
 ```
+
 ### 3 Telling Claude for Desktop to Use Your Script
-Go to File > Settings > Developer > Edit Config > 
-Open or create:
-claude_desktop_config.json
+
+Go to File > Settings > Developer > Edit Config >
+Open or create: `claude_desktop_config.json`
 
 Add an entry:
 
@@ -134,15 +146,19 @@ Add an entry:
   }
 }
 ```
+
 if uv run was successful and claude failed to load mcp, make sure claude is using the same python version, use:
+
 ```cmd
   python -c "import sys; print(sys.executable)"
-``` 
-to find python, and replace "python" with the path you got. 
+```
+
+to find python, and replace "python" with the path you got.
 
 ### 4 Use Cursor
+
 Go to Settings > MCP > add new MCP server
-add the same entry in claude_desktop_config.json
+add the same entry in `claude_desktop_config.json`
 you might need to stop claude and restart houdini and the server
 
 ### 5 OPUS integration
@@ -153,6 +169,72 @@ Subscribe to OPUS API at: [OPUS API Subscribe](https://rapidapi.com/genel-gi78OM
 Get your Rapid API key at [OPUS API](https://rapidapi.com/genel-gi78OM1rB/api/opus5)
 copy `urls.env.example` to `urls.env` and add your key (the file is gitignored).
 OPUS integration is optional — without a key the server still starts, only the OPUS tools are disabled.
-### 6 Acknowledgement
+
+---
+
+## Tier 1 工具清单
+
+> 以下工具以独立 PR 形式陆续合入。每次合入后会在 `CHANGELOG.md` 追加记录。本节列出最终交付时的目标清单。
+
+| 类别 | 工具名 | 说明 |
+|------|--------|------|
+| 场景 | `get_scene_info` | 增强版场景元信息（houdini_version / node_count） |
+| 场景 | `save_scene` / `load_scene` / `new_scene` | 场景 CRUD，自动失效缓存 |
+| 节点发现 | `list_node_types` | 按 category 过滤 + name 模糊匹配 + 分页 |
+| 节点发现 | `list_children` | 递归子树 + compact 模式 + 分页 |
+| 节点发现 | `find_nodes` | glob + 类型过滤，Houdini 端单次扫描 |
+| 图编辑 | `reorder_inputs` / `layout_children` / `set_node_position` / `set_node_color` / `create_network_box` | 节点位置/颜色/网络盒 |
+| 节点信息 | `get_node_info` | 增强：errors / cook_state / compact / input details |
+| 错误扫描 | `find_error_nodes` | 默认含 warnings，单次 `allSubChildren` 扫描 |
+| 几何 | `get_geo_summary` | counts / bbox / attributes / groups + 大几何降级 |
+| 材质 | `create_material` / `assign_material` / `get_material_info` | 50+ 参数白名单 + texture 引用识别 |
+| HScript | `execute_hscript` | 包装 `hou.hscript` |
+| 安全代码 | `execute_code` | 三档 policy + bypass 双开关 + 结构化 audit |
+| 安全代码 | `get_last_scene_diff` | 仅 mutation 模式提供前后场景快照 |
+| 截图 | `capture_pane_screenshot` / `render_node_network` / `list_visible_panes` / `capture_multiple_panes` | pane 截图，响应走 `apply_response_cap` |
+| 渲染 | `render_viewport_base64` / `render_quad_views_base64` | base64 版，karma cpu/xpu 双 renderer |
+| 文档 | `get_houdini_help` | SideFX 在线文档解析（urllib + stdlib html.parser） |
+| 诊断 | `check_connection` / `ping_houdini` | 不持久化连接的 ping |
+| 缓存 | `manage_cache` | stats / invalidate / warmup |
+
+---
+
+## execute_code 安全模型
+
+| Policy | mutation | dangerous | heavy_geometry | import hou | 默认 bypass |
+|--------|----------|-----------|----------------|------------|-------------|
+| `read-only` | **拒绝**（命中 mutation 正则/AST） | 拒绝 | 拒绝 | 拒绝 | — |
+| `normal`（默认） | 允许 | 拒绝（除非 `allow_dangerous=True`） | 拒绝（除非 `allow_heavy_geometry=True`） | 提示 | 仅在客户端显式开启 |
+| `privileged` | 允许 | 允许（必须同时开启 `allow_dangerous=True` **和** `HOUDINI_MCP_ALLOW_BYPASS=1`） | 允许（必须同时开启 `allow_heavy_geometry=True` **和** `HOUDINI_MCP_ALLOW_BYPASS=1`） | 允许 | 必须服务端环境变量 |
+
+**双开关原则**：任何 dangerous / heavy / privileged 操作都需要「请求端参数 + 服务端环境变量」同时开启。服务端不开环境变量，再多客户端请求也无效。
+
+**Audit**：每次 `execute_code` 调用都会在响应里附 `_audit` 块（policy / dangerous_hits / heavy_hits / mutation_hits / bypass_used / elapsed_ms / undo_group / exception）。
+
+**超时**：执行超时**不会**自动 `hou.undos.performUndo()`，避免误回滚正常操作。客户端需根据 `_audit.elapsed_ms` 自行决定。
+
+---
+
+## Troubleshooting
+
+| 现象 | 排查 | 修复 |
+|------|------|------|
+| MCP Install 按钮失败 | 检查 Houdini Python 版本与 uv 版本 | 重装 uv，重启 Houdini |
+| AI 连不上 9876 | `netstat -an | findstr 9876` | 关防火墙，或在 shelf 重新 Start MCP |
+| License 相关 | Houdini license server 状态 | `hkey -n` 看 license，Houdini 21 试用版过期需要重新申请 |
+| 升级后工具找不到 | Houdini 还加载着旧 plugin | 在 shelf 点 Stop MCP → 重启 Houdini → 点 Start MCP |
+| `get_houdini_help` 失败 | 网络是否能访问 `www.sidefx.com` | 失败时降级为 `hou.helpServerUrl()` 提示，详见 `_help.py` |
+
+---
+
+## Acknowledgement
 
 Houdini-MCP was built following [blender-mcp](https://github.com/ahujasid/blender-mcp). We thank them for the contribution.
+
+opera-houdini-mcp 是 [capoomgit/houdini-mcp](https://github.com/capoomgit/houdini-mcp) 的独立 fork，遵循 MIT 协议，原版权归 Capoom 2025 所有。本 fork 在 [CsrLib-Houdini](https://github.com/ChengZiiii/CsrLib-Houdini) 工作流下使用，提交通过 cherry-pick 而非 merge 同步上游。
+
+---
+
+## License
+
+本仓库全部代码沿用上游 [MIT License](./LICENSE)。`opera-houdini-mcp` 本身的改动部分同样以 MIT 协议发布。
