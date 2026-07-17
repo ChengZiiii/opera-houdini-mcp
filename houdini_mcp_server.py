@@ -1280,6 +1280,53 @@ def get_opus_job_result(batch_job_id: str) -> dict:
 # ... (rest of existing code, main function etc) ...
 
 
+# -------------------------------------------------------------------
+# PR 7 Materials Tools (thin relay to server-side _materials)
+# -------------------------------------------------------------------
+@mcp.tool()
+def create_material(ctx: Context, material_type: str,
+                    name: str = None, parent_path: str = "/mat",
+                    parameters: Dict[str, Any] = None) -> dict:
+    """Create a material node in Houdini. Returns {path, type, name,
+    parameters_set}. Parent_path defaults to '/mat'. parameters is an
+    optional dict keyed by parm name. Missing parm names are silently
+    skipped (no error).
+    """
+    return _houdini_call("create_material", {
+        "material_type": material_type,
+        "name": name,
+        "parent_path": parent_path,
+        "parameters": parameters or {},
+    })
+
+
+@mcp.tool()
+def assign_material(ctx: Context, geometry_path: str,
+                    material_path: str, group: str = None) -> dict:
+    """Assign a material to a geometry node. geometry_path is the SOP/OBJ
+    path; material_path is the material node path; group is optional (apply
+    only to a primitive / point group). Returns
+    {geometry_path, material_path, group, success}.
+    """
+    return _houdini_call("assign_material", {
+        "geometry_path": geometry_path,
+        "material_path": material_path,
+        "group": group,
+    })
+
+
+@mcp.tool()
+def get_material_info(ctx: Context, material_path: str) -> dict:
+    """Get detailed info about a material node. Returns
+    {path, type, name, parameters, texture_references}. parameters is
+    filtered against the 50+ whitelist in _materials.MATERIAL_PARM_WHITELIST
+    so the response stays stable across material types. texture_references
+    lists parms whose eval value matches a known texture extension
+    (.png/.jpg/.jpeg/.exr/.hdr/.tif/.tiff/.rat/.tex).
+    """
+    return _houdini_call("get_material_info", {"material_path": material_path})
+
+
 def main():
     """Run the MCP server on stdio."""
     global _houdini_port

@@ -34,6 +34,7 @@ from contextlib import redirect_stdout, redirect_stderr
 from . import _common as cmn
 from . import _scene as scn
 from . import _discovery as disc
+from . import _materials as mats
 
 # PR 4 scene-diff cache：execute_code(capture_diff=True) 时填充；get_last_scene_diff 读取。
 _before_scene = None
@@ -265,6 +266,10 @@ class HoudiniMCPServer:
             "find_nodes": self.find_nodes,
             "manage_cache": self.manage_cache,
             "ping": self._handle_ping,
+            # PR 7: 材质 CRUD + 参数白名单 + texture 识别
+            "create_material": self.create_material,
+            "assign_material": self.assign_material,
+            "get_material_info": self.get_material_info,
         }
         
         # If user has toggled asset library usage
@@ -293,6 +298,8 @@ class HoudiniMCPServer:
         "import_opus_url", "import_asset", "connect_nodes", "disconnect_input",
         "set_parameters", "set_node_flags", "layout_children",
         "create_wrangle", "set_wrangle_code",
+        # PR 7: 材质 CRUD 命令也属于场景变更
+        "create_material", "assign_material",
     })
 
     @contextmanager
@@ -402,6 +409,23 @@ class HoudiniMCPServer:
     def manage_cache(self, action="stats"):
         """PR 6: cache 管理（stats / invalidate / warmup）。thin wrapper to disc.manage_cache."""
         return disc.manage_cache(hou, action=action)
+
+    def create_material(self, material_type, name=None, parent_path="/mat",
+                        parameters=None):
+        """PR 7: 创建材质节点。thin wrapper to mats.create_material."""
+        return mats.create_material(hou, material_type, name=name,
+                                    parent_path=parent_path,
+                                    parameters=parameters)
+
+    def assign_material(self, geometry_path, material_path, group=None):
+        """PR 7: 把材质绑定到几何节点。thin wrapper to mats.assign_material."""
+        return mats.assign_material(hou, geometry_path, material_path,
+                                    group=group)
+
+    def get_material_info(self, material_path):
+        """PR 7: 查询材质节点详细参数 + texture 引用列表。
+        thin wrapper to mats.get_material_info."""
+        return mats.get_material_info(hou, material_path)
 
     def create_node(self, node_type, parent_path="/obj", name=None, position=None, parameters=None):
         """Creates a new node in the specified parent."""
