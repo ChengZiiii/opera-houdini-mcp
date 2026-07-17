@@ -1325,6 +1325,112 @@ def execute_hscript(ctx, code):
 
 
 # -------------------------------------------------------------------
+# PR 9 Graph Edit Tools (thin relay to server-side _graph_edit)
+# -------------------------------------------------------------------
+@mcp.tool()
+def reorder_inputs(ctx, node_path, new_order=None, order=None):
+    """重新排列节点的输入顺序。
+
+    参数说明：
+    - node_path: 目标节点路径。
+    - new_order: list of input_index，按新顺序排列（如 [2, 0, 1] 表示把
+      原 input 2 移到 input 0，依此类推）。空 list 表示全部断开。
+    - order: 旧版别名；若同时传 new_order 与 order，以 new_order 为准。
+
+    返回 dict 包含 path / old_order / new_order / success 四项；
+    节点不存在时函数会抛 ValueError，bridge 不会再以 success:True 形式
+    静默吞错。
+    """
+    if order is not None:
+        return _houdini_call("reorder_inputs", {
+            "node_path": node_path, "new_order": new_order, "order": order,
+        })
+    return _houdini_call("reorder_inputs", {
+        "node_path": node_path, "new_order": new_order,
+    })
+
+
+@mcp.tool()
+def layout_children(ctx, parent_path=None, parent=None,
+                    horizontal_spacing=None, vertical_spacing=None,
+                    direction=None):
+    """布局父节点下的子节点（按间距参数手动 setPosition，跨 Houdini
+    版本可移植）。
+
+    参数说明：
+    - parent_path: 父节点路径（PR 9 推荐命名）。
+    - parent: 旧版别名；若同时传 parent_path 与 parent，以 parent_path 为准。
+    - horizontal_spacing: 水平间距（Houdini units），缺省 2.0。
+    - vertical_spacing: 垂直间距，缺省 1.5。
+    - direction: "horizontal"（默认）或 "vertical"。
+
+    返回 dict 包含 parent_path / children_count / direction / spacing
+    四项。后向兼容：现有调用 layout_children(ctx, parent) 仍 work。
+    """
+    effective_parent = parent_path if parent_path is not None else parent
+    if horizontal_spacing is not None or vertical_spacing is not None \
+            or direction is not None:
+        return _houdini_call("layout_children", {
+            "parent_path": effective_parent,
+            "horizontal_spacing": horizontal_spacing,
+            "vertical_spacing": vertical_spacing,
+            "direction": direction,
+        })
+    return _houdini_call("layout_children", {"parent_path": effective_parent})
+
+
+@mcp.tool()
+def set_node_position(ctx, node_path, x, y):
+    """设置节点在 network editor 中的位置。
+
+    参数说明：
+    - node_path: 节点路径。
+    - x: x 坐标（Houdini units）。
+    - y: y 坐标。
+
+    返回 dict 包含 path / position / success 三项；
+    节点不存在时函数会抛 ValueError。
+    """
+    return _houdini_call("set_node_position", {
+        "node_path": node_path, "x": x, "y": y,
+    })
+
+
+@mcp.tool()
+def set_node_color(ctx, node_path, r, g, b):
+    """设置节点颜色（颜色分量自动 clamp 到 [0, 1]）。
+
+    参数说明：
+    - node_path: 节点路径。
+    - r, g, b: 颜色分量；负值 clamp 为 0.0，>1 值 clamp 为 1.0。
+
+    返回 dict 包含 path / color / success 三项；
+    节点不存在时函数会抛 ValueError。
+    """
+    return _houdini_call("set_node_color", {
+        "node_path": node_path, "r": r, "g": g, "b": b,
+    })
+
+
+@mcp.tool()
+def create_network_box(ctx, parent_path, name=None, node_paths=None):
+    """在父节点下创建 network box（network editor 中的分组框）。
+
+    参数说明：
+    - parent_path: 父节点路径。
+    - name: 可选，box 名；缺省时由 Houdini 自动命名。
+    - node_paths: 可选，要包含到此 box 的节点路径列表；
+      不存在的节点静默跳过，不抛错。
+
+    返回 dict 包含 path / name / nodes_in_box 三项；
+    父节点不存在时函数会抛 ValueError。
+    """
+    return _houdini_call("create_network_box", {
+        "parent_path": parent_path, "name": name, "node_paths": node_paths,
+    })
+
+
+# -------------------------------------------------------------------
 # PR 7 Materials Tools (thin relay to server-side _materials)
 # -------------------------------------------------------------------
 @mcp.tool()

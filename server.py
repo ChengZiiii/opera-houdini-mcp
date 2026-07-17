@@ -36,6 +36,7 @@ from . import _scene as scn
 from . import _discovery as disc
 from . import _materials as mats
 from . import _hscript as hsc
+from . import _graph_edit as ge
 
 # PR 4 scene-diff cache：execute_code(capture_diff=True) 时填充；get_last_scene_diff 读取。
 _before_scene = None
@@ -249,6 +250,11 @@ class HoudiniMCPServer:
             "get_parameter_schema": self.get_parameter_schema,
             "set_node_flags": self.set_node_flags,
             "layout_children": self.layout_children,
+            # PR 9: 图编辑增强（重写 reorder_inputs + layout_children + 3 新 handler）
+            "reorder_inputs": self.reorder_inputs,
+            "set_node_position": self.set_node_position,
+            "set_node_color": self.set_node_color,
+            "create_network_box": self.create_network_box,
             "find_error_nodes": self.find_error_nodes,
             "cook_node": self.cook_node,
             # VEX wrangles
@@ -303,6 +309,9 @@ class HoudiniMCPServer:
         "create_wrangle", "set_wrangle_code",
         # PR 7: 材质 CRUD 命令也属于场景变更
         "create_material", "assign_material",
+        # PR 9: 图编辑增强命令均修改场景
+        "reorder_inputs", "set_node_position", "set_node_color",
+        "create_network_box",
     })
 
     @contextmanager
@@ -965,11 +974,31 @@ class HoudiniMCPServer:
 
         return {"node": node.path(), "applied": applied, "unsupported": unsupported}
 
-    def layout_children(self, path):
-        """Auto-layout all children of a network node."""
-        node = self._resolve_node(path)
-        node.layoutChildren()
-        return {"node": node.path(), "children_laid_out": len(node.children())}
+    def layout_children(self, path, horizontal_spacing=2.0,
+                        vertical_spacing=1.5, direction="horizontal"):
+        """PR 9 重写：按 horizontal_spacing / vertical_spacing / direction
+        显式布局子节点。后向兼容：现有调用 layout_children(path) 用默认值。
+        """
+        return ge.layout_children(hou, path, horizontal_spacing,
+                                  vertical_spacing, direction)
+
+    def reorder_inputs(self, node_path, new_order):
+        """PR 9：先全部断开当前输入，再按 new_order 重新连接。
+        后向兼容：bridge 端如果收到 'order' 别名，会在传入前归一为 new_order。
+        """
+        return ge.reorder_inputs(hou, node_path, new_order)
+
+    def set_node_position(self, node_path, x, y):
+        """PR 9：设置节点在 network editor 中的位置。"""
+        return ge.set_node_position(hou, node_path, x, y)
+
+    def set_node_color(self, node_path, r, g, b):
+        """PR 9：设置节点颜色（自动 clamp 到 [0, 1]）。"""
+        return ge.set_node_color(hou, node_path, r, g, b)
+
+    def create_network_box(self, parent_path, name=None, node_paths=None):
+        """PR 9：在父节点下创建 network box，可选包含若干节点；缺失节点跳过。"""
+        return ge.create_network_box(hou, parent_path, name, node_paths)
 
     def find_error_nodes(self, root_path="/obj", include_warnings=False,
                          max_nodes=2000, limit=50):
