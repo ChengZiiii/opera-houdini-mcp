@@ -33,6 +33,7 @@ import io
 from contextlib import redirect_stdout, redirect_stderr
 from . import _common as cmn
 from . import _scene as scn
+from . import _error_nodes as en
 from . import _discovery as disc
 from . import _materials as mats
 from . import _hscript as hsc
@@ -962,42 +963,16 @@ class HoudiniMCPServer:
         """PR 9：在父节点下创建 network box，可选包含若干节点；缺失节点跳过。"""
         return ge.create_network_box(hou, parent_path, name, node_paths)
 
-    def find_error_nodes(self, root_path="/obj", include_warnings=False,
-                         max_nodes=2000, limit=50):
-        """
-        Walk the network under root_path and report nodes whose last cook
-        produced errors (and optionally warnings). Does not force cooks.
-        """
-        root = self._resolve_node(root_path)
-        found = []
-        scanned = 0
-        truncated = False
-        stack = [root]
+    def find_error_nodes(self, root_path="/", include_warnings=True,
+                         max_warnings=50, max_errors=None):
+        """PR 11：扫描场景中的错误与警告节点。
 
-        while stack:
-            if scanned >= max_nodes or len(found) >= limit:
-                truncated = True
-                break
-            node = stack.pop()
-            scanned += 1
-            errors = [e.strip() for e in node.errors() if e.strip()]
-            warnings = []
-            if include_warnings:
-                warnings = [w.strip() for w in node.warnings() if w.strip()]
-            if errors or warnings:
-                entry = {"path": node.path(), "type": node.type().name(), "errors": errors}
-                if include_warnings:
-                    entry["warnings"] = warnings
-                found.append(entry)
-            stack.extend(node.children())
-
-        return {
-            "root": root.path(),
-            "scanned": scanned,
-            "truncated": truncated,
-            "error_node_count": len(found),
-            "nodes": found,
-        }
+        薄封装到 _error_nodes.find_error_nodes，使用 node.allSubChildren()
+        单次扫描（非递归），并返回 errors / warnings 双列表。
+        """
+        return en.find_error_nodes(
+            hou, root_path=root_path, include_warnings=include_warnings,
+            max_warnings=max_warnings, max_errors=max_errors)
 
     def cook_node(self, path):
         """Force-cook a node and report errors, warnings and cook time."""

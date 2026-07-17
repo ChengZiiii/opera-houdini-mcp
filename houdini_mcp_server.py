@@ -953,17 +953,26 @@ def layout_network(ctx: Context, path: str) -> dict:
     return _houdini_call("layout_children", {"path": path})
 
 
+# PR 11 Error Nodes
+# ---------------------------------------------------------------------------
+
+
 @mcp.tool()
-def find_error_nodes(ctx: Context, root_path: str = "/obj",
-                     include_warnings: bool = False) -> dict:
-    """
-    Scan the network under root_path for nodes whose last cook produced
-    errors (optionally warnings too). Fast — reads existing error state
-    without forcing cooks. Use after building a network to verify it is
-    clean, or to locate what is broken in a scene.
+def find_error_nodes(ctx, root_path="/", include_warnings=True,
+                     max_warnings=50, max_errors=None):
+    """扫描场景中的错误与警告节点。
+
+    从 root_path 出发，单次调用 node.allSubChildren() 收集所有后代节点，
+    返回 errors 与 warnings 双列表。include_warnings 默认 True（PR 11 行为）；
+    max_warnings 限制警告条目数（超过返 _warnings_truncated 标记）；
+    max_errors 限制错误条目数（None 表示不限）。适合场景构建完成后做
+    一次性体检，比逐节点 cook_node 更快。
     """
     return _houdini_call("find_error_nodes", {
-        "root_path": root_path, "include_warnings": include_warnings,
+        "root_path": root_path,
+        "include_warnings": include_warnings,
+        "max_warnings": max_warnings,
+        "max_errors": max_errors,
     })
 
 
