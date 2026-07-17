@@ -690,6 +690,50 @@ class PR9BridgeBehaviorTests(unittest.TestCase):
             "order", body,
             "reorder_inputs bridge must reference 'order' (legacy alias)")
 
+    def test_reorder_inputs_accepts_legacy_order_kwarg(self):
+        """Legacy order kwarg must reach the server as new_order only."""
+        fn = self.tools["reorder_inputs"]
+        namespace = {
+            "mcp": type(
+                "_McpStub", (), {
+                    "tool": lambda self: (lambda decorated: decorated),
+                })(),
+        }
+        houdini_requests = []
+        server_calls = []
+
+        class _ServerStub(object):
+            def reorder_inputs(self, node_path, new_order):
+                server_calls.append((node_path, new_order))
+                return {"new_order": new_order}
+
+        server = _ServerStub()
+
+        def _houdini_call(command, params):
+            houdini_requests.append((command, params))
+            try:
+                return getattr(server, command)(**params)
+            except TypeError as exc:
+                return {"error": str(exc)}
+
+        namespace["_houdini_call"] = _houdini_call
+        module = ast.Module(body=[fn], type_ignores=[])
+        ast.fix_missing_locations(module)
+        exec(compile(module, SERVER_PY, "exec"), namespace)
+
+        result = namespace["reorder_inputs"](
+            object(), "/obj/x", order=[0, 1])
+
+        self.assertEqual(
+            houdini_requests,
+            [("reorder_inputs", {
+                "node_path": "/obj/x",
+                "new_order": [0, 1],
+            })],
+        )
+        self.assertEqual(server_calls, [("/obj/x", [0, 1])])
+        self.assertEqual(result, {"new_order": [0, 1]})
+
     # -- layout_children -----------------------------------------------------
     def test_layout_children_calls_houdini_with_parent_path(self):
         fn = self.tools["layout_children"]

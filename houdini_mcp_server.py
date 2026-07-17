@@ -1341,12 +1341,9 @@ def reorder_inputs(ctx, node_path, new_order=None, order=None):
     节点不存在时函数会抛 ValueError，bridge 不会再以 success:True 形式
     静默吞错。
     """
-    if order is not None:
-        return _houdini_call("reorder_inputs", {
-            "node_path": node_path, "new_order": new_order, "order": order,
-        })
+    effective_order = new_order if new_order is not None else order
     return _houdini_call("reorder_inputs", {
-        "node_path": node_path, "new_order": new_order,
+        "node_path": node_path, "new_order": effective_order,
     })
 
 
