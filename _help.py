@@ -62,60 +62,80 @@ class SideFXDocParser(HTMLParser):
         self.inputs = []
         self.outputs = []
         self.methods = []
-        self._current_tag = None
-        self._current_attrs = {}
-        self._buffer = ""
-        self._in_section = None
+        self._element_stack = []
+        self._section_stack = []
+        self._title_set = False
+        self._summary_set = False
 
     def handle_starttag(self, tag, attrs):
         attrs_dict = dict(attrs)
-        self._current_tag = tag
-        self._current_attrs = attrs_dict
-        self._buffer = ""
-        if tag == "div" and "class" in attrs_dict:
-            cls = attrs_dict["class"]
-            if "parameter" in cls:
-                self._in_section = "parameter"
-            elif "method" in cls:
-                self._in_section = "method"
-        elif tag == "div" and "id" in attrs_dict:
-            id_val = attrs_dict["id"]
-            if id_val == "inputs-body":
-                self._in_section = "inputs-body"
-            elif id_val == "outputs-body":
-                self._in_section = "outputs-body"
-        elif tag == "h1" and attrs_dict.get("class") == "title":
-            self._in_section = "title"
-        elif tag == "p" and attrs_dict.get("class") == "summary":
-            self._in_section = "summary"
+        classes = set((attrs_dict.get("class") or "").split())
+        element = object()
+        self._element_stack.append((tag, element))
+
+        section_name = None
+        if tag == "h1" and "title" in classes and not self._title_set:
+            section_name = "title"
+        elif tag == "p" and "summary" in classes and not self._summary_set:
+            section_name = "summary"
+        elif tag == "div":
+            if "parameter" in classes:
+                section_name = "parameter"
+            elif "method" in classes:
+                section_name = "method"
+            elif attrs_dict.get("id") == "inputs-body":
+                section_name = "inputs-body"
+            elif attrs_dict.get("id") == "outputs-body":
+                section_name = "outputs-body"
+
+        if section_name:
+            self._section_stack.append({
+                "name": section_name,
+                "tag": tag,
+                "root": element,
+                "buffer": [],
+            })
 
     def handle_data(self, data):
-        if self._in_section:
-            self._buffer += data
+        for section in self._section_stack:
+            section["buffer"].append(data)
+
+    def _commit_section(self, section):
+        content = "".join(section["buffer"]).strip()
+        section_name = section["name"]
+        if section_name == "title" and content:
+            self.title = content
+            self._title_set = True
+        elif section_name == "summary" and content:
+            self.summary = content
+            self._summary_set = True
+        elif section_name == "parameter" and content:
+            self.parameters.append({"text": content})
+        elif section_name == "inputs-body" and content:
+            self.inputs.append({"text": content})
+        elif section_name == "outputs-body" and content:
+            self.outputs.append({"text": content})
+        elif section_name == "method" and content:
+            self.methods.append({"text": content})
 
     def handle_endtag(self, tag):
-        if tag == self._current_tag:
-            content = self._buffer.strip()
-            if self._in_section == "title":
-                self.title = content
-            elif self._in_section == "summary":
-                self.summary = content
-            elif self._in_section == "parameter":
-                if content:
-                    self.parameters.append({"text": content})
-            elif self._in_section == "inputs-body":
-                if content:
-                    self.inputs.append({"text": content})
-            elif self._in_section == "outputs-body":
-                if content:
-                    self.outputs.append({"text": content})
-            elif self._in_section == "method":
-                if content:
-                    self.methods.append({"text": content})
-            self._in_section = None
-            self._buffer = ""
-            self._current_tag = None
-            self._current_attrs = {}
+        element_index = None
+        for index in range(len(self._element_stack) - 1, -1, -1):
+            if self._element_stack[index][0] == tag:
+                element_index = index
+                break
+        if element_index is None:
+            return
+
+        closed_elements = {
+            element for _tag, element
+            in self._element_stack[element_index:]
+        }
+        del self._element_stack[element_index:]
+
+        while (self._section_stack
+               and self._section_stack[-1]["root"] in closed_elements):
+            self._commit_section(self._section_stack.pop())
 
 
 # ---------------------------------------------------------------------------

@@ -108,6 +108,32 @@ def _patched_urlopen(mock_urlopen, status, html_text, encode="utf-8"):
     mock_urlopen.return_value = _make_mock_urlopen(status, html_text, encode)
 
 
+NESTED_HTML = """
+<html><body>
+<h1 class="title ">Grid <span>geometry node</span></h1>
+<p class="summary lead">Creates a grid of points. <em>Read more</em></p>
+<div class="parameter documented">
+    <span class="name">Size</span>
+    <span class="desc">Width and Height.</span>
+</div>
+<div id="inputs-body">
+    <p>None</p>
+</div>
+<div id="outputs-body">
+    <p>Grid geometry</p>
+</div>
+<div class="method documented">
+    <code>hou.Node.cook(force=False)</code>
+    <p>Cook the node.</p>
+</div>
+<aside>
+    <h1 class="title sidebar-title">Sidebar title</h1>
+    <p class="summary">This is a sidebar summary that should NOT override the main summary.</p>
+</aside>
+</body></html>
+"""
+
+
 # ===========================================================================
 # SideFXDocParser tests
 # ===========================================================================
@@ -198,6 +224,22 @@ class SideFXDocParserTests(unittest.TestCase):
         self.assertEqual(len(p.inputs), 1)
         self.assertEqual(len(p.outputs), 1)
         self.assertEqual(len(p.methods), 2)
+
+    def test_realistic_nested_html_preserves_sections_and_first_heading(self):
+        p = self.mod.SideFXDocParser()
+        p.feed(NESTED_HTML)
+
+        self.assertEqual(p.title, "Grid geometry node")
+        self.assertEqual(
+            p.summary, "Creates a grid of points. Read more")
+        self.assertEqual(len(p.parameters), 1)
+        self.assertIn("Size", p.parameters[0]["text"])
+        self.assertIn("Width and Height.", p.parameters[0]["text"])
+        self.assertEqual(p.inputs, [{"text": "None"}])
+        self.assertEqual(p.outputs, [{"text": "Grid geometry"}])
+        self.assertEqual(len(p.methods), 1)
+        self.assertIn("hou.Node.cook(force=False)", p.methods[0]["text"])
+        self.assertIn("Cook the node.", p.methods[0]["text"])
 
     def test_unrelated_divs_are_ignored(self):
         # divs without parameter/method class or inputs/outputs id are skipped
@@ -498,6 +540,63 @@ class PR15BridgeStyleTests(unittest.TestCase):
             "Current docstring: %r" % doc)
 
 
+class _RecordingHoudiniCall(object):
+    """Record bridge relay arguments and return a configurable envelope."""
+
+    def __init__(self, response=None):
+        self.calls = []
+        self.response = response if response is not None else {
+            "status": "success", "result": {"title": "Grid"}}
+
+    def __call__(self, command, params=None):
+        self.calls.append((command, params or {}))
+        return self.response
+
+
+class _FakeMCP(object):
+    def tool(self):
+        return lambda decorated: decorated
+
+
+def _exec_pr15_bridge_tool(response=None):
+    """AST-execute the PR 15 bridge tool with a recording relay stub."""
+    source = _read(BRIDGE_PY)
+    functions = _find_pr15_function_nodes()
+    if len(functions) != 1:
+        raise AssertionError("Expected exactly one PR 15 bridge tool")
+    function_source = ast.get_source_segment(source, functions[0])
+    relay = _RecordingHoudiniCall(response=response)
+    namespace = {"mcp": _FakeMCP(), "_houdini_call": relay}
+    exec(compile(function_source, "<pr15_get_houdini_help>", "exec"),
+         namespace)
+    return namespace["get_houdini_help"], relay
+
+
+class PR15BridgeExecTests(unittest.TestCase):
+    def test_calls_houdini_with_expected_command_and_params(self):
+        tool, relay = _exec_pr15_bridge_tool()
+
+        result = tool(object(), "sop", "grid", timeout=7)
+
+        self.assertEqual(relay.calls, [(
+            "get_houdini_help",
+            {"help_type": "sop", "item_name": "grid", "timeout": 7},
+        )])
+        self.assertEqual(result, relay.response)
+
+    def test_passes_through_error_envelope(self):
+        error = {
+            "status": "error",
+            "message": "SideFX unavailable",
+            "origin": "houdini",
+        }
+        tool, _relay = _exec_pr15_bridge_tool(response=error)
+
+        result = tool(object(), "sop", "grid")
+
+        self.assertEqual(result, error)
+
+
 # ===========================================================================
 # server.py wiring tests
 # ===========================================================================
@@ -543,6 +642,41 @@ class ServerWiringTests(unittest.TestCase):
         body_src = "\n".join(src_lines[method.lineno - 1: method.end_lineno])
         self.assertIn("apply_response_cap", body_src)
         self.assertIn("hlp.get_houdini_help", body_src)
+
+
+class ServerCapExecutionTests(unittest.TestCase):
+    def test_wrapper_calls_response_cap_once_with_help_payload(self):
+        source = _read(SERVER_PY)
+        tree = ast.parse(source)
+        server_class = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "HoudiniMCPServer")
+        method = next(
+            node for node in server_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "get_houdini_help")
+        method_source = ast.get_source_segment(source, method)
+
+        payload = {"status": "success", "title": "Grid"}
+        capped_payload = {"status": "success", "title": "Grid", "capped": True}
+        help_call = mock.Mock(return_value=payload)
+        cap = mock.Mock(return_value=capped_payload)
+        namespace = {
+            "hlp": types.SimpleNamespace(get_houdini_help=help_call),
+            "cmn": types.SimpleNamespace(apply_response_cap=cap),
+        }
+        exec(compile(method_source, "<server_get_houdini_help>", "exec"),
+             namespace)
+        server_type = type(
+            "_HelpServer", (),
+            {"get_houdini_help": namespace["get_houdini_help"]})
+
+        result = server_type().get_houdini_help("sop", "grid", timeout=4)
+
+        help_call.assert_called_once_with("sop", "grid", timeout=4)
+        cap.assert_called_once_with(payload)
+        self.assertEqual(result, capped_payload)
 
 
 if __name__ == "__main__":
