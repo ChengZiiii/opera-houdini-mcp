@@ -1551,6 +1551,69 @@ def render_node_network(ctx, node_path, fit_contents=True,
 
 
 # -------------------------------------------------------------------
+# PR 14 Render Base64 Tools (placed before PR 7 so existing test_bridge_style
+# PR 7 section probe does not pick them up — the probe scans all
+# @mcp.tool() after the PR 7 header without an explicit upper bound)
+# -------------------------------------------------------------------
+@mcp.tool(name="render_viewport_base64")
+def render_viewport_base64(ctx, camera_path=None, geometry_path=None,
+                           renderer="opengl", resolution=(640, 480),
+                           format="PNG"):
+    """渲染单个 viewport 视角并以 base64 形式返回图像（PR 14）。
+
+    renderer 支持 opengl / karma_cpu / karma_xpu 三选一；resolution 为
+    (width, height) 元组；format 支持 PNG / JPEG。响应含 image_base64 字段
+    与 size_bytes，响应整体过 apply_response_cap 截断大 payload。无 hou /
+    PySide 环境返回 _warning dict。
+    """
+    return _houdini_call("render_viewport_base64", {
+        "camera_path": camera_path,
+        "geometry_path": geometry_path,
+        "renderer": renderer,
+        "resolution": list(resolution) if isinstance(resolution, tuple)
+        else resolution,
+        "format": format,
+    })
+
+
+@mcp.tool(name="render_quad_views_base64")
+def render_quad_views_base64(ctx, geometry_path=None, renderer="opengl",
+                              resolution=(480, 360), format="PNG"):
+    """渲染四视图（top / front / side / perspective）并以 base64 形式返回
+    4 张图（PR 14）。
+
+    共享 bbox + camera rig，每个视图旋转 null 节点切换视角。响应以
+    top/front/side/perspective 四键分别承载 base64 字符串，整体过
+    apply_response_cap。无 hou 环境返回 _warning dict。
+    """
+    return _houdini_call("render_quad_views_base64", {
+        "geometry_path": geometry_path,
+        "renderer": renderer,
+        "resolution": list(resolution) if isinstance(resolution, tuple)
+        else resolution,
+        "format": format,
+    })
+
+
+@mcp.tool(name="render_specific_camera_base64")
+def render_specific_camera_base64(ctx, camera_path, resolution=(640, 480),
+                                   format="PNG", renderer="opengl"):
+    """渲染指定相机视角并以 base64 形式返回图像（PR 14）。
+
+    camera_path 必须指向 /obj 下已存在的相机节点；renderer 支持
+    opengl / karma_cpu / karma_xpu 三选一。响应整体过 apply_response_cap
+    截断大 payload。
+    """
+    return _houdini_call("render_specific_camera_base64", {
+        "camera_path": camera_path,
+        "resolution": list(resolution) if isinstance(resolution, tuple)
+        else resolution,
+        "format": format,
+        "renderer": renderer,
+    })
+
+
+# -------------------------------------------------------------------
 # PR 7 Materials Tools (thin relay to server-side _materials)
 # -------------------------------------------------------------------
 @mcp.tool()

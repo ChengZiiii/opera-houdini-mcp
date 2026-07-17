@@ -41,6 +41,7 @@ from . import _graph_edit as ge
 from . import _node_info as ni
 from . import _geo_summary as gs
 from . import _pane_capture as pcp
+from . import _render_b64 as rb64
 
 # PR 4 scene-diff cache：execute_code(capture_diff=True) 时填充；get_last_scene_diff 读取。
 _before_scene = None
@@ -278,6 +279,10 @@ class HoudiniMCPServer:
             "render_single_view": self.handle_render_single_view,
             "render_quad_view": self.handle_render_quad_view,
             "render_specific_camera": self.handle_render_specific_camera,
+            # PR 14: base64 渲染（与既有 render_*_view handler 共存；旧 handler 仍返文件路径）
+            "render_viewport_base64": self.render_viewport_base64,
+            "render_quad_views_base64": self.render_quad_views_base64,
+            "render_specific_camera_base64": self.render_specific_camera_base64,
             # PR 6: node discovery + cache management (NodeTypeCache)
             "list_node_types": self.list_node_types,
             "list_children": self.list_children,
@@ -1627,10 +1632,10 @@ class HoudiniMCPServer:
     def handle_render_specific_camera(self, camera_path, render_path=None, render_engine="opengl", karma_engine="cpu"):
         """Handles the 'render_specific_camera' command."""
         # self._check_render_lib()
-        
+
         if not render_path:
             render_path = tempfile.gettempdir()
-            
+
         if not camera_path or not hou.node(camera_path):
              return {"status": "error", "message": f"Camera path '{camera_path}' is invalid or node not found.", "origin": "handle_render_specific_camera"}
 
@@ -1652,6 +1657,54 @@ class HoudiniMCPServer:
             print(error_message)
             traceback.print_exc()
             return {"status": "error", "message": error_message, "origin": "handle_render_specific_camera"}
+
+    # -------------------------------------------------------------------------
+    # PR 14: Render Base64 (thin wrappers to _render_b64 + apply_response_cap)
+    # -------------------------------------------------------------------------
+    def render_viewport_base64(self, camera_path=None, geometry_path=None,
+                               renderer="opengl", resolution=(640, 480),
+                               format="PNG"):
+        """PR 14：渲染单个 viewport 并以 base64 形式返回图像。
+
+        薄封装到 _render_b64.render_viewport，支持 opengl / karma_cpu /
+        karma_xpu 三种 renderer。无 hou 环境返回 _warning dict。响应过
+        cmn.apply_response_cap 截断大 base64 payload。
+        """
+        result = rb64.render_viewport(
+            hou, camera_path=camera_path, geometry_path=geometry_path,
+            renderer=renderer, resolution=tuple(resolution)
+            if isinstance(resolution, (list, tuple)) else resolution,
+            format=format)
+        return cmn.apply_response_cap(result)
+
+    def render_quad_views_base64(self, geometry_path=None, renderer="opengl",
+                                 resolution=(480, 360), format="PNG"):
+        """PR 14：渲染四视图（top / front / side / perspective）并以 base64
+        形式返回 4 张图。
+
+        薄封装到 _render_b64.render_quad_views，共享 bbox + camera rig；
+        响应过 apply_response_cap。无 hou 环境返回 _warning dict。
+        """
+        result = rb64.render_quad_views(
+            hou, geometry_path=geometry_path, renderer=renderer,
+            resolution=tuple(resolution)
+            if isinstance(resolution, (list, tuple)) else resolution,
+            format=format)
+        return cmn.apply_response_cap(result)
+
+    def render_specific_camera_base64(self, camera_path, resolution=(640, 480),
+                                      format="PNG", renderer="opengl"):
+        """PR 14：渲染指定相机视角并以 base64 形式返回。
+
+        薄封装到 _render_b64.render_specific_camera_base64，响应过
+        apply_response_cap。camera_path 必须存在。
+        """
+        result = rb64.render_specific_camera_base64(
+            hou, camera_path=camera_path,
+            resolution=tuple(resolution)
+            if isinstance(resolution, (list, tuple)) else resolution,
+            format=format, renderer=renderer)
+        return cmn.apply_response_cap(result)
 
     # -------------------------------------------------------------------------
     # Existing Placeholder asset library methods
