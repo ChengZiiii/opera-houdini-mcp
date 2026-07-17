@@ -40,6 +40,7 @@ from . import _hscript as hsc
 from . import _graph_edit as ge
 from . import _node_info as ni
 from . import _geo_summary as gs
+from . import _pane_capture as pcp
 
 # PR 4 scene-diff cache：execute_code(capture_diff=True) 时填充；get_last_scene_diff 读取。
 _before_scene = None
@@ -262,6 +263,11 @@ class HoudiniMCPServer:
             "cook_node": self.cook_node,
             # PR 12: 轻量级几何概要 + 大几何降级
             "get_geo_summary": self.get_geo_summary,
+            # PR 13: pane 截图（list_visible_panes 只读；其它写文件/UI 状态）
+            "capture_pane_screenshot": self.capture_pane_screenshot,
+            "list_visible_panes": self.list_visible_panes,
+            "capture_multiple_panes": self.capture_multiple_panes,
+            "render_node_network": self.render_node_network,
             # VEX wrangles
             "create_wrangle": self.create_wrangle,
             "set_wrangle_code": self.set_wrangle_code,
@@ -317,6 +323,10 @@ class HoudiniMCPServer:
         # PR 9: 图编辑增强命令均修改场景
         "reorder_inputs", "set_node_position", "set_node_color",
         "create_network_box",
+        # PR 13: pane 截图。截图视为写文件状态；render_node_network 通过
+        # pane.cd() 修改 NetworkEditor 当前路径（UI 状态）。三者均纳入 undo group。
+        "capture_pane_screenshot", "capture_multiple_panes",
+        "render_node_network",
     })
 
     @contextmanager
@@ -990,6 +1000,51 @@ class HoudiniMCPServer:
             hou, node_path=node_path,
             max_points_for_full=max_points_for_full,
             sample_size=sample_size)
+
+    # -------------------------------------------------------------------------
+    # PR 13: Pane Capture (thin wrappers to _pane_capture + apply_response_cap)
+    # -------------------------------------------------------------------------
+    def capture_pane_screenshot(self, pane_type_name, save_path=None,
+                                fit_contents=True):
+        """PR 13：截图指定类型 pane（NetworkEditor / SceneViewer / 等）。
+
+        薄封装到 _pane_capture.capture_pane_screenshot，响应过
+        cmn.apply_response_cap。无 PySide 环境返回 _warning dict 而非抛异常。
+        """
+        result = pcp.capture_pane_screenshot(
+            hou, pane_type_name, save_path=save_path,
+            fit_contents=fit_contents)
+        return cmn.apply_response_cap(result)
+
+    def list_visible_panes(self):
+        """PR 13：列出当前所有 desktop 中可见的 pane。
+
+        只读操作，不在 MUTATING_COMMANDS 内。响应过 apply_response_cap 防止
+        多 desktop 大场景撑爆 MCP。
+        """
+        result = {"panes": pcp.list_visible_panes(hou)}
+        return cmn.apply_response_cap(result)
+
+    def capture_multiple_panes(self, pane_types, save_dir):
+        """PR 13：批量截图多种 pane 到 save_dir（自动创建目录）。
+
+        薄封装到 _pane_capture.capture_multiple_panes，响应过
+        apply_response_cap。每种 pane 独立报告 success/error。
+        """
+        result = {"results": pcp.capture_multiple_panes(
+            hou, pane_types, save_dir)}
+        return cmn.apply_response_cap(result)
+
+    def render_node_network(self, node_path, fit_contents=True,
+                            save_path=None):
+        """PR 13：定位到节点所在 NetworkEditor pane，cd 到节点，再截图。
+
+        薄封装到 _pane_capture.render_node_network，响应过 apply_response_cap。
+        """
+        result = pcp.render_node_network(
+            hou, node_path, fit_contents=fit_contents,
+            save_path=save_path)
+        return cmn.apply_response_cap(result)
 
     def cook_node(self, path):
         """Force-cook a node and report errors, warnings and cook time."""

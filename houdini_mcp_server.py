@@ -1490,6 +1490,67 @@ def get_node_info(ctx, node_path, include_errors=True, force_cook=False,
 
 
 # -------------------------------------------------------------------
+# PR 13 Pane Capture Tools
+# -------------------------------------------------------------------
+@mcp.tool()
+def capture_pane_screenshot(ctx, pane_type_name, save_path=None,
+                            fit_contents=True):
+    """截图指定类型 pane（NetworkEditor / SceneViewer / Compositor /
+    ChannelEditor 等 30 种）。
+
+    pane_type_name 必须是 hou.paneTabType 的合法属性名。save_path 为 None
+    时不落盘，size_bytes 改用 QBuffer 估算。fit_contents=True 时先按
+    pane 类型调用 homeAll() / curViewport().home() 把可视范围对齐。
+    响应走 apply_response_cap。无 PySide 环境返回 _warning dict。
+    """
+    return _houdini_call("capture_pane_screenshot", {
+        "pane_type_name": pane_type_name,
+        "save_path": save_path,
+        "fit_contents": fit_contents,
+    })
+
+
+@mcp.tool()
+def list_visible_panes(ctx):
+    """列出当前所有 desktop 中可见的 pane tab。
+
+    返回 {desktop, pane_type, name, is_current} 四元组列表；is_current
+    标记该 desktop 当前激活的 pane。只读操作，响应过 apply_response_cap。
+    """
+    return _houdini_call("list_visible_panes", {})
+
+
+@mcp.tool()
+def capture_multiple_panes(ctx, pane_types, save_dir):
+    """批量截图多种 pane 到 save_dir（不存在会自动创建）。
+
+    pane_types 是 pane 类型名列表；返回与 pane_types 等长的 result 列表，
+    每条 {pane_type, save_path, success, error} 独立报告。任意一种 pane
+    抛异常不影响其他 pane。响应过 apply_response_cap。
+    """
+    return _houdini_call("capture_multiple_panes", {
+        "pane_types": pane_types,
+        "save_dir": save_dir,
+    })
+
+
+@mcp.tool()
+def render_node_network(ctx, node_path, fit_contents=True,
+                        save_path=None):
+    """定位到节点所在 NetworkEditor pane，cd 到节点，再截图。
+
+    node_path 必须存在；fit_contents=True 时截图前调用 homeAll() 把可视
+    范围对齐到节点子树。save_path=None 时不落盘（size_bytes 改用 QBuffer
+    估算）。响应过 apply_response_cap。
+    """
+    return _houdini_call("render_node_network", {
+        "node_path": node_path,
+        "fit_contents": fit_contents,
+        "save_path": save_path,
+    })
+
+
+# -------------------------------------------------------------------
 # PR 7 Materials Tools (thin relay to server-side _materials)
 # -------------------------------------------------------------------
 @mcp.tool()
