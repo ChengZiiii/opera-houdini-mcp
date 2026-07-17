@@ -1428,6 +1428,36 @@ def create_network_box(ctx, parent_path, name=None, node_paths=None):
 
 
 # -------------------------------------------------------------------
+# PR 10 Node Info Tool (thin relay to server-side _node_info)
+# -------------------------------------------------------------------
+@mcp.tool()
+def get_node_info(ctx, node_path, include_errors=True, force_cook=False,
+                  include_input_details=False, compact=False):
+    """获取节点的详细信息。
+
+    参数说明：
+    - node_path: 目标节点路径。
+    - include_errors: 可选，是否包含 errors / warnings 字段，默认 True。
+    - force_cook: 可选，读取前是否调 node.cook(force=True)，默认 False。
+    - include_input_details: 可选，是否包含每个 input 的详细连接
+      （用 node.inputConnectors() 一次性取），默认 False。
+    - compact: 可选，是否仅返精简字段 path/type/counts（不含 parameters /
+      errors / warnings），默认 False。
+
+    返回 dict：compact=True 时仅含 path / type / children_count / input_count
+    / output_count 五项；否则包含完整字段（详见 _node_info.get_node_info）。
+    节点不存在时函数会抛 ValueError，bridge 透传 error envelope 不静默吞错。
+    """
+    return _houdini_call("get_node_info", {
+        "node_path": node_path,
+        "include_errors": include_errors,
+        "force_cook": force_cook,
+        "include_input_details": include_input_details,
+        "compact": compact,
+    })
+
+
+# -------------------------------------------------------------------
 # PR 7 Materials Tools (thin relay to server-side _materials)
 # -------------------------------------------------------------------
 @mcp.tool()

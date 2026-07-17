@@ -37,6 +37,7 @@ from . import _discovery as disc
 from . import _materials as mats
 from . import _hscript as hsc
 from . import _graph_edit as ge
+from . import _node_info as ni
 
 # PR 4 scene-diff cache：execute_code(capture_diff=True) 时填充；get_last_scene_diff 读取。
 _before_scene = None
@@ -510,59 +511,20 @@ class HoudiniMCPServer:
         node.destroy()
         return {"deleted": node_path, "name": node_name}
 
-    def get_node_info(self, path):
-        """Returns detailed information about a single node."""
-        node = hou.node(path)
-        if not node:
-            raise ValueError(f"Node not found: {path}")
-        
-        node_info = {
-            "name": node.name(),
-            "path": node.path(),
-            "type": node.type().name(),
-            "category": node.type().category().name(),
-            "position": [node.position()[0], node.position()[1]],
-            "color": list(node.color().rgb()) if node.color() else None,
-            "is_bypassed": getattr(node, "isBypassed", lambda: None)(),
-            "is_displayed": getattr(node, "isDisplayFlagSet", lambda: None)(),
-            "is_rendered": getattr(node, "isRenderFlagSet", lambda: None)(),
-            "parameters": [],
-            "inputs": [],
-            "outputs": []
-        }
+    def get_node_info(self, node_path=None, path=None, include_errors=True,
+                      force_cook=False, include_input_details=False,
+                      compact=False):
+        """PR 10 重写：委托到 _node_info.get_node_info，新增 include_errors /
+        force_cook / include_input_details / compact 四个参数。
 
-        # Limit to 20 parameters for brevity
-        for i, parm in enumerate(node.parms()):
-            if i >= 20:
-                break
-            node_info["parameters"].append({
-                "name": parm.name(),
-                "value": str(parm.eval()),
-                "type": parm.parmTemplate().type().name()
-            })
-
-        # Inputs
-        for i, in_node in enumerate(node.inputs()):
-            if in_node:
-                node_info["inputs"].append({
-                    "index": i,
-                    "name": in_node.name(),
-                    "path": in_node.path(),
-                    "type": in_node.type().name()
-                })
-
-        # Outputs
-        for i, out_conn in enumerate(node.outputConnections()):
-            out_node = out_conn.outputNode()
-            node_info["outputs"].append({
-                "index": i,
-                "name": out_node.name(),
-                "path": out_node.path(),
-                "type": out_node.type().name(),
-                "input_index": out_conn.inputIndex()
-            })
-
-        return node_info
+        后向兼容：
+        - 旧调用 `get_node_info(path=...)` 仍 work（path 关键字回退为 node_path）。
+        - 仅传 1 个位置参数（path / node_path）也兼容。
+        """
+        if node_path is None and path is not None:
+            node_path = path
+        return ni.get_node_info(hou, node_path, include_errors, force_cook,
+                                include_input_details, compact)
 
     def execute_code(self, code, policy="normal", allow_dangerous=False,
                      allow_heavy_geometry=False, capture_diff=False, timeout=30):
