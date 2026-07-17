@@ -464,14 +464,26 @@ class BridgeGetLastSceneDiffTests(unittest.TestCase):
         spec.loader.exec_module(cls.bridge)
 
     def _make_mock_conn(self):
-        """Build a mock HoudiniConnection whose send_command records calls."""
+        """Build a mock HoudiniConnection whose send_command records calls.
+
+        Mock returns the real server.py:604 get_last_scene_diff shape
+        ({available, changed, before, after}) so the test catches
+        field-name mismatches between bridge and server.
+        """
         sent = []
 
         class MockConn(object):
             def send_command(self, cmd_type, params=None):
                 sent.append((cmd_type, params))
-                return {"status": "success", "result": {"ok": True,
-                                                       "diff": {"changed": False}}}
+                return {
+                    "status": "success",
+                    "result": {
+                        "available": True,
+                        "changed": True,
+                        "before": {"nodes": ["obj1"]},
+                        "after": {"nodes": ["obj1", "obj2"]},
+                    },
+                }
 
             def disconnect(self):
                 pass
@@ -491,6 +503,26 @@ class BridgeGetLastSceneDiffTests(unittest.TestCase):
         self.bridge.get_houdini_connection = lambda: conn
         result = self.bridge.get_last_scene_diff(None)
         self.assertIsInstance(result, str)
+
+    def test_get_last_scene_diff_output_contains_before_and_after(self):
+        """Regression: bridge must serialize real {available, changed, before, after}.
+
+        Prior bug (C1 in PR 4 review): bridge read result.get('diff', {}) which
+        server never emits, so agent always saw '{}'. With mock returning the
+        real server shape, bridge output must be non-empty and contain the
+        before / after keys.
+        """
+        conn, _ = self._make_mock_conn()
+        self.bridge.get_houdini_connection = lambda: conn
+        result = self.bridge.get_last_scene_diff(None)
+        # Must not be the placeholder '{}' from the old implementation
+        self.assertNotEqual(result.strip(), "{}")
+        # Must contain the real server keys
+        self.assertIn("before", result)
+        self.assertIn("after", result)
+        # And the stubbed scene payload
+        self.assertIn("obj1", result)
+        self.assertIn("obj2", result)
 
     def test_get_last_scene_diff_handles_status_error(self):
         class MockConn(object):

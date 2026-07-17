@@ -735,8 +735,15 @@ def get_last_scene_diff(ctx: Context) -> str:
         if not result.get("available", False):
             return ("No scene diff available yet. Run execute_houdini_code "
                     "with capture_diff=True first.")
-        diff = result.get("diff", {})
-        return json.dumps(diff, indent=2)
+        # Server (server.py get_last_scene_diff) returns
+        # {available, changed, before, after}; align bridge field reads.
+        payload = {
+            "available": result.get("available"),
+            "changed": result.get("changed"),
+            "before": result.get("before"),
+            "after": result.get("after"),
+        }
+        return json.dumps(payload, indent=2)
     except ConnectionError as e:
          return f"Connection Error getting scene diff: {str(e)}"
     except Exception as e:

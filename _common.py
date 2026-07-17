@@ -839,6 +839,15 @@ def _run_code_thread(code, namespace, timeout=30):
     - timed_out: bool
     - exception_type / exception_message: 异常时填入
     注：超时情况下线程为 daemon，主进程退出时会被回收；不会自动 undo。
+
+    Caveat — StringIO 写入的线程安全：
+    超时返回时子线程（daemon）可能仍在执行，被 exec 中的 print/traceback
+    会持续写入 stdout_capture / stderr_capture（io.StringIO）。io.StringIO
+    非 thread-safe（write/getvalue 没有锁），但 CPython GIL 下基本不会
+    段错误或丢字符；不过理论上仍存在交错写入的风险。调用方若关心一致性，
+    建议在 read stdout/stderr 前做短轮询 `thread.join(0.01)`，让子线程
+    在自然执行间隙结束，再读取 StringIO。本函数不主动 join 第二次，以
+    避免引入新线程同步复杂度（fix brief 推荐 docstring-only 修复）。
     """
     stdout_capture = io.StringIO()
     stderr_capture = io.StringIO()
