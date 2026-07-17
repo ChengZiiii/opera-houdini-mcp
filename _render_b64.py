@@ -293,7 +293,7 @@ def render_quad_views(hou, geometry_path=None, renderer="opengl",
 
     nodes = []
     try:
-        nodes = _render_lib.find_displayed_geometry(hou)
+        nodes = _render_lib.find_displayed_geometry()
     except Exception:
         nodes = []
     if not nodes and not geometry_path:

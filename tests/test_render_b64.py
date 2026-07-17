@@ -72,11 +72,16 @@ class _FakeRenderHelpers(object):
 
     def __init__(self):
         self.find_displayed_geometry_calls = []
+        self.find_displayed_geometry_args = []
         self.calculate_bounding_box_calls = []
         self.setup_camera_rig_calls = []
         self.adjust_camera_to_fit_bbox_calls = []
 
-    def find_displayed_geometry(self, hou):
+    def find_displayed_geometry(self):
+        # Record (args, kwargs) of every call so tests can assert the
+        # production code matches HoudiniMCPRender.find_displayed_geometry()'s
+        # real no-arg signature (PR 14 reviewer Important).
+        self.find_displayed_geometry_args.append(((), {}))
         self.find_displayed_geometry_calls.append(True)
         return [object()]
 
@@ -518,12 +523,38 @@ class RenderQuadViewsTests(unittest.TestCase):
         hou = _FakeHou(has_hipfile=True)
         # Override fake to return empty list
         original = self.render_helpers.find_displayed_geometry
-        self.render_helpers.find_displayed_geometry = lambda h: []
+        self.render_helpers.find_displayed_geometry = lambda: []
         try:
             result = self.mod.render_quad_views(hou)
             self.assertIn("_warning", result)
         finally:
             self.render_helpers.find_displayed_geometry = original
+
+    def test_find_displayed_geometry_called_with_no_args(self):
+        """Regression: PR 14 reviewer Important.
+
+        HoudiniMCPRender.find_displayed_geometry() real signature is no-arg,
+        so production _render_b64.render_quad_views MUST call it with no args.
+        The old call ``_render_lib.find_displayed_geometry(hou)`` raised
+        TypeError in production that was silently swallowed by the surrounding
+        try/except, making every scene look empty.
+        """
+        hou = _make_hou_with_default_camera()
+        hou.hipFile = object()
+        self.mod.render_quad_views(hou)
+        self.assertEqual(
+            len(self.render_helpers.find_displayed_geometry_args), 1,
+            "find_displayed_geometry should be called once")
+        args, kwargs = self.render_helpers.find_displayed_geometry_args[0]
+        self.assertEqual(
+            args, (),
+            "find_displayed_geometry must be called with no positional args "
+            "(real signature is `def find_displayed_geometry():`), got {0!r}"
+            .format(args))
+        self.assertEqual(
+            kwargs, {},
+            "find_displayed_geometry must be called with no kwargs, got {0!r}"
+            .format(kwargs))
 
 
 # ===========================================================================
