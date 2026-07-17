@@ -1614,6 +1614,31 @@ def render_specific_camera_base64(ctx, camera_path, resolution=(640, 480),
 
 
 # -------------------------------------------------------------------
+# PR 15 Help Tools (placed before PR 7 section so test_bridge_style PR 7
+# probe — which scans all @mcp.tool() strictly after the "# PR 7 Materials
+# Tools" header line — does not pick it up; the trailing "Tools" also makes
+# the PR 14 probe's "next section header" regex stop here)
+# -------------------------------------------------------------------
+@mcp.tool()
+def get_houdini_help(ctx, help_type, item_name, timeout=10):
+    """从 SideFX 在线文档查询 Houdini 节点、VEX 函数或 hou 方法的帮助（PR 15）。
+
+    help_type 支持 11 种："sop" / "obj" / "dop" / "cop2" / "chop" /
+    "vop" / "lop" / "top" / "rop" / "vex_function" / "python_hou"。
+    item_name 是节点名 / VEX 函数名 / hou 方法名。timeout 是 HTTP 请求
+    超时秒数（默认 10）。返回 dict 包含 title / summary / parameters /
+    inputs / outputs / methods / status 等字段，HTML 解析使用 stdlib
+    html.parser（零新增 pip 依赖）。HTTP 4xx / 5xx / 网络错误 / 超时
+    全部降级为 status=error，不抛异常。响应整体过 apply_response_cap。
+    """
+    return _houdini_call("get_houdini_help", {
+        "help_type": help_type,
+        "item_name": item_name,
+        "timeout": timeout,
+    })
+
+
+# -------------------------------------------------------------------
 # PR 7 Materials Tools (thin relay to server-side _materials)
 # -------------------------------------------------------------------
 @mcp.tool()

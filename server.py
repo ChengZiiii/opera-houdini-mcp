@@ -42,6 +42,7 @@ from . import _node_info as ni
 from . import _geo_summary as gs
 from . import _pane_capture as pcp
 from . import _render_b64 as rb64
+from . import _help as hlp
 
 # PR 4 scene-diff cache：execute_code(capture_diff=True) 时填充；get_last_scene_diff 读取。
 _before_scene = None
@@ -295,6 +296,8 @@ class HoudiniMCPServer:
             "get_material_info": self.get_material_info,
             # PR 8: HScript 执行包装（薄封装到 _hscript.execute_hscript）
             "execute_hscript": self.execute_hscript,
+            # PR 15: SideFX 在线文档查询（薄封装到 _help.get_houdini_help）
+            "get_houdini_help": self.get_houdini_help,
         }
         
         # If user has toggled asset library usage
@@ -1709,6 +1712,22 @@ class HoudiniMCPServer:
     # -------------------------------------------------------------------------
     # Existing Placeholder asset library methods
     # -------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # PR 15: SideFX 在线文档查询（thin wrapper to _help + apply_response_cap）
+    # -------------------------------------------------------------------------
+    def get_houdini_help(self, help_type, item_name, timeout=10):
+        """PR 15：从 SideFX 在线文档抓取并解析节点/函数/方法的帮助信息。
+
+        薄封装到 _help.get_houdini_help，支持 11 个 help_type（sop / obj /
+        dop / cop2 / chop / vop / lop / top / rop / vex_function /
+        python_hou）。HTML 解析使用 stdlib html.parser，无需 beautifulsoup4。
+        HTTP 4xx / 5xx / 网络错误 / timeout 均降级为 status=error 字典，
+        不抛异常。响应整体过 cmn.apply_response_cap 截断大 payload。
+        """
+        result = hlp.get_houdini_help(
+            help_type, item_name, timeout=timeout)
+        return cmn.apply_response_cap(result)
+
     def get_asset_categories(self):
         """Placeholder for an asset library feature (e.g., Poly Haven)."""
         return {"error": "get_asset_categories not implemented"}
