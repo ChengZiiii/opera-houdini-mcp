@@ -298,6 +298,9 @@ class HoudiniMCPServer:
             "execute_hscript": self.execute_hscript,
             # PR 15: SideFX 在线文档查询（薄封装到 _help.get_houdini_help）
             "get_houdini_help": self.get_houdini_help,
+            # PR 16: 连接诊断（Houdini 端 check_connection / ping_houdini）
+            "check_connection": self.check_connection,
+            "ping_houdini": self.ping_houdini,
         }
         
         # If user has toggled asset library usage
@@ -1727,6 +1730,84 @@ class HoudiniMCPServer:
         result = hlp.get_houdini_help(
             help_type, item_name, timeout=timeout)
         return cmn.apply_response_cap(result)
+
+    # -------------------------------------------------------------------------
+    # PR 16: 连接诊断（check_connection / ping_houdini，不持久化连接）
+    # -------------------------------------------------------------------------
+    def check_connection(self):
+        """PR 16：返回 Houdini 端连接信息（版本 / build / 当前 .hip 文件）。
+
+        仅使用既有 hou 上下文查询，不开新 socket，也不修改任何场景状态。
+        字段说明：
+        - hou_version: hou.version() 字符串
+        - hou_build: hou.applicationVersionString() 优先，回退到 str(hou.build())
+        - hip_file: 当前 .hip 文件绝对路径，未保存时为 None
+        - hip_file_basename: 仅文件名（basename）
+        - is_untitled: True 表示当前 hip 未保存
+        - node_count: root 节点 + 所有子节点总数（hou.node("/").allSubChildren() 长度 + 1）
+        - desktop_count: hou.ui.desktops() 数量
+        - _status: 固定为 "ok"，便于上层做健康检查
+        """
+        hip_path = hou.hipFile.path()
+        if hou.hipFile.isUntitled():
+            hip_file = None
+            hip_basename = None
+            untitled = True
+        else:
+            hip_file = hip_path
+            hip_basename = os.path.basename(hip_path)
+            untitled = False
+
+        if hasattr(hou, "applicationVersionString"):
+            build_str = hou.applicationVersionString()
+        else:
+            build_str = str(hou.build())
+
+        return {
+            "hou_version": hou.version(),
+            "hou_build": build_str,
+            "hip_file": hip_file,
+            "hip_file_basename": hip_basename,
+            "is_untitled": untitled,
+            "node_count": len(hou.node("/").allSubChildren()) + 1,
+            "desktop_count": len(hou.ui.desktops()),
+            "_status": "ok",
+        }
+
+    def ping_houdini(self, timeout=5):
+        """PR 16：轻量级 Houdini 端 ping，验证响应时间。
+
+        仅在既有 hou 上下文里调用一次 hou.version()，不持久化新连接，不开
+        新 socket，不修改场景。异常被捕获后以 pong=False + error 字段返回，
+        不会传播到 bridge。
+
+        Args:
+            timeout: 最长等待毫秒对应的秒数（默认 5 秒）
+
+        Returns:
+            成功: {"pong": True, "elapsed_ms": int, "within_timeout": bool,
+                    "hou_version": str}
+            失败: {"pong": False, "elapsed_ms": int, "within_timeout": False,
+                    "error": str}
+        """
+        start = time.time()
+        try:
+            v = hou.version()
+            elapsed_ms = int((time.time() - start) * 1000)
+            return {
+                "pong": True,
+                "elapsed_ms": elapsed_ms,
+                "within_timeout": elapsed_ms < int(timeout * 1000),
+                "hou_version": v,
+            }
+        except Exception as e:
+            elapsed_ms = int((time.time() - start) * 1000)
+            return {
+                "pong": False,
+                "elapsed_ms": elapsed_ms,
+                "within_timeout": False,
+                "error": str(e),
+            }
 
     def get_asset_categories(self):
         """Placeholder for an asset library feature (e.g., Poly Haven)."""

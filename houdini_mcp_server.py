@@ -1614,6 +1614,41 @@ def render_specific_camera_base64(ctx, camera_path, resolution=(640, 480),
 
 
 # -------------------------------------------------------------------
+# PR 16 Connection Diagnostic Tools (placed before PR 15 / PR 7 sections
+# so existing test_bridge_style (PR 7) and test_help PR 15 probes — which
+# scan @mcp.tool() strictly after their own header lines — do not pick it
+# up; PR 16 ships its own AST probe in tests.test_connection)
+# -------------------------------------------------------------------
+@mcp.tool()
+def check_connection(ctx):
+    """检查 Houdini 端连接信息（PR 16 连接诊断）。
+
+    返回 dict 包含 hou_version / hou_build / hip_file / hip_file_basename /
+    is_untitled / node_count / desktop_count / _status 八个字段。返回结构
+    与 server.py 中 HoudiniMCPServer.check_connection 保持一致。仅做只读
+    查询，不会修改 .hip 文件、节点或网络；适合 AI agent 在长会话开头调用
+    一次以获取当前 Houdini 版本与场景规模。
+    """
+    return _houdini_call("check_connection", {})
+
+
+@mcp.tool()
+def ping_houdini(ctx, timeout=5):
+    """轻量级 Houdini 端 ping，验证响应时间（PR 16 连接诊断）。
+
+    参数说明：
+    - timeout: 最长等待秒数（默认 5），超过则 within_timeout=False
+
+    返回 dict 包含 pong / elapsed_ms / within_timeout / hou_version 四项；
+    hou 抛异常时返 pong=False 并带 error 字段。该 ping 不持久化新连接，
+    只在既有 hou 上下文里调用一次 hou.version()；适合作为健康检查或
+    网络抖动场景下的快速探测。注意：与 bridge 协议的 "ping" 命令不同，
+    后者只验证 socket / 帧协议，本工具测量 Houdini 端的实际响应时间。
+    """
+    return _houdini_call("ping_houdini", {"timeout": timeout})
+
+
+# -------------------------------------------------------------------
 # PR 15 Help Tools (placed before PR 7 section so test_bridge_style PR 7
 # probe — which scans all @mcp.tool() strictly after the "# PR 7 Materials
 # Tools" header line — does not pick it up; the trailing "Tools" also makes
