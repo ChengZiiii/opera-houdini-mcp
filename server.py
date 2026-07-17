@@ -31,6 +31,7 @@ except ImportError:
         QtWidgets = None
 import io
 from contextlib import redirect_stdout, redirect_stderr
+from . import _common as cmn
 
 # Imports for OPUS import
 import zipfile
