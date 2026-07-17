@@ -302,24 +302,28 @@ def _estimate_response_size(data):
 
 
 def _find_truncation_target(obj):
-    """找到 dict 中最大的 list 值；找不到再递归一层；返回 (key, list_ref) 或 None。"""
-    best_key = None
-    best_list = None
-    best_len = 0
-    if isinstance(obj, dict):
-        for k, v in obj.items():
+    """找到 dict 中最大的 list 值；递归时返回完整路径与 list 引用。"""
+    def _walk(current, path):
+        best_key = None
+        best_list = None
+        best_len = 0
+        if not isinstance(current, dict):
+            return None
+        for k, v in current.items():
             if isinstance(v, list) and len(v) > best_len:
                 best_key = k
                 best_list = v
                 best_len = len(v)
         if best_key is not None:
-            return best_key, best_list
-        for k, v in obj.items():
+            return path + [best_key], best_list
+        for k, v in current.items():
             if isinstance(v, dict):
-                sub = _find_truncation_target(v)
+                sub = _walk(v, path + [k])
                 if sub is not None:
                     return sub
-    return None
+        return None
+
+    return _walk(obj, [])
 
 
 def apply_response_cap(data, max_bytes=16384):
@@ -336,24 +340,42 @@ def apply_response_cap(data, max_bytes=16384):
         capped["_original_size"] = _serialized_size(data)
         return capped
 
-    key, original = target
+    path, original = target
+    parent = capped
+    for key in path[:-1]:
+        if not isinstance(parent, dict) or key not in parent:
+            return data
+        parent = parent[key]
+    if not isinstance(parent, dict) or path[-1] not in parent:
+        return data
+
+    original_size = _serialized_size(data)
+    # 将最终元数据提前加入探针，确保最终结果也受 max_bytes 约束。
+    capped["_truncated"] = True
+    capped["_original_size"] = original_size
+    capped["_truncated_count"] = 0
+
     # 二分搜索前缀长度
     lo, hi = 0, len(original)
-    best = 0
+    best = None
     while lo <= hi:
         mid = (lo + hi) // 2
-        capped[key] = original[:mid]
+        parent[path[-1]] = original[:mid]
         capped["_truncated_count"] = len(original) - mid
         if _serialized_size(capped) <= max_bytes:
             best = mid
             lo = mid + 1
         else:
             hi = mid - 1
-    capped[key] = original[:best]
+
+    # 列表缩到最短仍超限时，返回原数据，避免伪造截断标记。
+    if best is None:
+        return data
+
+    parent[path[-1]] = original[:best]
+    capped["_truncated_count"] = len(original) - best
     if best == 0:
-        del capped[key]
-    capped["_truncated"] = True
-    capped["_original_size"] = _serialized_size(data)
+        del parent[path[-1]]
     return capped
 
 

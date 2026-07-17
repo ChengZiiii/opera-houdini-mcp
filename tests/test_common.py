@@ -357,6 +357,15 @@ class ApplyResponseCapTests(unittest.TestCase):
         size = len(json.dumps(result, default=str).encode("utf-8"))
         self.assertLessEqual(size, cap + 500)
 
+    def test_nested_dict_truncation(self):
+        payload = {"a": {"b": [{"i": i, "pad": "x" * 40} for i in range(200)]}}
+        cap = 1024
+        result = cmn.apply_response_cap(payload, cap)
+        self.assertLess(len(result["a"]["b"]), 200)
+        self.assertTrue(result.get("_truncated"))
+        size = len(json.dumps(result, default=str).encode("utf-8"))
+        self.assertLessEqual(size, cap)
+
 
 # ===========================================================================
 # Section I: paginate_list
