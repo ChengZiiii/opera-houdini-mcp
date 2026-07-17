@@ -77,9 +77,162 @@ def _load_pane_capture_fresh():
     return mod
 
 
+# ---------------------------------------------------------------------------
+# Important 3: PySide fixture robustness helpers.
+#
+# Baseline assumption: neither PySide6 nor PySide2 is installed in the test
+# env, so _pane_capture._QT_BACKEND becomes None. We must enforce this
+# invariant even if the host happens to have PySide pre-installed (e.g.
+# another test in the same process loaded it). The snapshot context manager
+# also guarantees that any fakes installed during a test are stripped on
+# teardown, and the original _pane_capture module object is restored.
+# ---------------------------------------------------------------------------
+_QT_PREFIXES = ("PySide6", "PySide2", "shiboken6", "shiboken2")
+
+
+class _QtSysModulesSnapshot(object):
+    """Snapshot and restore sys.modules entries related to Qt.
+
+    On __enter__: snapshot all sys.modules keys matching one of the Qt
+    prefixes (or submodules thereof), then delete them. After __enter__,
+    `from PySide6 ...` / `from PySide2 ...` will fall through to ImportError,
+    so _pane_capture's try/except will set _QT_BACKEND = None.
+
+    On __exit__: first delete any Qt-related keys NOT in the snapshot (those
+    were injected as fakes during the block), then restore the originals.
+    """
+
+    def __init__(self, prefixes=_QT_PREFIXES):
+        self._prefixes = tuple(prefixes)
+        self._saved = None
+
+    def __enter__(self):
+        saved = {}
+        for k in list(sys.modules):
+            if self._is_qt_key(k):
+                saved[k] = sys.modules[k]
+                del sys.modules[k]
+        self._saved = saved
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Strip any Qt-related fakes that snuck in during the block.
+        for k in list(sys.modules):
+            if self._is_qt_key(k) and k not in self._saved:
+                del sys.modules[k]
+        # Restore originals.
+        for k, v in self._saved.items():
+            sys.modules[k] = v
+        self._saved = None
+        return False
+
+    def _is_qt_key(self, key):
+        return any(key == p or key.startswith(p + ".")
+                   for p in self._prefixes)
+
+
+class _FakeQtFixture(object):
+    """Set up + tear down a fake PySide6/PySide2 environment robustly.
+
+    Usage:
+        cls.fx = _FakeQtFixture("PySide6")
+        cls.fx.__enter__()
+        try:
+            cls.pcp = _load_pane_capture_fresh()
+            cls.addClassCleanup(cls.fx.__exit__, None, None, None)
+            cls.addClassCleanup(_restore_pcp_module, cls._orig_pcp)
+        except Exception:
+            cls.fx.__exit__(*sys.exc_info())
+            raise
+
+    On teardown:
+      1. Pop fake PySide keys from sys.modules
+      2. _QtSysModulesSnapshot.__exit__ removes any other Qt fakes and
+         restores originals (handles PySide6 vs PySide2 cross-contamination)
+      3. Restore original sys.modules[_PCP_KEY] object captured pre-setup
+    """
+
+    def __init__(self, version, block=None):
+        self.version = version
+        # By default block the OTHER major version to prevent cross-detection.
+        if block is None:
+            block = ("PySide6",) if version == "PySide2" else ("PySide2",)
+        self._snapshot = _QtSysModulesSnapshot(prefixes=_QT_PREFIXES)
+
+    def __enter__(self):
+        self._snapshot.__enter__()
+        self._install_fake_qt()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Pop fakes we installed first
+        self._uninstall_fake_qt()
+        # Then snapshot teardown restores original Qt modules + strips others
+        self._snapshot.__exit__(exc_type, exc_val, exc_tb)
+
+    def _install_fake_qt(self):
+        fake_qtcore = types.ModuleType(self.version + ".QtCore")
+        fake_qtcore.QBuffer = _FakeQBuffer
+        fake_qtcore.QIODevice = _FakeQIODevice
+        fake_qtgui = types.ModuleType(self.version + ".QtGui")
+        fake_qtgui.QImage = _FakeQImage
+        fake_qtwidgets = types.ModuleType(self.version + ".QtWidgets")
+        fake_qtwidgets.QWidget = _FakeQWidget
+        fake_pkg = types.ModuleType(self.version)
+        fake_pkg.QtCore = fake_qtcore
+        fake_pkg.QtGui = fake_qtgui
+        fake_pkg.QtWidgets = fake_qtwidgets
+        sys.modules[self.version] = fake_pkg
+        sys.modules[self.version + ".QtCore"] = fake_qtcore
+        sys.modules[self.version + ".QtGui"] = fake_qtgui
+        sys.modules[self.version + ".QtWidgets"] = fake_qtwidgets
+
+    def _uninstall_fake_qt(self):
+        for k in (self.version, self.version + ".QtCore",
+                  self.version + ".QtGui", self.version + ".QtWidgets"):
+            sys.modules.pop(k, None)
+
+
+def _restore_pcp_module(orig):
+    """Restore sys.modules[_PCP_KEY] to the pre-fixture value.
+
+    If no pre-fixture value existed, pop the key so subsequent fresh loads
+    create a new module object (matches the original "first time" state).
+    """
+    if orig is None:
+        sys.modules.pop(_PCP_KEY, None)
+    else:
+        sys.modules[_PCP_KEY] = orig
+
+
+# Baseline: block Qt up front so the module-level _pane_capture load below
+# observes _QT_BACKEND == None regardless of host environment. Baseline is
+# permanent for the test process lifetime (no teardown); subsequent fixtures
+# use their own _QtSysModulesSnapshot.
+_BASELINE_NO_QT = _QtSysModulesSnapshot()
+_BASELINE_NO_QT.__enter__()
 # Baseline module load: neither PySide6 nor PySide2 is installed -> _QT_BACKEND
 # becomes None. All "graceful no-op" tests rely on this default.
 pcp = _load_pane_capture_fresh()
+
+
+def _run_with_fake_pyside6(body):
+    """Module-level helper: run `body(pcp_module)` inside a fake PySide6
+    fixture context. Restores sys.modules + original _pane_capture module
+    object on teardown even if `body` raises.
+
+    Used by instance-level tests that need a transient fake PySide6
+    environment per test case.
+    """
+    orig_pcp = sys.modules.get(_PCP_KEY)
+    fx = _FakeQtFixture("PySide6")
+    fx.__enter__()
+    try:
+        pcp2 = _load_pane_capture_fresh()
+        body(pcp2)
+    finally:
+        fx.__exit__(None, None, None)
+        _restore_pcp_module(orig_pcp)
 
 
 # ---------------------------------------------------------------------------
@@ -217,9 +370,13 @@ class _FakeQIODevice(object):
 
 
 class _FakeQImage(object):
-    def __init__(self, w, h):
+    def __init__(self, w, h, null=False):
         self._w = w
         self._h = h
+        self._null = null
+
+    def isNull(self):
+        return self._null
 
     def width(self):
         return self._w
@@ -237,11 +394,30 @@ class _FakeQImage(object):
 
 
 class _FakeQPixmap(object):
-    def __init__(self, w, h):
-        self._img = _FakeQImage(w, h)
+    def __init__(self, w, h, null=False):
+        self._img = _FakeQImage(w, h, null=null)
+        self._null = null
+
+    def isNull(self):
+        return self._null
 
     def toImage(self):
         return self._img
+
+
+class _NullImageQImage(object):
+    """Returns from toImage() when image is invalid (null or None)."""
+    def width(self):
+        return 0
+
+    def height(self):
+        return 0
+
+    def isNull(self):
+        return True
+
+    def save(self, target, fmt=None):
+        return False
 
 
 class _FakeQWidget(object):
@@ -266,21 +442,6 @@ class _FakeQtGui(object):
 class _FakeQtCore(object):
     QBuffer = _FakeQBuffer
     QIODevice = _FakeQIODevice
-
-
-def _install_fake_pyside(modules_dict):
-    """Inject fake PySide modules into sys.modules.
-
-    modules_dict: keys are 'PySide6' / 'PySide2'; values are module instances
-    with attributes QtWidgets / QtCore / QtGui matching the real layout.
-    """
-    for name, mod in modules_dict.items():
-        sys.modules[name] = mod
-
-
-def _uninstall_fake_pyside(names):
-    for name in names:
-        sys.modules.pop(name, None)
 
 
 # ===========================================================================
@@ -316,148 +477,69 @@ class ValidPaneTypesTests(unittest.TestCase):
 # Section B: _fit_pane_contents
 # ===========================================================================
 class FitPaneContentsTests(unittest.TestCase):
+    """Important 3: each test that needs fake PySide6 wraps it in a
+    _FakeQtFixture context manager via the helper below, so any exception
+    inside the test body still triggers teardown (restoring sys.modules
+    + the original _pane_capture module object)."""
+
+    def _run_with_fake_pyside6(self, body):
+        """Run `body(pcp_module)` inside a fake PySide6 fixture context.
+
+        The original sys.modules + houdinimcp._pane_capture object are
+        restored on teardown even if `body` raises.
+        """
+        orig_pcp = sys.modules.get(_PCP_KEY)
+        fx = _FakeQtFixture("PySide6")
+        fx.__enter__()
+        try:
+            pcp2 = _load_pane_capture_fresh()
+            body(pcp2)
+        finally:
+            fx.__exit__(None, None, None)
+            _restore_pcp_module(orig_pcp)
 
     def test_network_editor_calls_homeall(self):
-        pane = _FakePaneTab()
-        # Qt backend is None in this env, so _fit_pane_contents is a no-op.
-        # To still verify the method dispatch path, install fake PySide6,
-        # reload, run, restore.
-        fake_qtcore = types.ModuleType("PySide6.QtCore")
-        fake_qtcore.QBuffer = _FakeQBuffer
-        fake_qtcore.QIODevice = _FakeQIODevice
-        fake_qtgui = types.ModuleType("PySide6.QtGui")
-        fake_qtgui.QImage = _FakeQImage
-        fake_qtwidgets = types.ModuleType("PySide6.QtWidgets")
-        fake_qtwidgets.QWidget = _FakeQWidget
-        fake_pkg = types.ModuleType("PySide6")
-        fake_pkg.QtCore = fake_qtcore
-        fake_pkg.QtGui = fake_qtgui
-        fake_pkg.QtWidgets = fake_qtwidgets
-        _install_fake_pyside({"PySide6": fake_pkg,
-                              "PySide6.QtCore": fake_qtcore,
-                              "PySide6.QtGui": fake_qtgui,
-                              "PySide6.QtWidgets": fake_qtwidgets})
-        try:
-            pcp2 = _load_pane_capture_fresh()
+        def body(pcp2):
             self.assertEqual(pcp2._QT_BACKEND, "PySide6")
+            pane = _FakePaneTab()
             pcp2._fit_pane_contents(pane, "NetworkEditor")
             self.assertEqual(len(pane._home_calls), 1)
-        finally:
-            _uninstall_fake_pyside(["PySide6", "PySide6.QtCore",
-                                    "PySide6.QtGui", "PySide6.QtWidgets"])
-            _load_pane_capture_fresh()
+        self._run_with_fake_pyside6(body)
 
     def test_compositor_calls_homeall(self):
-        pane = _FakePaneTab()
-        fake_qtcore = types.ModuleType("PySide6.QtCore")
-        fake_qtcore.QBuffer = _FakeQBuffer
-        fake_qtcore.QIODevice = _FakeQIODevice
-        fake_qtgui = types.ModuleType("PySide6.QtGui")
-        fake_qtgui.QImage = _FakeQImage
-        fake_qtwidgets = types.ModuleType("PySide6.QtWidgets")
-        fake_qtwidgets.QWidget = _FakeQWidget
-        fake_pkg = types.ModuleType("PySide6")
-        fake_pkg.QtCore = fake_qtcore
-        fake_pkg.QtGui = fake_qtgui
-        fake_pkg.QtWidgets = fake_qtwidgets
-        _install_fake_pyside({"PySide6": fake_pkg,
-                              "PySide6.QtCore": fake_qtcore,
-                              "PySide6.QtGui": fake_qtgui,
-                              "PySide6.QtWidgets": fake_qtwidgets})
-        try:
-            pcp2 = _load_pane_capture_fresh()
+        def body(pcp2):
+            pane = _FakePaneTab()
             pcp2._fit_pane_contents(pane, "Compositor")
             self.assertEqual(len(pane._home_calls), 1)
-        finally:
-            _uninstall_fake_pyside(["PySide6", "PySide6.QtCore",
-                                    "PySide6.QtGui", "PySide6.QtWidgets"])
-            _load_pane_capture_fresh()
+        self._run_with_fake_pyside6(body)
 
     def test_channel_editor_calls_homeall(self):
-        pane = _FakePaneTab()
-        fake_qtcore = types.ModuleType("PySide6.QtCore")
-        fake_qtcore.QBuffer = _FakeQBuffer
-        fake_qtcore.QIODevice = _FakeQIODevice
-        fake_qtgui = types.ModuleType("PySide6.QtGui")
-        fake_qtgui.QImage = _FakeQImage
-        fake_qtwidgets = types.ModuleType("PySide6.QtWidgets")
-        fake_qtwidgets.QWidget = _FakeQWidget
-        fake_pkg = types.ModuleType("PySide6")
-        fake_pkg.QtCore = fake_qtcore
-        fake_pkg.QtGui = fake_qtgui
-        fake_pkg.QtWidgets = fake_qtwidgets
-        _install_fake_pyside({"PySide6": fake_pkg,
-                              "PySide6.QtCore": fake_qtcore,
-                              "PySide6.QtGui": fake_qtgui,
-                              "PySide6.QtWidgets": fake_qtwidgets})
-        try:
-            pcp2 = _load_pane_capture_fresh()
+        def body(pcp2):
+            pane = _FakePaneTab()
             pcp2._fit_pane_contents(pane, "ChannelEditor")
             self.assertEqual(len(pane._home_calls), 1)
-        finally:
-            _uninstall_fake_pyside(["PySide6", "PySide6.QtCore",
-                                    "PySide6.QtGui", "PySide6.QtWidgets"])
-            _load_pane_capture_fresh()
+        self._run_with_fake_pyside6(body)
 
     def test_scene_viewer_calls_viewport_home(self):
-        pane = _FakePaneTab(has_viewport=True)
-        fake_qtcore = types.ModuleType("PySide6.QtCore")
-        fake_qtcore.QBuffer = _FakeQBuffer
-        fake_qtcore.QIODevice = _FakeQIODevice
-        fake_qtgui = types.ModuleType("PySide6.QtGui")
-        fake_qtgui.QImage = _FakeQImage
-        fake_qtwidgets = types.ModuleType("PySide6.QtWidgets")
-        fake_qtwidgets.QWidget = _FakeQWidget
-        fake_pkg = types.ModuleType("PySide6")
-        fake_pkg.QtCore = fake_qtcore
-        fake_pkg.QtGui = fake_qtgui
-        fake_pkg.QtWidgets = fake_qtwidgets
-        _install_fake_pyside({"PySide6": fake_pkg,
-                              "PySide6.QtCore": fake_qtcore,
-                              "PySide6.QtGui": fake_qtgui,
-                              "PySide6.QtWidgets": fake_qtwidgets})
-        try:
-            pcp2 = _load_pane_capture_fresh()
+        def body(pcp2):
+            pane = _FakePaneTab(has_viewport=True)
             pcp2._fit_pane_contents(pane, "SceneViewer")
             self.assertEqual(len(pane._viewport.home_calls), 1)
-        finally:
-            _uninstall_fake_pyside(["PySide6", "PySide6.QtCore",
-                                    "PySide6.QtGui", "PySide6.QtWidgets"])
-            _load_pane_capture_fresh()
+        self._run_with_fake_pyside6(body)
 
     def test_other_types_no_op_even_with_qt(self):
-        fake_qtcore = types.ModuleType("PySide6.QtCore")
-        fake_qtcore.QBuffer = _FakeQBuffer
-        fake_qtcore.QIODevice = _FakeQIODevice
-        fake_qtgui = types.ModuleType("PySide6.QtGui")
-        fake_qtgui.QImage = _FakeQImage
-        fake_qtwidgets = types.ModuleType("PySide6.QtWidgets")
-        fake_qtwidgets.QWidget = _FakeQWidget
-        fake_pkg = types.ModuleType("PySide6")
-        fake_pkg.QtCore = fake_qtcore
-        fake_pkg.QtGui = fake_qtgui
-        fake_pkg.QtWidgets = fake_qtwidgets
-        _install_fake_pyside({"PySide6": fake_pkg,
-                              "PySide6.QtCore": fake_qtcore,
-                              "PySide6.QtGui": fake_qtgui,
-                              "PySide6.QtWidgets": fake_qtwidgets})
-        try:
-            pcp2 = _load_pane_capture_fresh()
-            pane = _FakePaneTab()  # has homeAll but for ParameterEditor should NOT call it
-            pcp2._fit_pane_contents(pane, "ParameterEditor")
-            self.assertEqual(pane._home_calls, [])
-            pcp2._fit_pane_contents(pane, "PythonPanel")
-            self.assertEqual(pane._home_calls, [])
-            pcp2._fit_pane_contents(pane, "HelpBrowser")
-            self.assertEqual(pane._home_calls, [])
-        finally:
-            _uninstall_fake_pyside(["PySide6", "PySide6.QtCore",
-                                    "PySide6.QtGui", "PySide6.QtWidgets"])
-            _load_pane_capture_fresh()
+        def body(pcp2):
+            pane = _FakePaneTab()  # has homeAll but non-fit types should NOT call it
+            for name in ("ParameterEditor", "PythonPanel", "HelpBrowser"):
+                pcp2._fit_pane_contents(pane, name)
+                self.assertEqual(pane._home_calls, [])
+        self._run_with_fake_pyside6(body)
 
     def test_no_qt_no_op(self):
         # Default state: _QT_BACKEND is None -> _fit_pane_contents must be
         # no-op even for NetworkEditor (so we don't crash on missing Qt).
+        # The baseline _QtSysModulesSnapshot enforces "no PySide" for the
+        # module-level `pcp` reference loaded below.
         pane = _FakePaneTab()
         self.assertIsNone(pcp._QT_BACKEND)
         pcp._fit_pane_contents(pane, "NetworkEditor")
@@ -488,29 +570,21 @@ class CapturePaneScreenshotWithQtTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        fake_qtcore = types.ModuleType("PySide6.QtCore")
-        fake_qtcore.QBuffer = _FakeQBuffer
-        fake_qtcore.QIODevice = _FakeQIODevice
-        fake_qtgui = types.ModuleType("PySide6.QtGui")
-        fake_qtgui.QImage = _FakeQImage
-        fake_qtwidgets = types.ModuleType("PySide6.QtWidgets")
-        fake_qtwidgets.QWidget = _FakeQWidget
-        fake_pkg = types.ModuleType("PySide6")
-        fake_pkg.QtCore = fake_qtcore
-        fake_pkg.QtGui = fake_qtgui
-        fake_pkg.QtWidgets = fake_qtwidgets
-        sys.modules["PySide6"] = fake_pkg
-        sys.modules["PySide6.QtCore"] = fake_qtcore
-        sys.modules["PySide6.QtGui"] = fake_qtgui
-        sys.modules["PySide6.QtWidgets"] = fake_qtwidgets
-        cls.pcp = _load_pane_capture_fresh()
-
-    @classmethod
-    def tearDownClass(cls):
-        for k in ("PySide6", "PySide6.QtCore", "PySide6.QtGui",
-                  "PySide6.QtWidgets"):
-            sys.modules.pop(k, None)
-        _load_pane_capture_fresh()
+        # Important 3: snapshot the original sys.modules + _pane_capture
+        # object, install fake PySide6 via _FakeQtFixture, and register
+        # addClassCleanup so teardown runs even if a later setup phase
+        # raises. try/finally inside setUpClass handles the rare case
+        # where setup itself blows up before cleanup can be registered.
+        cls._orig_pcp = sys.modules.get(_PCP_KEY)
+        cls.fx = _FakeQtFixture("PySide6")
+        cls.fx.__enter__()
+        try:
+            cls.pcp = _load_pane_capture_fresh()
+            cls.addClassCleanup(cls.fx.__exit__, None, None, None)
+            cls.addClassCleanup(_restore_pcp_module, cls._orig_pcp)
+        except Exception:
+            cls.fx.__exit__(*sys.exc_info())
+            raise
 
     def test_qt_backend_is_pyside6(self):
         self.assertEqual(self.pcp._QT_BACKEND, "PySide6")
@@ -567,6 +641,93 @@ class CapturePaneScreenshotWithQtTests(unittest.TestCase):
                                          fit_contents=False)
         self.assertEqual(pane._home_calls, [])
 
+    # ----- Important 1: grab exception handling (RED) -----
+    def test_grab_returns_none_raises_runtime_error(self):
+        """widget.grab() 返回 None 必须抛 RuntimeError，不能 AttributeError."""
+        class _NoneGrabWidget(_FakeQWidget):
+            def grab(self):
+                return None
+        widget = _NoneGrabWidget()
+        hou = _make_hou_with_scene_viewer(widget)
+        with self.assertRaises(RuntimeError):
+            self.pcp.capture_pane_screenshot(hou, "SceneViewer")
+
+    def test_grab_raises_runtime_error_wraps_with_cause(self):
+        """widget.grab() 自身抛异常时必须包装为 RuntimeError 并保留 __cause__."""
+        class _ExplodingGrabWidget(_FakeQWidget):
+            def grab(self):
+                raise RuntimeError("explosion in grab")
+        widget = _ExplodingGrabWidget()
+        hou = _make_hou_with_scene_viewer(widget)
+        with self.assertRaises(RuntimeError) as cm:
+            self.pcp.capture_pane_screenshot(hou, "SceneViewer")
+        # Must preserve original cause chain
+        self.assertIsNotNone(cm.exception.__cause__)
+        self.assertIn("explosion in grab", str(cm.exception.__cause__))
+
+    def test_pixmap_is_null_raises_runtime_error(self):
+        """widget.grab() 返回 isNull()==True pixmap 必须抛 RuntimeError."""
+        class _NullPixmapGrabWidget(_FakeQWidget):
+            def grab(self):
+                return _FakeQPixmap(100, 100, null=True)
+        widget = _NullPixmapGrabWidget()
+        hou = _make_hou_with_scene_viewer(widget)
+        with self.assertRaises(RuntimeError):
+            self.pcp.capture_pane_screenshot(hou, "SceneViewer")
+
+    def test_to_image_returns_none_raises_runtime_error(self):
+        """pixmap.toImage() 返回 None 必须抛 RuntimeError."""
+        class _NoneImagePixmap(_FakeQPixmap):
+            def toImage(self):
+                return None
+        class _NoneImageWidget(_FakeQWidget):
+            def grab(self):
+                return _NoneImagePixmap(100, 100)
+        widget = _NoneImageWidget()
+        hou = _make_hou_with_scene_viewer(widget)
+        with self.assertRaises(RuntimeError):
+            self.pcp.capture_pane_screenshot(hou, "SceneViewer")
+
+    def test_to_image_raises_runtime_error_wraps_with_cause(self):
+        """pixmap.toImage() 抛异常时必须包装为 RuntimeError 并保留 __cause__."""
+        class _ExplodingToImagePixmap(_FakeQPixmap):
+            def toImage(self):
+                raise RuntimeError("explosion in toImage")
+        class _ExplodingToImageWidget(_FakeQWidget):
+            def grab(self):
+                return _ExplodingToImagePixmap(100, 100)
+        widget = _ExplodingToImageWidget()
+        hou = _make_hou_with_scene_viewer(widget)
+        with self.assertRaises(RuntimeError) as cm:
+            self.pcp.capture_pane_screenshot(hou, "SceneViewer")
+        self.assertIsNotNone(cm.exception.__cause__)
+        self.assertIn("explosion in toImage", str(cm.exception.__cause__))
+
+    def test_image_is_null_raises_runtime_error(self):
+        """pixmap.toImage() 返回 isNull()==True image 必须抛 RuntimeError."""
+        class _NullImageWidget(_FakeQWidget):
+            def grab(self):
+                p = _FakeQPixmap(100, 100, null=True)
+                # Also make toImage() return a null image
+                return p
+        widget = _NullImageWidget()
+        hou = _make_hou_with_scene_viewer(widget)
+        with self.assertRaises(RuntimeError):
+            self.pcp.capture_pane_screenshot(hou, "SceneViewer")
+
+    def test_grab_error_message_includes_pane_type(self):
+        """RuntimeError 消息必须包含 pane 类型名便于排错."""
+        class _NoneGrabWidget(_FakeQWidget):
+            def grab(self):
+                return None
+        widget = _NoneGrabWidget()
+        hou = _make_hou_with_scene_viewer(widget)
+        try:
+            self.pcp.capture_pane_screenshot(hou, "SceneViewer")
+            self.fail("Expected RuntimeError")
+        except RuntimeError as e:
+            self.assertIn("SceneViewer", str(e))
+
 
 # ===========================================================================
 # Section C.3: capture_pane_screenshot with PySide2 fake
@@ -575,29 +736,19 @@ class CapturePaneScreenshotPySide2Tests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        fake_qtcore = types.ModuleType("PySide2.QtCore")
-        fake_qtcore.QBuffer = _FakeQBuffer
-        fake_qtcore.QIODevice = _FakeQIODevice
-        fake_qtgui = types.ModuleType("PySide2.QtGui")
-        fake_qtgui.QImage = _FakeQImage
-        fake_qtwidgets = types.ModuleType("PySide2.QtWidgets")
-        fake_qtwidgets.QWidget = _FakeQWidget
-        fake_pkg = types.ModuleType("PySide2")
-        fake_pkg.QtCore = fake_qtcore
-        fake_pkg.QtGui = fake_qtgui
-        fake_pkg.QtWidgets = fake_qtwidgets
-        sys.modules["PySide2"] = fake_pkg
-        sys.modules["PySide2.QtCore"] = fake_qtcore
-        sys.modules["PySide2.QtGui"] = fake_qtgui
-        sys.modules["PySide2.QtWidgets"] = fake_qtwidgets
-        cls.pcp2 = _load_pane_capture_fresh()
-
-    @classmethod
-    def tearDownClass(cls):
-        for k in ("PySide2", "PySide2.QtCore", "PySide2.QtGui",
-                  "PySide2.QtWidgets"):
-            sys.modules.pop(k, None)
-        _load_pane_capture_fresh()
+        # Important 3: use _FakeQtFixture so PySide6 is blocked (would
+        # otherwise be preferred over PySide2) and original module
+        # objects are restored on teardown via addClassCleanup.
+        cls._orig_pcp = sys.modules.get(_PCP_KEY)
+        cls.fx = _FakeQtFixture("PySide2")
+        cls.fx.__enter__()
+        try:
+            cls.pcp2 = _load_pane_capture_fresh()
+            cls.addClassCleanup(cls.fx.__exit__, None, None, None)
+            cls.addClassCleanup(_restore_pcp_module, cls._orig_pcp)
+        except Exception:
+            cls.fx.__exit__(*sys.exc_info())
+            raise
 
     def test_qt_backend_is_pyside2(self):
         self.assertEqual(self.pcp2._QT_BACKEND, "PySide2")
@@ -678,40 +829,12 @@ class CaptureMultiplePanesTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    def test_partial_failure_continues(self):
-        """Inject fake PySide6 so capture_pane_screenshot normally succeeds,
-        then monkey-patch it to raise ValueError for NetworkEditor. The
-        other two panes must still succeed and the loop must continue past
-        the failure."""
-
-        fake_qtcore = types.ModuleType("PySide6.QtCore")
-        fake_qtcore.QBuffer = _FakeQBuffer
-        fake_qtcore.QIODevice = _FakeQIODevice
-        fake_qtgui = types.ModuleType("PySide6.QtGui")
-        fake_qtgui.QImage = _FakeQImage
-        fake_qtwidgets = types.ModuleType("PySide6.QtWidgets")
-        fake_qtwidgets.QWidget = _FakeQWidget
-        fake_pkg = types.ModuleType("PySide6")
-        fake_pkg.QtCore = fake_qtcore
-        fake_pkg.QtGui = fake_qtgui
-        fake_pkg.QtWidgets = fake_qtwidgets
-        _install_fake_pyside({"PySide6": fake_pkg,
-                              "PySide6.QtCore": fake_qtcore,
-                              "PySide6.QtGui": fake_qtgui,
-                              "PySide6.QtWidgets": fake_qtwidgets})
-        try:
-            pcp_qt = _load_pane_capture_fresh()
+    def test_all_success_when_qt_available(self):
+        """Important 2：注入 fake PySide6 让 capture_pane_screenshot 真正
+        成功时，capture_multiple_panes 必须全部 success=True, error=None，
+        且 save_path 实际落盘。"""
+        def body(pcp_qt):
             self.assertEqual(pcp_qt._QT_BACKEND, "PySide6")
-            original = pcp_qt.capture_pane_screenshot
-
-            def flaky(hou, pane_type_name, save_path=None, fit_contents=True):
-                if pane_type_name == "NetworkEditor":
-                    raise ValueError("simulated failure")
-                return original(hou, pane_type_name, save_path=save_path,
-                                fit_contents=fit_contents)
-
-            pcp_qt.capture_pane_screenshot = flaky
-            # Build hou with all three pane types so they would normally succeed
             widget = _FakeQWidget()
             sv = _FakePaneTab(widget=widget)
             ne = _FakePaneTab(widget=widget)
@@ -728,17 +851,62 @@ class CaptureMultiplePanesTests(unittest.TestCase):
                     ["SceneViewer", "NetworkEditor", "Compositor"],
                     tmpdir)
                 self.assertEqual(len(results), 3)
-                failed = [r for r in results if not r["success"]]
-                self.assertEqual(len(failed), 1)
-                self.assertEqual(failed[0]["pane_type"], "NetworkEditor")
-                self.assertIn("simulated failure", failed[0]["error"])
+                # 全部成功
+                succeeded = [r for r in results if r["success"]]
+                self.assertEqual(len(succeeded), 3)
+                for r in results:
+                    self.assertTrue(r["success"], r)
+                    self.assertIsNone(r["error"], r)
+                    self.assertTrue(os.path.isfile(r["save_path"]))
             finally:
-                pcp_qt.capture_pane_screenshot = original
                 shutil.rmtree(tmpdir, ignore_errors=True)
-        finally:
-            _uninstall_fake_pyside(["PySide6", "PySide6.QtCore",
-                                    "PySide6.QtGui", "PySide6.QtWidgets"])
-            _load_pane_capture_fresh()
+        _run_with_fake_pyside6(body)
+
+    def test_partial_failure_continues(self):
+        """Inject fake PySide6 so capture_pane_screenshot normally succeeds,
+        then monkey-patch it to raise ValueError for NetworkEditor. The
+        other two panes must still succeed and the loop must continue past
+        the failure."""
+        def body(pcp_qt):
+            self.assertEqual(pcp_qt._QT_BACKEND, "PySide6")
+            original = pcp_qt.capture_pane_screenshot
+
+            def flaky(hou, pane_type_name, save_path=None, fit_contents=True):
+                if pane_type_name == "NetworkEditor":
+                    raise ValueError("simulated failure")
+                return original(hou, pane_type_name, save_path=save_path,
+                                fit_contents=fit_contents)
+
+            pcp_qt.capture_pane_screenshot = flaky
+            try:
+                # Build hou with all three pane types so they would normally succeed
+                widget = _FakeQWidget()
+                sv = _FakePaneTab(widget=widget)
+                ne = _FakePaneTab(widget=widget)
+                co = _FakePaneTab(widget=widget)
+                hou = _FakeHou(pane_tabs_by_type={
+                    _FakePaneTabType.SceneViewer: sv,
+                    _FakePaneTabType.NetworkEditor: ne,
+                    _FakePaneTabType.Compositor: co,
+                })
+                tmpdir = tempfile.mkdtemp()
+                try:
+                    results = pcp_qt.capture_multiple_panes(
+                        hou,
+                        ["SceneViewer", "NetworkEditor", "Compositor"],
+                        tmpdir)
+                    self.assertEqual(len(results), 3)
+                    failed = [r for r in results if not r["success"]]
+                    self.assertEqual(len(failed), 1)
+                    self.assertEqual(failed[0]["pane_type"], "NetworkEditor")
+                    self.assertIn("simulated failure", failed[0]["error"])
+                finally:
+                    pcp_qt.capture_pane_screenshot = original
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pcp_qt.capture_pane_screenshot = original
+                raise
+        _run_with_fake_pyside6(body)
 
 
 # ===========================================================================
@@ -767,6 +935,32 @@ class RenderNodeNetworkTests(unittest.TestCase):
         hou._nodes["/obj/geo1"] = _FakeNode("/obj/geo1")
         with self.assertRaises(ValueError):
             pcp.render_node_network(hou, "/obj/geo1")
+
+    # ----- Important 2: fit_contents True/False 直接影响 render_node_network -----
+    def test_fit_contents_true_calls_homeAll(self):
+        """render_node_network(fit_contents=True) 必须触发 pane.homeAll()."""
+        def body(pcp_qt):
+            self.assertEqual(pcp_qt._QT_BACKEND, "PySide6")
+            widget = _FakeQWidget()
+            hou, ne = _make_hou_with_network_editor(widget=widget)
+            hou._nodes["/obj/geo1"] = _FakeNode("/obj/geo1")
+            pcp_qt.render_node_network(hou, "/obj/geo1", fit_contents=True)
+            self.assertEqual(len(ne._home_calls), 1)
+            self.assertEqual(ne._cd_calls, ["/obj/geo1"])
+        _run_with_fake_pyside6(body)
+
+    def test_fit_contents_false_skips_homeAll(self):
+        """render_node_network(fit_contents=False) 必须跳过 pane.homeAll()."""
+        def body(pcp_qt):
+            self.assertEqual(pcp_qt._QT_BACKEND, "PySide6")
+            widget = _FakeQWidget()
+            hou, ne = _make_hou_with_network_editor(widget=widget)
+            hou._nodes["/obj/geo1"] = _FakeNode("/obj/geo1")
+            pcp_qt.render_node_network(hou, "/obj/geo1", fit_contents=False)
+            self.assertEqual(ne._home_calls, [])
+            # pane.cd() 仍然必须被调用（cd 与 fit_contents 独立）
+            self.assertEqual(ne._cd_calls, ["/obj/geo1"])
+        _run_with_fake_pyside6(body)
 
 
 # ===========================================================================
@@ -1030,6 +1224,273 @@ class ServerHandlersTests(unittest.TestCase):
                         self.assertNotIn("list_visible_panes", src)
                         return
         self.fail("MUTATING_COMMANDS assignment not found")
+
+
+# ===========================================================================
+# Section J: Bridge tool AST node exec (Important 2)
+# ===========================================================================
+# Parse houdini_mcp_server.py, extract the 4 PR 13 @mcp.tool() function
+# source, compile + exec each in an isolated namespace where _houdini_call
+# is a recording mock. This validates that each tool:
+#   - Calls _houdini_call with the correct cmd_name
+#   - Passes the correct param keys + values
+#   - Surfaces Houdini error responses as bridge error envelopes
+# without importing the heavy houdini_mcp_server module (mcp / requests /
+# langchain).
+class _RecordingHoudiniCall(object):
+    """Mock for houdini_mcp_server._houdini_call that records (cmd, params)
+    and returns a configurable response dict."""
+
+    def __init__(self, response=None, raise_exc=None):
+        self.calls = []
+        self.response = response if response is not None else {
+            "status": "success", "result": {"ok": True}}
+        self.raise_exc = raise_exc
+
+    def __call__(self, cmd, params=None):
+        self.calls.append({"cmd": cmd, "params": params or {}})
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return self.response
+
+
+class _FakeMCP(object):
+    """Stub for the @mcp.tool() decorator used in houdini_mcp_server.py.
+
+    Records the wrapped function under the function's __name__ on .registry."""
+
+    def __init__(self):
+        self.registry = {}
+
+    def tool(self):
+        def decorator(fn):
+            self.registry[fn.__name__] = fn
+            return fn
+        return decorator
+
+
+def _exec_pr13_bridge_tool(tool_name):
+    """AST-isolate-exec the named PR 13 bridge tool from houdini_mcp_server.py.
+
+    Returns (executed_function, recording_mock, fake_mcp).
+    """
+    with open(SERVER_PY, "r", encoding="utf-8") as f:
+        src = f.read()
+    tree = ast.parse(src)
+    fn_node = None
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == tool_name:
+            # Ensure @mcp.tool() decorator is present
+            for dec in node.decorator_list:
+                if isinstance(dec, ast.Call):
+                    func = dec.func
+                    if isinstance(func, ast.Attribute) and func.attr == "tool":
+                        fn_node = node
+                        break
+            if fn_node is not None:
+                break
+    if fn_node is None:
+        raise AssertionError(
+            "PR 13 bridge tool {0} not found in houdini_mcp_server.py".format(
+                tool_name))
+    fn_src = ast.get_source_segment(src, fn_node)
+    fake_mcp = _FakeMCP()
+    rec = _RecordingHoudiniCall()
+    ns = {"mcp": fake_mcp, "_houdini_call": rec}
+    exec(compile(fn_src, "<pr13_{0}>".format(tool_name), "exec"), ns)
+    return ns[tool_name], rec, fake_mcp
+
+
+class PR13BridgeToolASTExecTests(unittest.TestCase):
+    """Important 2: each PR 13 bridge tool, AST-isolated, must call
+    _houdini_call with the exact cmd_name + param keys/values."""
+
+    def test_capture_pane_screenshot_cmd_and_params(self):
+        fn, rec, _mcp = _exec_pr13_bridge_tool("capture_pane_screenshot")
+        fn(object(), "NetworkEditor", "/tmp/out.png", True)
+        self.assertEqual(len(rec.calls), 1)
+        call = rec.calls[0]
+        self.assertEqual(call["cmd"], "capture_pane_screenshot")
+        self.assertEqual(call["params"]["pane_type_name"], "NetworkEditor")
+        self.assertEqual(call["params"]["save_path"], "/tmp/out.png")
+        self.assertTrue(call["params"]["fit_contents"])
+
+    def test_list_visible_panes_cmd_and_params(self):
+        fn, rec, _mcp = _exec_pr13_bridge_tool("list_visible_panes")
+        fn(object())
+        self.assertEqual(len(rec.calls), 1)
+        call = rec.calls[0]
+        self.assertEqual(call["cmd"], "list_visible_panes")
+        # No params, but tool should pass an empty dict (per source).
+        self.assertEqual(call["params"], {})
+
+    def test_capture_multiple_panes_cmd_and_params(self):
+        fn, rec, _mcp = _exec_pr13_bridge_tool("capture_multiple_panes")
+        pane_list = ["SceneViewer", "NetworkEditor"]
+        fn(object(), pane_list, "/tmp/captures")
+        self.assertEqual(len(rec.calls), 1)
+        call = rec.calls[0]
+        self.assertEqual(call["cmd"], "capture_multiple_panes")
+        self.assertEqual(call["params"]["pane_types"], pane_list)
+        self.assertEqual(call["params"]["save_dir"], "/tmp/captures")
+
+    def test_render_node_network_cmd_and_params(self):
+        fn, rec, _mcp = _exec_pr13_bridge_tool("render_node_network")
+        fn(object(), "/obj/geo1", True, "/tmp/net.png")
+        self.assertEqual(len(rec.calls), 1)
+        call = rec.calls[0]
+        self.assertEqual(call["cmd"], "render_node_network")
+        self.assertEqual(call["params"]["node_path"], "/obj/geo1")
+        self.assertTrue(call["params"]["fit_contents"])
+        self.assertEqual(call["params"]["save_path"], "/tmp/net.png")
+
+    def test_capture_pane_screenshot_passes_through_houdini_error(self):
+        """Houdini 返 status=error 时，bridge 工具必须把 envelope 原样透传."""
+        err_envelope = {
+            "status": "error",
+            "message": "pane not found",
+            "origin": "houdini",
+        }
+        fn, rec, _mcp = _exec_pr13_bridge_tool("capture_pane_screenshot")
+        rec.response = err_envelope
+        result = fn(object(), "SceneViewer")
+        self.assertEqual(result, err_envelope)
+
+    def test_render_node_network_passes_through_houdini_error(self):
+        err_envelope = {
+            "status": "error",
+            "message": "no NetworkEditor pane",
+            "origin": "houdini",
+        }
+        fn, rec, _mcp = _exec_pr13_bridge_tool("render_node_network")
+        rec.response = err_envelope
+        result = fn(object(), "/obj/geo1")
+        self.assertEqual(result, err_envelope)
+
+
+# ===========================================================================
+# Section K: Server.py handler wrapper apply_response_cap (Important 2)
+# ===========================================================================
+# server.py imports hou at module top, so we cannot import it directly. We
+# AST-extract the 4 PR 13 HoudiniMCPServer method bodies, exec each into a
+# stub class with mocked `hou` / `pcp` / `cmn` namespace, then verify
+# cmn.apply_response_cap is called exactly once per invocation.
+class _StubCap(object):
+    """Stub for houdinimcp._common.apply_response_cap with call recording."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, value, *args, **kwargs):
+        self.calls.append({"value": value, "args": args, "kwargs": kwargs})
+        return value
+
+
+def _build_pr13_handler_class(pcp_stub=None, hou_stub=None,
+                              cap_stub=None):
+    """AST-extract the 4 PR 13 handler methods from server.py and exec each
+    into a stub class namespace with mocked `hou` / `pcp` / `cmn`.
+
+    Returns (class, cap_stub, pcp_stub).
+    """
+    server_src_path = os.path.join(ROOT, "server.py")
+    with open(server_src_path, "r", encoding="utf-8") as f:
+        src = f.read()
+    tree = ast.parse(src)
+    cls_node = next((n for n in tree.body
+                     if isinstance(n, ast.ClassDef)
+                     and n.name == "HoudiniMCPServer"), None)
+    if cls_node is None:
+        raise AssertionError("HoudiniMCPServer class not found in server.py")
+
+    if cap_stub is None:
+        cap_stub = _StubCap()
+    if pcp_stub is None:
+        pcp_stub = types.SimpleNamespace()
+    if hou_stub is None:
+        hou_stub = object()
+
+    cmn_stub = types.SimpleNamespace(apply_response_cap=cap_stub)
+    ns = {
+        "hou": hou_stub,
+        "pcp": pcp_stub,
+        "cmn": cmn_stub,
+    }
+
+    target_methods = {
+        "capture_pane_screenshot",
+        "list_visible_panes",
+        "capture_multiple_panes",
+        "render_node_network",
+    }
+    class_ns = {}
+    for method in cls_node.body:
+        if not isinstance(method, ast.FunctionDef):
+            continue
+        if method.name not in target_methods:
+            continue
+        method_src = ast.get_source_segment(src, method)
+        # Execute the def into a per-method namespace and lift the function
+        # into class_ns so it becomes an unbound method of the class.
+        local = dict(ns)
+        local["__name__"] = "_Pr13Method_{0}".format(method.name)
+        exec(compile(method_src, "<server_{0}>".format(method.name), "exec"),
+             local)
+        class_ns[method.name] = local[method.name]
+
+    class _Pr13Server(object):
+        pass
+    for name, fn in class_ns.items():
+        setattr(_Pr13Server, name, fn)
+    return _Pr13Server, cap_stub, pcp_stub
+
+
+class PR13HandlerCapMockTests(unittest.TestCase):
+    """Important 2: each PR 13 HoudiniMCPServer method must call
+    cmn.apply_response_cap exactly once. Previously the test only grep'd
+    the source for `apply_response_cap`, missing whether the wrapper
+    actually invoked it."""
+
+    def setUp(self):
+        self._pcp_stub = types.SimpleNamespace()
+        # Pre-populate pcp stubs so the handler calls don't blow up.
+        self._pcp_stub.capture_pane_screenshot = lambda *a, **kw: {
+            "pane_type": kw.get("pane_type_name", a[1] if len(a) > 1 else "?"),
+            "save_path": kw.get("save_path"),
+            "width": 100, "height": 100, "size_bytes": 100,
+            "_qt_backend": "PySide6"}
+        self._pcp_stub.list_visible_panes = lambda *a, **kw: []
+        self._pcp_stub.capture_multiple_panes = lambda *a, **kw: []
+        self._pcp_stub.render_node_network = lambda *a, **kw: {
+            "pane_type": "NetworkEditor"}
+
+    def test_capture_pane_screenshot_calls_cap_once(self):
+        cls, cap, _ = _build_pr13_handler_class(
+            pcp_stub=self._pcp_stub)
+        inst = cls()
+        inst.capture_pane_screenshot("SceneViewer")
+        self.assertEqual(len(cap.calls), 1)
+
+    def test_list_visible_panes_calls_cap_once(self):
+        cls, cap, _ = _build_pr13_handler_class(
+            pcp_stub=self._pcp_stub)
+        inst = cls()
+        inst.list_visible_panes()
+        self.assertEqual(len(cap.calls), 1)
+
+    def test_capture_multiple_panes_calls_cap_once(self):
+        cls, cap, _ = _build_pr13_handler_class(
+            pcp_stub=self._pcp_stub)
+        inst = cls()
+        inst.capture_multiple_panes(["SceneViewer"], "/tmp/cap")
+        self.assertEqual(len(cap.calls), 1)
+
+    def test_render_node_network_calls_cap_once(self):
+        cls, cap, _ = _build_pr13_handler_class(
+            pcp_stub=self._pcp_stub)
+        inst = cls()
+        inst.render_node_network("/obj/geo1")
+        self.assertEqual(len(cap.calls), 1)
 
 
 if __name__ == "__main__":

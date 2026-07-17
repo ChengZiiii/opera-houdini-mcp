@@ -145,8 +145,18 @@ def capture_pane_screenshot(hou, pane_type_name, save_path=None,
     if widget is None:
         raise RuntimeError("无法获取 " + str(pane_type_name) + " Qt widget")
 
-    pixmap = widget.grab()
-    img = pixmap.toImage()
+    try:
+        pixmap = widget.grab()
+    except Exception as e:
+        raise RuntimeError(str(pane_type_name) + " widget.grab() 失败: " + str(e)) from e
+    if pixmap is None or pixmap.isNull():
+        raise RuntimeError(str(pane_type_name) + " widget.grab() 返回无效 pixmap")
+    try:
+        img = pixmap.toImage()
+    except Exception as e:
+        raise RuntimeError(str(pane_type_name) + " pixmap.toImage() 失败: " + str(e)) from e
+    if img is None or img.isNull():
+        raise RuntimeError(str(pane_type_name) + " pixmap 转 image 失败")
     width = img.width()
     height = img.height()
 
