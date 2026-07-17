@@ -640,17 +640,36 @@ def create_node(ctx: Context, node_type: str, parent_path: str = "/obj", name: s
         return f"Server Error creating node: {str(e)}"
 
 @mcp.tool()
-def execute_houdini_code(ctx: Context, code: str) -> str:
+def execute_houdini_code(ctx: Context, code: str,
+                          policy: str = "normal",
+                          allow_dangerous: bool = False,
+                          allow_heavy_geometry: bool = False,
+                          capture_diff: bool = False) -> str:
     """
     Execute arbitrary Python code in Houdini's environment. LAST RESORT:
     prefer the dedicated tools (connect_nodes, set_parameters, create_wrangle,
     get_geometry_info, ...) — they validate input, report structured errors
     and are undoable as a single step. Use this only for operations no
-    dedicated tool covers. Returns status and any stdout/stderr.
+    dedicated tool covers.
+
+    Args:
+        code: Python source to exec inside Houdini.
+        policy: "read-only" / "normal" / "privileged" (PR 4 safety policy).
+        allow_dangerous: explicit per-call dangerous-code override (privileged only).
+        allow_heavy_geometry: explicit per-call heavy-geometry override.
+        capture_diff: when True, server snapshots scene state before & after.
+
+    Returns status, any stdout/stderr, and an optional audit block.
     """
     try:
         conn = get_houdini_connection()
-        response = conn.send_command("execute_code", {"code": code})
+        response = conn.send_command("execute_code", {
+            "code": code,
+            "policy": policy,
+            "allow_dangerous": allow_dangerous,
+            "allow_heavy_geometry": allow_heavy_geometry,
+            "capture_diff": capture_diff,
+        })
 
         # Handle Houdini-side errors first (could be connection error or execution error)
         if response.get("status") == "error":
@@ -662,12 +681,26 @@ def execute_houdini_code(ctx: Context, code: str) -> str:
         if result.get("executed"): # Check if executed flag is True
             stdout = result.get("stdout", "").strip()
             stderr = result.get("stderr", "").strip()
+            audit = result.get("_audit")
 
             output_message = "Code executed successfully."
             if stdout:
-                output_message += f"\\n--- Stdout ---\\n{stdout}"
+                output_message += f"\n--- Stdout ---\n{stdout}"
             if stderr:
-                output_message += f"\\n--- Stderr ---\\n{stderr}"
+                output_message += f"\n--- Stderr ---\n{stderr}"
+            if audit:
+                output_message += "\n--- Audit ---\n" + json.dumps(audit, indent=2)
+            return output_message
+        elif result.get("blocked"):
+            # PR 4 policy rejection: server returned blocked dict
+            reason = result.get("reason", "blocked by policy")
+            output_message = "Execution blocked: " + reason
+            hits = result.get("hits") or {}
+            if hits:
+                output_message += "\n--- Hits ---\n" + json.dumps(hits, indent=2)
+            audit = result.get("_audit")
+            if audit:
+                output_message += "\n--- Audit ---\n" + json.dumps(audit, indent=2)
             return output_message
         else:
             # Unexpected success response format or executed flag missing/false
@@ -680,6 +713,35 @@ def execute_houdini_code(ctx: Context, code: str) -> str:
         # Errors during communication or parsing in this script
         logger.error(f"Unexpected error in execute_houdini_code tool: {str(e)}", exc_info=True)
         return f"Server Error executing code: {str(e)}"
+
+
+@mcp.tool()
+def get_last_scene_diff(ctx: Context) -> str:
+    """Return the last execute_code (capture_diff=True) scene before/after diff.
+
+    The Houdini-side server caches the most recent serialize_scene_state pair;
+    this tool fetches and pretty-prints the diff so the agent can verify what
+    a privileged execution actually changed in the scene.
+    """
+    try:
+        conn = get_houdini_connection()
+        response = conn.send_command("get_last_scene_diff", {})
+
+        if response.get("status") == "error":
+            origin = response.get('origin', 'houdini')
+            return f"Error ({origin}): {response.get('message', 'Unknown error')}"
+
+        result = response.get("result", {}) or {}
+        if not result.get("available", False):
+            return ("No scene diff available yet. Run execute_houdini_code "
+                    "with capture_diff=True first.")
+        diff = result.get("diff", {})
+        return json.dumps(diff, indent=2)
+    except ConnectionError as e:
+         return f"Connection Error getting scene diff: {str(e)}"
+    except Exception as e:
+        logger.error(f"Unexpected error in get_last_scene_diff tool: {str(e)}", exc_info=True)
+        return f"Server Error getting scene diff: {str(e)}"
 
 # -------------------------------------------------------------------
 # Graph Editing & Introspection Tools

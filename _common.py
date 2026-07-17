@@ -21,8 +21,14 @@
 import ast
 import copy
 import functools
+import io
 import json
+import os
 import re
+import sys
+import threading
+import time
+from contextlib import redirect_stderr, redirect_stdout
 
 __all__ = [
     "handle_connection_errors",
@@ -45,6 +51,12 @@ __all__ = [
     "_json_safe_hou_value",
     "_flatten_parm_templates",
     "ExecutionTimeoutError",
+    "validate_policy",
+    "_bypass_config_enabled",
+    "check_execute_code_policy",
+    "_build_audit",
+    "serialize_scene_state",
+    "_run_code_thread",
 ]
 
 
@@ -585,3 +597,284 @@ class ExecutionTimeoutError(Exception):
     def __init__(self, message="execution timed out"):
         super().__init__(message)
         self.message = message
+
+
+# ---------------------------------------------------------------------------
+# Section 10: execute_code policy / bypass / audit (PR 4)
+# ---------------------------------------------------------------------------
+_VALID_POLICIES = ("read-only", "normal", "privileged")
+_BYPASS_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def validate_policy(policy):
+    """规范化 policy 名：大小写不敏感；非法值抛 ValueError。"""
+    if not isinstance(policy, str):
+        raise ValueError(
+            "policy must be a string, got {0}".format(type(policy).__name__)
+        )
+    norm = policy.strip().lower()
+    if norm not in _VALID_POLICIES:
+        raise ValueError(
+            "policy must be one of {0}, got {1!r}".format(
+                list(_VALID_POLICIES), policy
+            )
+        )
+    return norm
+
+
+def _bypass_config_enabled():
+    """读环境变量 HOUDINI_MCP_ALLOW_BYPASS；truthy 字符串视为开启。"""
+    raw = os.environ.get("HOUDINI_MCP_ALLOW_BYPASS")
+    if raw is None:
+        return False
+    return raw.strip().lower() in _BYPASS_TRUTHY
+
+
+def check_execute_code_policy(code, policy, allow_dangerous,
+                               allow_heavy_geometry, bypass_enabled):
+    """三档 policy 决策：返 allowed / reason / hits 详情。
+
+    - read-only + 任意 mutation → 拒绝（即使 hits 是空）
+    - normal + dangerous + 未 allow → 拒绝
+    - normal + heavy + 未 allow → 拒绝
+    - privileged + dangerous + 未 allow → 拒绝（即便 bypass ON）
+    - privileged + dangerous + allow_dangerous + bypass_enabled → 通过
+    - import hou 在所有 policy 下都被记录到 hits.import_hou；
+      read-only 下额外拒绝（避免 import hou 绕过 mutation 校验）
+    """
+    norm_policy = validate_policy(policy)
+    dangerous_hits = _detect_dangerous_code(code)
+    heavy_hits = _detect_heavy_geometry_code(code)
+    mutation_hits = _detect_mutation_code(code)
+    import_hou_hits = _detect_import_hou(code)
+    import_hou = bool(import_hou_hits)
+
+    hits = {
+        "dangerous": dangerous_hits,
+        "heavy": heavy_hits,
+        "mutation": mutation_hits,
+        "import_hou": import_hou,
+    }
+
+    # read-only 永远禁止 mutation / import hou
+    if norm_policy == "read-only":
+        if mutation_hits:
+            return {
+                "allowed": False,
+                "reason": "read-only policy forbids mutation: {0}".format(
+                    mutation_hits[0]
+                ),
+                "hits": hits,
+                "policy": norm_policy,
+            }
+        if import_hou:
+            return {
+                "allowed": False,
+                "reason": "read-only policy forbids import hou",
+                "hits": hits,
+                "policy": norm_policy,
+            }
+        # 即使 dangerous / heavy，read-only 也拒绝（双层防御）
+        if dangerous_hits:
+            return {
+                "allowed": False,
+                "reason": "read-only policy forbids dangerous code: {0}".format(
+                    dangerous_hits[0]
+                ),
+                "hits": hits,
+                "policy": norm_policy,
+            }
+        if heavy_hits:
+            return {
+                "allowed": False,
+                "reason": "read-only policy forbids heavy geometry: {0}".format(
+                    heavy_hits[0]
+                ),
+                "hits": hits,
+                "policy": norm_policy,
+            }
+        return {"allowed": True, "reason": "ok", "hits": hits,
+                "policy": norm_policy}
+
+    # normal policy: dangerous / heavy 需要显式 allow
+    if norm_policy == "normal":
+        if dangerous_hits and not allow_dangerous:
+            return {
+                "allowed": False,
+                "reason": "normal policy forbids dangerous code: {0}".format(
+                    dangerous_hits[0]
+                ),
+                "hits": hits,
+                "policy": norm_policy,
+            }
+        if heavy_hits and not allow_heavy_geometry:
+            return {
+                "allowed": False,
+                "reason": "normal policy forbids heavy geometry: {0}".format(
+                    heavy_hits[0]
+                ),
+                "hits": hits,
+                "policy": norm_policy,
+            }
+        return {"allowed": True, "reason": "ok", "hits": hits,
+                "policy": norm_policy}
+
+    # privileged policy: 双开关 allow_dangerous AND bypass_enabled
+    if norm_policy == "privileged":
+        if dangerous_hits:
+            if not allow_dangerous:
+                return {
+                    "allowed": False,
+                    "reason": "privileged requires allow_dangerous=true for: {0}".format(
+                        dangerous_hits[0]
+                    ),
+                    "hits": hits,
+                    "policy": norm_policy,
+                }
+            if not bypass_enabled:
+                return {
+                    "allowed": False,
+                    "reason": (
+                        "privileged dangerous code requires "
+                        "HOUDINI_MCP_ALLOW_BYPASS env var enabled"
+                    ),
+                    "hits": hits,
+                    "policy": norm_policy,
+                }
+        if heavy_hits and not allow_heavy_geometry:
+            return {
+                "allowed": False,
+                "reason": "privileged requires allow_heavy_geometry=true for: {0}".format(
+                    heavy_hits[0]
+                ),
+                "hits": hits,
+                "policy": norm_policy,
+            }
+        return {"allowed": True, "reason": "ok", "hits": hits,
+                "policy": norm_policy}
+
+    # validate_policy 已覆盖所有合法值，到这里是防御性兜底
+    return {"allowed": False, "reason": "unknown policy: {0}".format(norm_policy),
+            "hits": hits, "policy": norm_policy}
+
+
+def _build_audit(policy, bypass_used, dangerous_hits, heavy_hits,
+                  mutation_hits, elapsed_ms, undo_group,
+                  exception_type=None, exception_message=None,
+                  timed_out=False):
+    """结构化 audit 块；空 hits 字段省略而非 None。"""
+    audit = {
+        "policy": policy,
+        "bypass_used": bool(bypass_used),
+        "elapsed_ms": int(elapsed_ms) if elapsed_ms is not None else 0,
+    }
+    if dangerous_hits:
+        audit["dangerous_hits"] = list(dangerous_hits)
+    if heavy_hits:
+        audit["heavy_hits"] = list(heavy_hits)
+    if mutation_hits:
+        audit["mutation_hits"] = list(mutation_hits)
+    if undo_group:
+        audit["undo_group"] = undo_group
+    if exception_type:
+        audit["exception_type"] = exception_type
+    if exception_message:
+        audit["exception_message"] = exception_message
+    if timed_out:
+        audit["timed_out"] = True
+    return audit
+
+
+def serialize_scene_state(hou, root_path=None, max_depth=2):
+    """PLACEHOLDER — PR 5 will replace.
+
+    PR 4 仅返回最小摘要：节点数 + 顶层节点列表。完整序列化（参数 / 属性 /
+    max_depth 递归等）由 PR 5 `_scene.py` 提供。hou 参数由调用方注入。
+    """
+    if root_path is None:
+        root_path = "/"
+    try:
+        root = hou.node(root_path)
+    except Exception:
+        return {"root_path": root_path, "error": "failed to resolve root"}
+    if root is None:
+        return {"root_path": root_path, "node_count": 0, "nodes": []}
+
+    nodes = []
+
+    def _walk(node, depth):
+        if depth > max_depth:
+            return
+        try:
+            name = node.name()
+            path = node.path()
+        except Exception:
+            return
+        try:
+            type_name = node.type().name()
+        except Exception:
+            type_name = "unknown"
+        nodes.append({"name": name, "path": path, "type": type_name})
+        try:
+            children = node.children()
+        except Exception:
+            return
+        for child in children:
+            _walk(child, depth + 1)
+
+    _walk(root, 0)
+    return {
+        "root_path": root_path,
+        "node_count": len(nodes),
+        "nodes": nodes,
+    }
+
+
+def _run_code_thread(code, namespace, timeout=30):
+    """在 daemon 线程里 exec(code, namespace)；超时只标记不阻塞。
+
+    返回 dict 字段：
+    - stdout / stderr: 重定向捕获的输出
+    - elapsed_ms: 实际等待时间（毫秒）
+    - timed_out: bool
+    - exception_type / exception_message: 异常时填入
+    注：超时情况下线程为 daemon，主进程退出时会被回收；不会自动 undo。
+    """
+    stdout_capture = io.StringIO()
+    stderr_capture = io.StringIO()
+    container = {}
+
+    def _target():
+        try:
+            with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
+                exec(code, namespace)
+            container["exc"] = None
+        except Exception as e:
+            container["exc"] = e
+            try:
+                traceback_mod = __import__("traceback")
+                traceback_mod.print_exc(file=stderr_capture)
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=_target, daemon=True)
+    start = time.time()
+    thread.start()
+    thread.join(timeout=timeout)
+    elapsed_ms = int((time.time() - start) * 1000)
+    timed_out = thread.is_alive()
+
+    result = {
+        "stdout": stdout_capture.getvalue(),
+        "stderr": stderr_capture.getvalue(),
+        "elapsed_ms": elapsed_ms,
+        "timed_out": timed_out,
+    }
+    exc = container.get("exc")
+    if exc is not None:
+        result["exception_type"] = type(exc).__name__
+        result["exception_message"] = str(exc)
+    else:
+        result["exception_type"] = None
+        result["exception_message"] = None
+    return result

@@ -33,6 +33,10 @@ import io
 from contextlib import redirect_stdout, redirect_stderr
 from . import _common as cmn
 
+# PR 4 scene-diff cache：execute_code(capture_diff=True) 时填充；get_last_scene_diff 读取。
+_before_scene = None
+_after_scene = None
+
 # Imports for OPUS import
 import zipfile
 from urllib.parse import urlparse
@@ -227,6 +231,7 @@ class HoudiniMCPServer:
             "delete_node": self.delete_node,
             "get_node_info": self.get_node_info,
             "execute_code": self.execute_code,
+            "get_last_scene_diff": self.get_last_scene_diff,
             "set_material": self.set_material,
             "get_asset_lib_status": self.get_asset_lib_status,
             "import_opus_url": self.handle_import_opus_url,
@@ -458,30 +463,163 @@ class HoudiniMCPServer:
 
         return node_info
 
-    def execute_code(self, code):
-        """Executes arbitrary Python code within Houdini."""
-        stdout_capture = io.StringIO()
-        stderr_capture = io.StringIO()
-        try:
-            namespace = {"hou": hou}
-            # Capture stdout/stderr during exec
-            with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
-                exec(code, namespace)
+    def execute_code(self, code, policy="normal", allow_dangerous=False,
+                     allow_heavy_geometry=False, capture_diff=False, timeout=30):
+        """Execute arbitrary Python code within Houdini with PR 4 safety layer.
 
-            # Success case: return execution status and captured output
+        新签名（向后兼容：仅传 code 时等价于 policy=normal / 全 bypass 关闭 /
+        不 capture diff / timeout=30s）。流程：
+        1) 规范化 policy 2) 读 bypass config 3) policy 决策（hit 即返 blocked）
+        4) capture_diff 时先 serialize 5) _run_code_thread 执行 6) capture_diff
+        时再 serialize 7) _build_audit 组装审计块。
+        """
+        # Step 1+2: validate policy & bypass config
+        try:
+            norm_policy = cmn.validate_policy(policy)
+        except ValueError as e:
             return {
-                "executed": True,
-                "stdout": stdout_capture.getvalue(),
-                "stderr": stderr_capture.getvalue()
+                "executed": False,
+                "blocked": True,
+                "reason": str(e),
+                "_audit": cmn._build_audit(
+                    policy=str(policy),
+                    bypass_used=False,
+                    dangerous_hits=[],
+                    heavy_hits=[],
+                    mutation_hits=[],
+                    elapsed_ms=0,
+                    undo_group=None,
+                    exception_type="ValueError",
+                    exception_message=str(e),
+                ),
             }
-        except Exception as e:
-            # Failure case: print traceback to actual stderr for debugging in Houdini
-            print("--- Houdini MCP: execute_code Error ---", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-            print("--- End Error ---", file=sys.stderr)
-            # Re-raise the exception so it's caught by execute_command
-            # and reported back as a standard error message.
-            raise Exception(f"Code execution error: {str(e)}")
+        bypass_enabled = cmn._bypass_config_enabled()
+
+        # Step 3: policy decision
+        decision = cmn.check_execute_code_policy(
+            code, norm_policy, allow_dangerous, allow_heavy_geometry,
+            bypass_enabled,
+        )
+        if not decision["allowed"]:
+            # 不进入 thread，返 blocked dict
+            return {
+                "executed": False,
+                "blocked": True,
+                "reason": decision["reason"],
+                "hits": decision["hits"],
+                "_audit": cmn._build_audit(
+                    policy=norm_policy,
+                    bypass_used=False,
+                    dangerous_hits=decision["hits"]["dangerous"],
+                    heavy_hits=decision["hits"]["heavy"],
+                    mutation_hits=decision["hits"]["mutation"],
+                    elapsed_ms=0,
+                    undo_group=None,
+                ),
+            }
+
+        # Step 4: undo group name（保持向后兼容：execute_code 不属于 MUTATING_COMMANDS
+        # 的硬编码集合，但 policy==privileged 时仍尝试 undo 包一层以便 agent 撤销）
+        undo_group_name = None
+        if norm_policy == "privileged" and hasattr(hou, "undos"):
+            undo_group_name = "MCP: execute_code (privileged)"
+
+        # Step 5: capture diff before
+        global _before_scene, _after_scene
+        if capture_diff:
+            try:
+                _before_scene = cmn.serialize_scene_state(hou)
+            except Exception as e:
+                # serialize 失败不阻断执行；audit 记录
+                _before_scene = {"error": "before-snapshot failed: {0}".format(e)}
+        else:
+            _before_scene = None
+
+        # Step 6: namespace + thread-exec
+        namespace = {"hou": hou}
+        # 把 undo 包成 context manager（如果可用）
+        if undo_group_name and hasattr(hou, "undos") and hasattr(hou.undos, "group"):
+            with hou.undos.group(undo_group_name):
+                run_result = cmn._run_code_thread(code, namespace, timeout=timeout)
+        else:
+            run_result = cmn._run_code_thread(code, namespace, timeout=timeout)
+
+        # Step 7: capture diff after
+        if capture_diff:
+            try:
+                _after_scene = cmn.serialize_scene_state(hou)
+            except Exception as e:
+                _after_scene = {"error": "after-snapshot failed: {0}".format(e)}
+        else:
+            _after_scene = None
+
+        # Step 8: 截断输出
+        max_size = 16 * 1024
+        stdout, stdout_truncated = cmn._truncate_output(
+            run_result.get("stdout", ""), max_size
+        )
+        stderr, stderr_truncated = cmn._truncate_output(
+            run_result.get("stderr", ""), max_size
+        )
+
+        # 异常时仍要打 traceback 到 host stderr（沿用 PR 3 之前行为）
+        if run_result.get("exception_type") and not run_result.get("timed_out"):
+            try:
+                print("--- Houdini MCP: execute_code Error ---", file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
+                print("--- End Error ---", file=sys.stderr)
+            except Exception:
+                pass
+
+        # Step 9: 组装 audit + 返回
+        audit = cmn._build_audit(
+            policy=norm_policy,
+            bypass_used=(norm_policy == "privileged" and bypass_enabled),
+            dangerous_hits=decision["hits"]["dangerous"],
+            heavy_hits=decision["hits"]["heavy"],
+            mutation_hits=decision["hits"]["mutation"],
+            elapsed_ms=run_result.get("elapsed_ms", 0),
+            undo_group=undo_group_name,
+            exception_type=run_result.get("exception_type"),
+            exception_message=run_result.get("exception_message"),
+            timed_out=run_result.get("timed_out", False),
+        )
+
+        result = {
+            "executed": True,
+            "stdout": stdout,
+            "stderr": stderr,
+            "_audit": audit,
+        }
+        if stdout_truncated:
+            result["stdout_truncated"] = True
+        if stderr_truncated:
+            result["stderr_truncated"] = True
+        if run_result.get("exception_type"):
+            # 保留 PR 3 之前向 host 抛异常的语义；通过 _audit.exception_* 已记录
+            # 这里不再 raise，避免双重异常处理。bridge 端可读 _audit 字段判定。
+            result["execution_error"] = run_result.get("exception_message", "")
+        return result
+
+    def get_last_scene_diff(self):
+        """返回最近一次 execute_code(capture_diff=True) 的前后场景快照 diff。
+
+        若从未以 capture_diff=True 执行过，返回 {"available": False, ...}。
+        不修改场景（因此不在 MUTATING_COMMANDS 内）。
+        """
+        global _before_scene, _after_scene
+        if _before_scene is None and _after_scene is None:
+            return {
+                "available": False,
+                "message": "No scene diff captured yet. Run execute_code with capture_diff=True.",
+            }
+        changed = _before_scene != _after_scene
+        return {
+            "available": True,
+            "changed": changed,
+            "before": _before_scene,
+            "after": _after_scene,
+        }
 
     # -------------------------------------------------------------------------
     # Graph Editing & Introspection
