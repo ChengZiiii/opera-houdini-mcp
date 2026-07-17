@@ -5,8 +5,8 @@ Tests cover:
     - _node_info.get_node_info: default params / compact / include_errors /
       force_cook / include_input_details / cook_state H20.5+ & fallback /
       inputConnectors single-call / missing node -> ValueError
-    - _node_info._cook_state: H20.5+ returns enum tail / H<20.5 returns
-      "Unknown" + hint
+    - _node_info._cook_state: H20.5+ returns enum tail / H<20.5 maps
+      needsToCook() to Dirty or Cooked
     - bridge @mcp.tool() style probe (no type annotations + Chinese docstring)
     - bridge behavior: _houdini_call param keys, error passthrough
 
@@ -93,12 +93,21 @@ class _FakeParm(object):
 
 
 class _FakeConnector(object):
-    """Mimics hou.Node.inputConnectors() output tuples."""
+    """Mimics hou.NodeConnection methods used by inputConnectors()."""
 
-    def __init__(self, input_index, output_node, output_index=0):
-        self.input_index = input_index
-        self.output_node = output_node
-        self.output_index = output_index
+    def __init__(self, input_index, input_node, output_index=0):
+        self._input_index = input_index
+        self._input_node = input_node
+        self._output_index = output_index
+
+    def inputIndex(self):
+        return self._input_index
+
+    def inputNode(self):
+        return self._input_node
+
+    def outputIndex(self):
+        return self._output_index
 
 
 class _FakeNode(object):
@@ -169,8 +178,11 @@ class _FakeNode(object):
     def inputConnectors(self):
         out = []
         for idx, src in enumerate(self._inputs):
-            out.append(_FakeConnector(idx, src, 0))
-        return out
+            if src is None:
+                out.append(())
+            else:
+                out.append((_FakeConnector(idx, src, 0),))
+        return tuple(out)
 
     def cook(self, force=False):
         self.cook_calls.append(bool(force))
@@ -239,14 +251,17 @@ class CookStateTests(unittest.TestCase):
         hou, target = _make_hou_with_target(cook_state="Uncooked")
         self.assertEqual(ni._cook_state(hou, target), "Uncooked")
 
-    def test_cook_state_pre_20_5_fallback(self):
-        """H<20.5: no cookState() attribute -> 'Unknown' + hint."""
-        target = _FakeNode("a", version="19.5")
-        # remove cookState so the fallback path triggers
-        if hasattr(target, "cookState"):
-            del target.cookState
-        result = ni._cook_state(None, target)
-        self.assertEqual(result, "Unknown (H20.5+ required)")
+    def test_cook_state_pre_20_5_dirty_when_needs_to_cook(self):
+        """H<20.5: needsToCook() True maps to Dirty."""
+        target = _FakeNode(
+            "a", version="19.5", needs_to_cook=True)
+        self.assertEqual(ni._cook_state(None, target), "Dirty")
+
+    def test_cook_state_pre_20_5_cooked_when_clean(self):
+        """H<20.5: needsToCook() False maps to Cooked."""
+        target = _FakeNode(
+            "a", version="19.5", needs_to_cook=False)
+        self.assertEqual(ni._cook_state(None, target), "Cooked")
 
 
 # ===========================================================================
@@ -353,20 +368,41 @@ class IncludeInputDetailsTests(unittest.TestCase):
                                   include_input_details=False)
         self.assertNotIn("input_connectors", result)
 
-    def test_include_input_details_true_returns_input_connectors(self):
+    def test_include_input_details_true_handles_nested_hom_connectors(self):
         a = _FakeNode("a")
-        b = _FakeNode("b", inputs=[a, None, None])
+        c = _FakeNode("c")
+        d = _FakeNode("d")
+        b = _FakeNode("b", inputs=[None, a, c])
+        b.inputConnectors = lambda: (
+            (),
+            (_FakeConnector(1, a, 2),),
+            (_FakeConnector(2, c, 3), _FakeConnector(2, d, 4)),
+        )
         hou = _FakeHou()
         hou.add_node("/obj/a", a)
         hou.add_node("/obj/b", b)
+        hou.add_node("/obj/c", c)
+        hou.add_node("/obj/d", d)
+
         result = ni.get_node_info(hou, "/obj/b",
                                   include_input_details=True)
-        self.assertIn("input_connectors", result)
-        connectors = result["input_connectors"]
-        self.assertEqual(len(connectors), 1)
-        self.assertEqual(connectors[0]["input_index"], 0)
-        self.assertEqual(connectors[0]["output_path"], a.path())
-        self.assertEqual(connectors[0]["output_index"], 0)
+
+        self.assertEqual(result["input_connectors"], [
+            {"input_index": 0, "connections": []},
+            {
+                "input_index": 1,
+                "connections": [
+                    {"output_node": "/obj/a", "output_index": 2},
+                ],
+            },
+            {
+                "input_index": 2,
+                "connections": [
+                    {"output_node": "/obj/c", "output_index": 3},
+                    {"output_node": "/obj/d", "output_index": 4},
+                ],
+            },
+        ])
 
     def test_input_connectors_called_once_not_per_input(self):
         """Per brief 10.3: inputConnectors() must be called ONCE on the node,

@@ -8,8 +8,8 @@
   include_input_details 模式下使用 node.inputConnectors() 一次性取所有输入
   连接（避免 per-input RPC）。
 - _cook_state(hou, node)
-  辅助函数：H20.5+ 调 node.cookState() 并返 enum 名称尾巴；H<20.5 回退到
-  "Unknown (H20.5+ required)" 提示。
+  辅助函数：H20.5+ 调 node.cookState() 并返 enum 名称尾巴；H<20.5 根据
+  node.needsToCook() 回退为 "Dirty" 或 "Cooked"。
 
 设计原则：
 - hou 隔离：函数第一参数是 hou（与 _materials / _hscript / _scene /
@@ -25,7 +25,7 @@ _PARMS_LIMIT = 20
 
 
 def _cook_state(hou, node):
-    """获取节点的 cook state。H20.5+ 用 cookState()，否则回退 Unknown。
+    """获取节点的 cook state，并为 H<20.5 回退 needsToCook()。
 
     Args:
         hou: hou 模块或 stub（保留参数以备后续扩展；当前实现只依赖 node
@@ -33,8 +33,8 @@ def _cook_state(hou, node):
         node: hou.Node 实例。
 
     Returns:
-        str: cook state 名称（如 "Cooked" / "Dirty" / "Uncooked" / "Cooking"）；
-             H<20.5 时返 "Unknown (H20.5+ required)"。
+        str: cook state 名称。H<20.5 时，needsToCook() 为 True 返回
+             "Dirty"，否则返回 "Cooked"。
     """
     if hasattr(node, "cookState"):
         state = node.cookState()
@@ -42,27 +42,34 @@ def _cook_state(hou, node):
             return "Unknown"
         # hou.cookStateType.Cooked -> "Cooked"
         return str(state).split(".")[-1]
-    return "Unknown (H20.5+ required)"
+    if hasattr(node, "needsToCook") and node.needsToCook():
+        return "Dirty"
+    return "Cooked"
 
 
 def _collect_input_connectors(node):
-    """用 node.inputConnectors() 一次取所有输入连接并序列化为 dict。
+    """遍历 inputConnectors() 的 HOM 嵌套 tuple 并序列化。
 
     Returns:
-        list of {"input_index": int, "output_path": str, "output_index": int}
-        —— 只保留 input_index 上确实连接了源节点的项（None 输入跳过）。
+        list of {"input_index": int, "connections": list}。外层按输入索引
+        保留空项；每条连接包含 output_node 路径和 output_index。
     """
-    connectors = node.inputConnectors()
     out = []
-    for conn in connectors:
-        src = getattr(conn, "output_node", None)
-        if src is None:
-            continue
-        out.append({
-            "input_index": conn.input_index,
-            "output_path": src.path(),
-            "output_index": getattr(conn, "output_index", 0),
-        })
+    for input_index, connections in enumerate(node.inputConnectors()):
+        entry = {"input_index": input_index, "connections": []}
+        for connection in connections:
+            try:
+                source = connection.inputNode()
+            except Exception:
+                source = None
+            if source is None:
+                continue
+            entry["connections"].append({
+                "output_node": source.path(),
+                "output_index": getattr(
+                    connection, "outputIndex", lambda: 0)(),
+            })
+        out.append(entry)
     return out
 
 
