@@ -298,11 +298,20 @@ class AssignMaterialTests(unittest.TestCase):
         hou.node("/obj")._children.append(geo)
         hou.add_node("/obj/grpGeo", geo)
 
+        # PR 7 fix: group is non-None -> must call assignToNode(geo, group=...),
+        # bypassing the shop_materialpath shortcut. Provide an assignToNode
+        # hook on the mat so the new code path can succeed.
         mat = hou.node("/mat").createNode("principledshader", "layerMat")
+        mat.assignToNode_calls = []
+        mat.assignToNode = lambda g, group=None: mat.assignToNode_calls.append(
+            (g, group))
         result = mat_mod.assign_material(hou, "/obj/grpGeo",
                                           mat.path(), group="piece1")
         self.assertTrue(result["success"])
         self.assertEqual(result["group"], "piece1")
+        # PR 7 fix: must actually have invoked assignToNode with the group,
+        # not silently set shop_materialpath.
+        self.assertEqual(mat.assignToNode_calls, [(geo, "piece1")])
 
     def test_group_none_default(self):
         hou = _make_hou()
@@ -343,6 +352,141 @@ class AssignMaterialTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             mat_mod.assign_material(hou, "/obj/validGeo", "/mat/noSuchMat")
+
+    # ---- PR 7 fix: group semantics + fallback failure must raise ----
+    def test_group_calls_assignToNode_when_no_shop_materialpath(self):
+        """group= non-None + geo has NO shop_materialpath parm + mat exposes
+        assignToNode -> must call assignToNode(geo, group=group) and succeed.
+        """
+        hou = _make_hou()
+        geo = _FakeMaterialNode("noParmGeo", node_type_name="geo",
+                                category_name="Sop")
+        # intentionally do NOT add shop_materialpath
+        geo._parent = hou.node("/obj")
+        hou.node("/obj")._children.append(geo)
+        hou.add_node("/obj/noParmGeo", geo)
+
+        mat = hou.node("/mat").createNode("principledshader", "gMat")
+        mat.assignToNode_calls = []
+        mat.assignToNode = lambda g, group=None: mat.assignToNode_calls.append(
+            (g, group))
+
+        result = mat_mod.assign_material(hou, "/obj/noParmGeo",
+                                          mat.path(), group="piece7")
+        self.assertTrue(result["success"])
+        self.assertEqual(result["group"], "piece7")
+        self.assertEqual(mat.assignToNode_calls, [(geo, "piece7")])
+
+    def test_group_assignToNode_missing_raises_value_error(self):
+        """group= non-None + geo has NO shop_materialpath + mat has NO
+        assignToNode attribute -> must raise ValueError, not silent success.
+        """
+        hou = _make_hou()
+        geo = _FakeMaterialNode("noParmGeo2", node_type_name="geo",
+                                category_name="Sop")
+        geo._parent = hou.node("/obj")
+        hou.node("/obj")._children.append(geo)
+        hou.add_node("/obj/noParmGeo2", geo)
+
+        mat = hou.node("/mat").createNode("principledshader", "noAssignMat")
+        # default _FakeMaterialNode has no assignToNode -> AttributeError path
+
+        with self.assertRaises(ValueError):
+            mat_mod.assign_material(hou, "/obj/noParmGeo2",
+                                     mat.path(), group="pieceX")
+
+    def test_group_assignToNode_rejects_group_kwarg_raises_value_error(self):
+        """group= non-None + geo has NO shop_materialpath + mat.assignToNode
+        raises TypeError on group= kwarg -> must raise ValueError (not
+        silently fall back to no-group call).
+        """
+        hou = _make_hou()
+        geo = _FakeMaterialNode("kwGeo", node_type_name="geo",
+                                category_name="Sop")
+        geo._parent = hou.node("/obj")
+        hou.node("/obj")._children.append(geo)
+        hou.add_node("/obj/kwGeo", geo)
+
+        mat = hou.node("/mat").createNode("principledshader", "kwMat")
+
+        def _reject_kwarg(g, group=None):
+            if group is not None:
+                raise TypeError("assignToNode() got unexpected kwarg 'group'")
+            return None
+
+        mat.assignToNode = _reject_kwarg
+
+        with self.assertRaises(ValueError):
+            mat_mod.assign_material(hou, "/obj/kwGeo",
+                                     mat.path(), group="pieceY")
+
+    def test_group_assignToNode_runtime_error_raises_value_error(self):
+        """group= non-None + assignToNode raises a non-TypeError exception
+        -> must propagate as ValueError.
+        """
+        hou = _make_hou()
+        geo = _FakeMaterialNode("rtGeo", node_type_name="geo",
+                                category_name="Sop")
+        geo._parent = hou.node("/obj")
+        hou.node("/obj")._children.append(geo)
+        hou.add_node("/obj/rtGeo", geo)
+
+        mat = hou.node("/mat").createNode("principledshader", "rtMat")
+
+        def _explode(g, group=None):
+            raise RuntimeError("hou internal failure")
+
+        mat.assignToNode = _explode
+
+        with self.assertRaises(ValueError):
+            mat_mod.assign_material(hou, "/obj/rtGeo",
+                                     mat.path(), group="pieceZ")
+
+    def test_fallback_failure_no_assignToNode_raises_value_error(self):
+        """group=None (default fallback path) + geo has NO shop_materialpath
+        + mat has NO assignToNode -> must raise ValueError instead of
+        silently returning success:True.
+        """
+        hou = _make_hou()
+        geo = _FakeMaterialNode("fbGeo", node_type_name="geo",
+                                category_name="Sop")
+        geo._parent = hou.node("/obj")
+        hou.node("/obj")._children.append(geo)
+        hou.add_node("/obj/fbGeo", geo)
+
+        mat = hou.node("/mat").createNode("principledshader", "fbMat")
+
+        with self.assertRaises(ValueError):
+            mat_mod.assign_material(hou, "/obj/fbGeo", mat.path())
+
+    def test_group_bypasses_shop_materialpath_when_group_given(self):
+        """Even when geo HAS shop_materialpath parm, group= non-None must
+        still go through assignToNode (so the group binding actually takes
+        effect). shop_materialpath must NOT be modified.
+        """
+        hou = _make_hou()
+        geo = _FakeMaterialNode("bypassGeo", node_type_name="geo",
+                                category_name="Sop")
+        original_parm_value = "ORIGINAL"
+        geo._parm_dict["shop_materialpath"] = _FakeParm(
+            "shop_materialpath", original_parm_value)
+        geo._parent = hou.node("/obj")
+        hou.node("/obj")._children.append(geo)
+        hou.add_node("/obj/bypassGeo", geo)
+
+        mat = hou.node("/mat").createNode("principledshader", "bpMat")
+        mat.assignToNode_calls = []
+        mat.assignToNode = lambda g, group=None: mat.assignToNode_calls.append(
+            (g, group))
+
+        result = mat_mod.assign_material(hou, "/obj/bypassGeo",
+                                          mat.path(), group="pieceB")
+        self.assertTrue(result["success"])
+        self.assertEqual(result["group"], "pieceB")
+        self.assertEqual(mat.assignToNode_calls, [(geo, "pieceB")])
+        # shop_materialpath parm must NOT have been clobbered when group given
+        self.assertEqual(
+            geo._parm_dict["shop_materialpath"]._value, original_parm_value)
 
 
 # ===========================================================================

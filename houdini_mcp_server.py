@@ -1284,13 +1284,20 @@ def get_opus_job_result(batch_job_id: str) -> dict:
 # PR 7 Materials Tools (thin relay to server-side _materials)
 # -------------------------------------------------------------------
 @mcp.tool()
-def create_material(ctx: Context, material_type: str,
-                    name: str = None, parent_path: str = "/mat",
-                    parameters: Dict[str, Any] = None) -> dict:
-    """Create a material node in Houdini. Returns {path, type, name,
-    parameters_set}. Parent_path defaults to '/mat'. parameters is an
-    optional dict keyed by parm name. Missing parm names are silently
-    skipped (no error).
+def create_material(ctx, material_type,
+                    name=None, parent_path="/mat",
+                    parameters=None):
+    """在 Houdini 中创建一个材质节点并返回节点信息。
+
+    参数说明：
+    - material_type: 材质节点类型，如 "principledshader"、"vopsurface"
+    - name: 可选，节点名；缺省时由 Houdini 自动命名
+    - parent_path: 可选，父节点路径，默认 "/mat"；不存在时回退到 /mat
+    - parameters: 可选，dict 按 parm 名设置参数值；不存在的 parm 名会
+      静默跳过（不影响调用）
+
+    返回 dict 包含 path / type / name / parameters_set 四项，
+    parameters_set 列出已尝试设置的 parm 名（含静默跳过的）。
     """
     return _houdini_call("create_material", {
         "material_type": material_type,
@@ -1301,12 +1308,19 @@ def create_material(ctx: Context, material_type: str,
 
 
 @mcp.tool()
-def assign_material(ctx: Context, geometry_path: str,
-                    material_path: str, group: str = None) -> dict:
-    """Assign a material to a geometry node. geometry_path is the SOP/OBJ
-    path; material_path is the material node path; group is optional (apply
-    only to a primitive / point group). Returns
-    {geometry_path, material_path, group, success}.
+def assign_material(ctx, geometry_path,
+                    material_path, group=None):
+    """把 material_path 处的材质绑定到 geometry_path 处的几何节点。
+
+    参数说明：
+    - geometry_path: SOP / OBJ 几何节点路径
+    - material_path: 材质节点路径
+    - group: 可选，指定要绑定到的 group 名（如 primitive / point group）；
+      传 None 时整节点绑定，传具体名字时仅绑定到该 group
+
+    返回 dict 包含 geometry_path / material_path / group / success；
+    绑定失败时函数会抛 ValueError，bridge 不会再以 success:True 形式
+    静默吞错。
     """
     return _houdini_call("assign_material", {
         "geometry_path": geometry_path,
@@ -1316,13 +1330,14 @@ def assign_material(ctx: Context, geometry_path: str,
 
 
 @mcp.tool()
-def get_material_info(ctx: Context, material_path: str) -> dict:
-    """Get detailed info about a material node. Returns
-    {path, type, name, parameters, texture_references}. parameters is
-    filtered against the 50+ whitelist in _materials.MATERIAL_PARM_WHITELIST
-    so the response stays stable across material types. texture_references
-    lists parms whose eval value matches a known texture extension
-    (.png/.jpg/.jpeg/.exr/.hdr/.tif/.tiff/.rat/.tex).
+def get_material_info(ctx, material_path):
+    """获取材质节点的详细信息。
+
+    返回 dict 包含 path / type / name / parameters / texture_references
+    五项。parameters 仅保留 _materials.MATERIAL_PARM_WHITELIST 中列出的
+    50+ parm，过滤后键集合稳定跨材质类型一致；texture_references 列出
+    eval 值匹配已知贴图后缀（.png / .jpg / .jpeg / .exr / .hdr / .tif /
+    .tiff / .rat / .tex）的 parm。
     """
     return _houdini_call("get_material_info", {"material_path": material_path})
 

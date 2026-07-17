@@ -130,15 +130,21 @@ def assign_material(hou, geometry_path, material_path, group=None):
     """把 material_path 处的材质绑定到 geometry_path 处的几何节点。
 
     实现策略：
-    - 优先用 geo.parm("shop_materialpath") 设值；这是 PR 之前 server.py
-      既有的 set_material 的兼容写法，跨 Houdini 版本最稳定
-    - 若 geo 没有 shop_materialpath parm，尝试 mat.assignToNode(geo,
-      group=group)（HOU 较新版本支持；参数缺失 AttributeError 时
-      退化为直接 pass，让 Houdini 抛具体错）
-    - group 可选；None 时整节点绑定，非 None 时仅绑定到指定 group
+    - group 非 None 时：必须走 mat.assignToNode(geo, group=group)，
+      Houdini 版本不支持 group kwarg（TypeError）或缺少 assignToNode
+      (AttributeError) 时直接抛 ValueError，不再 fallback 到
+      shop_materialpath
+    - group 为 None 时：优先用 geo.parm("shop_materialpath") 设值
+      （跨 Houdini 版本最稳定），缺失 parm 时尝试
+      mat.assignToNode(geo)；两条路径都不可用时抛 ValueError
+    - 任何绑定路径抛错都转为 ValueError，调用方不会再收到
+      success:True 的虚假成功响应
 
     Returns:
         dict {"geometry_path", "material_path", "group", "success": True}
+
+    Raises:
+        ValueError: 节点不存在，或所有绑定路径都失败
     """
     geo = hou.node(geometry_path)
     mat = hou.node(material_path)
@@ -151,25 +157,33 @@ def assign_material(hou, geometry_path, material_path, group=None):
         raise ValueError(
             "几何或材质节点不存在: {0}".format(", ".join(missing)))
 
-    parm = geo.parm("shop_materialpath")
-    if parm is not None:
-        parm.set(mat.path())
-    else:
-        # 退化路径：调用 Houdini 较新版本的 assignToNode
+    if group is not None:
+        # group 绑定路径：必须经过 assignToNode，不能用 shop_materialpath
+        # 兜底，否则 group 信息会静默丢失。
         assign = getattr(mat, "assignToNode", None)
-        if callable(assign):
+        if not callable(assign):
+            raise ValueError("Houdini 版本不支持 assignToNode")
+        try:
+            assign(geo, group=group)
+        except TypeError:
+            raise ValueError("Houdini 版本不支持 group 绑定")
+        except Exception as e:
+            raise ValueError("assignToNode 调用失败: {0}".format(e))
+    else:
+        # 整节点绑定：保留既有 shop_materialpath 优先策略
+        parm = geo.parm("shop_materialpath")
+        if parm is not None:
+            parm.set(mat.path())
+        else:
+            assign = getattr(mat, "assignToNode", None)
+            if not callable(assign):
+                raise ValueError(
+                    "无可用绑定入口（shop_materialpath parm 不存在且"
+                    "材质节点无 assignToNode）")
             try:
-                if group is not None:
-                    assign(geo, group=group)
-                else:
-                    assign(geo)
-            except TypeError:
-                # 某些版本签名不接受 group kwargs
-                if group is not None:
-                    assign(geo, group)
-                else:
-                    assign(geo)
-        # 没有可调用的绑定入口也不抛错 —— 调用方可在 Houdini 侧自行处理
+                assign(geo)
+            except Exception as e:
+                raise ValueError("assignToNode 调用失败: {0}".format(e))
 
     return {
         "geometry_path": geometry_path,
