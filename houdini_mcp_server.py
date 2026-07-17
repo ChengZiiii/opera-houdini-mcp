@@ -778,6 +778,80 @@ def new_scene(ctx: Context) -> str:
     """
     return _houdini_call("new_scene", {})
 
+
+# -------------------------------------------------------------------
+# PR 6: Node Discovery & Cache Management Tools
+# -------------------------------------------------------------------
+@mcp.tool()
+def list_node_types(ctx: Context, category: str = None,
+                    name_filter: str = None, limit: int = 50,
+                    cursor: int = None) -> dict:
+    """List Houdini node types with optional category / name filter, paginated.
+
+    PR 6: relays to server-side disc.list_node_types, which populates the
+    NodeTypeCache on first call and reuses it across invocations.
+    """
+    return _houdini_call("list_node_types", {
+        "category": category,
+        "name_filter": name_filter,
+        "limit": limit,
+        "cursor": cursor,
+    })
+
+
+@mcp.tool()
+def list_children(ctx: Context, node_path: str = "/",
+                  recursive: bool = False, max_depth: int = 5,
+                  max_nodes: int = 1000, compact: bool = False,
+                  limit: int = 50, cursor: int = None) -> dict:
+    """List the children of node_path. With recursive=True walk the subtree up
+    to max_depth. compact=True returns only {path, type, children_count}.
+
+    PR 6: relays to server-side disc.list_children.
+    """
+    return _houdini_call("list_children", {
+        "node_path": node_path,
+        "recursive": recursive,
+        "max_depth": max_depth,
+        "max_nodes": max_nodes,
+        "compact": compact,
+        "limit": limit,
+        "cursor": cursor,
+    })
+
+
+@mcp.tool()
+def find_nodes(ctx: Context, root_path: str = "/", pattern: str = None,
+               node_type: str = None, limit: int = 50,
+               cursor: int = None) -> dict:
+    """Find nodes under root_path matching a glob / substring pattern or
+    node_type. Default root_path is "/".
+
+    PR 6: relays to server-side disc.find_nodes.
+    """
+    return _houdini_call("find_nodes", {
+        "root_path": root_path,
+        "pattern": pattern,
+        "node_type": node_type,
+        "limit": limit,
+        "cursor": cursor,
+    })
+
+
+@mcp.tool()
+def manage_cache(ctx: Context, action: str = "stats") -> dict:
+    """Manage the Houdini-side NodeTypeCache.
+
+    action="stats"     -> return cache hits/misses/size/last_populated_at
+    action="invalidate"-> clear all registered caches (calls
+                          cmn.invalidate_all_caches under the hood)
+    action="warmup"    -> pre-populate the NodeTypeCache
+
+    PR 6: relays to server-side disc.manage_cache. ValueError on unknown
+    action surfaces as an error dict with origin="houdini".
+    """
+    return _houdini_call("manage_cache", {"action": action})
+
 # -------------------------------------------------------------------
 # Graph Editing & Introspection Tools
 # -------------------------------------------------------------------

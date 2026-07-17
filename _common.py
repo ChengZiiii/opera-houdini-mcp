@@ -57,8 +57,10 @@ __all__ = [
     "_build_audit",
     "serialize_scene_state",
     "invalidate_all_caches",
+    "register_cache",
+    "_cache_registry",
     "_run_code_thread",
-]
+] 
 
 
 # ---------------------------------------------------------------------------
@@ -867,14 +869,32 @@ def serialize_scene_state(hou, root_path=None, include_params=False, max_depth=3
 
 
 # ---------------------------------------------------------------------------
-# Section 11: cache invalidation placeholder (PR 5 -> PR 6 NodeTypeCache)
+# Section 11: cache invalidation registry (PR 6 NodeTypeCache-aware)
 # ---------------------------------------------------------------------------
-def invalidate_all_caches():
-    """清除所有节点类型缓存。PR 6 will replace with NodeTypeCache-aware version.
+_cache_registry = []  # list of objects with .clear() method
 
-    PR 5 占位实现：当前无缓存层，no-op。后续 _scene.load_scene / new_scene
-    等场景突变操作仍调用本函数，PR 6 会替换为遍历 _cache_registry 的实现。
+
+def register_cache(cache_obj):
+    """注册 cache 对象，使 invalidate_all_caches 能遍历清理。
+
+    幂等：同一对象重复注册不重复添加（用 `not in` 判定）。
     """
+    if cache_obj not in _cache_registry:
+        _cache_registry.append(cache_obj)
+
+
+def invalidate_all_caches():
+    """遍历 _cache_registry 调各 cache.clear()。
+
+    - 单个 cache 抛异常被吞掉，不影响其他 cache
+    - 遍历时拷贝 list 防迭代中被改
+    - 返回 None（与 PR 5 占位签名保持兼容：调用方无需关心返回值）
+    """
+    for cache in list(_cache_registry):
+        try:
+            cache.clear()
+        except Exception:
+            pass
     return None
 
 

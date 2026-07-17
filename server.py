@@ -33,6 +33,7 @@ import io
 from contextlib import redirect_stdout, redirect_stderr
 from . import _common as cmn
 from . import _scene as scn
+from . import _discovery as disc
 
 # PR 4 scene-diff cache：execute_code(capture_diff=True) 时填充；get_last_scene_diff 读取。
 _before_scene = None
@@ -258,6 +259,11 @@ class HoudiniMCPServer:
             "render_single_view": self.handle_render_single_view,
             "render_quad_view": self.handle_render_quad_view,
             "render_specific_camera": self.handle_render_specific_camera,
+            # PR 6: node discovery + cache management (NodeTypeCache)
+            "list_node_types": self.list_node_types,
+            "list_children": self.list_children,
+            "find_nodes": self.find_nodes,
+            "manage_cache": self.manage_cache,
             "ping": self._handle_ping,
         }
         
@@ -374,6 +380,28 @@ class HoudiniMCPServer:
     def new_scene(self):
         """PR 5: 新建空白场景（suppress_save_prompt=True）；自动调用 invalidate_all_caches()。"""
         return scn.new_scene(hou)
+
+    def list_node_types(self, category=None, name_filter=None, limit=50, cursor=None):
+        """PR 6: 列出 Houdini 节点类型（paginated）。thin wrapper to disc.list_node_types."""
+        return disc.list_node_types(hou, category=category, name_filter=name_filter,
+                                    limit=limit, cursor=cursor)
+
+    def list_children(self, node_path="/", recursive=False, max_depth=5,
+                      max_nodes=1000, compact=False, limit=50, cursor=None):
+        """PR 6: 列出 node_path 的子节点。thin wrapper to disc.list_children."""
+        return disc.list_children(hou, node_path=node_path, recursive=recursive,
+                                  max_depth=max_depth, max_nodes=max_nodes,
+                                  compact=compact, limit=limit, cursor=cursor)
+
+    def find_nodes(self, root_path="/", pattern=None, node_type=None,
+                   limit=50, cursor=None):
+        """PR 6: 在 root_path 下用 pattern / node_type 过滤查找。thin wrapper to disc.find_nodes."""
+        return disc.find_nodes(hou, root_path=root_path, pattern=pattern,
+                               node_type=node_type, limit=limit, cursor=cursor)
+
+    def manage_cache(self, action="stats"):
+        """PR 6: cache 管理（stats / invalidate / warmup）。thin wrapper to disc.manage_cache."""
+        return disc.manage_cache(hou, action=action)
 
     def create_node(self, node_type, parent_path="/obj", name=None, position=None, parameters=None):
         """Creates a new node in the specified parent."""
