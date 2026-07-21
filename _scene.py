@@ -20,14 +20,15 @@ def get_scene_info(hou):
     """返回场景元信息 dict。
 
     字段：
-    - houdini_version: hou.houdiniVersion() 字符串
+    - houdini_version: hou.applicationVersionString() 字符串（H21+；
+      旧 hou.houdiniVersion() 已移除）
     - node_count: 全场景节点数（hou.node('/').allSubChildren() 长度，失败回退 0）
     - file_path: hou.hipFile.name() 字符串
     - fps / start_frame / end_frame: 时间线相关
     """
     info = {}
     try:
-        info["houdini_version"] = hou.houdiniVersion()
+        info["houdini_version"] = hou.applicationVersionString()
     except Exception:
         info["houdini_version"] = ""
     try:

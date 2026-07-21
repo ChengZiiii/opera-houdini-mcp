@@ -77,7 +77,8 @@ def _has_cjk(s):
 def _make_mock_hou(
     *,
     version="20.5.123",
-    application_version_string="Houdini 20.5.123",
+    application_version_string=None,
+    application_version=(21, 0, 596),
     build="123",
     hip_path="/tmp/scene.hip",
     is_untitled=False,
@@ -87,16 +88,34 @@ def _make_mock_hou(
     """Build a Mock that mimics the subset of hou API PR 16 uses.
 
     Returns a Mock that responds to .version(), .applicationVersionString(),
-    .build(), .hipFile.path(), .hipFile.isUntitled(), .node("/").allSubChildren()
+    .applicationVersion(), .build(), .hipFile.path(), .hipFile.basename(),
+    .hipFile.isUntitled(), .hipFile.isNewFile(), .node("/").allSubChildren()
     and .ui.desktops() with sensible defaults.
+
+    H21 compat 备注：H21 已移除 .version / .build / .hipFile.isUntitled；
+    H21 真实存在的 API 是 .applicationVersionString / .applicationVersion /
+    .hipFile.isNewFile / .hipFile.basename / .hipFile.name。Task 8（conftest
+    揭露性）会从 conftest.py 移除 legacy lambda；本 helper 暂时**并存**
+    提供，让旧测试与 H21-aware 新测试同时跑通。
+
+    默认让 application_version_string == version，避免「fork 改用新 API 后
+    旧 assertion 取到不同值」的契约漂移。调用方仍可显式传不同值。
     """
+    if application_version_string is None:
+        application_version_string = version
     h = mock.Mock()
+    # 旧 API（H21 已移除，但 Mock 不揭露）—— Task 8 会清理依赖它们的测试
     h.version.return_value = version
-    h.applicationVersionString.return_value = application_version_string
     h.build.return_value = build
+    h.hipFile.isUntitled.return_value = is_untitled
+    # H21+ 真实存在的新 API
+    h.applicationVersionString.return_value = application_version_string
+    h.applicationVersion.return_value = application_version
+    h.hipFile.isNewFile.return_value = is_untitled
+    h.hipFile.basename.return_value = os.path.basename(hip_path) if hip_path else None
+    h.hipFile.name.return_value = hip_path
 
     h.hipFile.path.return_value = hip_path
-    h.hipFile.isUntitled.return_value = is_untitled
 
     all_children = sub_children if sub_children is not None else []
     h.node.return_value.allSubChildren.return_value = all_children
@@ -143,7 +162,6 @@ class CheckConnectionServerTests(unittest.TestCase):
     def test_method_returns_full_field_set(self):
         h = _make_mock_hou(
             version="21.0.456",
-            application_version_string="Houdini 21.0.456",
             build="456",
             hip_path="/tmp/scene.hip",
             is_untitled=False,
@@ -152,8 +170,10 @@ class CheckConnectionServerTests(unittest.TestCase):
         )
         fn = self._exec_method(h)
         result = fn(self)  # self arg unused inside
+        # fork 改用 applicationVersionString 后，hou_version 取自 applicationVersionString
+        # （默认与 version 同值，见 _make_mock_hou 备注）
         self.assertEqual(result["hou_version"], "21.0.456")
-        self.assertEqual(result["hou_build"], "Houdini 21.0.456")
+        self.assertEqual(result["hou_build"], "21.0.456")
         self.assertEqual(result["hip_file"], "/tmp/scene.hip")
         self.assertEqual(result["hip_file_basename"], "scene.hip")
         self.assertFalse(result["is_untitled"])
@@ -204,23 +224,29 @@ class CheckConnectionServerTests(unittest.TestCase):
         result = fn(self)
         self.assertEqual(result["_status"], "ok")
 
-    def test_falls_back_to_hou_build_when_no_application_version_string(self):
-        # When hou has no applicationVersionString attribute, fall back to
-        # str(hou.build()).
-        h = mock.Mock()
-        h.version.return_value = "20.5.999"
-        # build() returns something printable
-        h.build.return_value = "999"
-        # applicationVersionString does not exist on this hou
-        del h.applicationVersionString
-        h.hipFile.path.return_value = "/tmp/x.hip"
-        h.hipFile.isUntitled.return_value = False
-        h.node.return_value.allSubChildren.return_value = []
-        h.ui.desktops.return_value = []
+    def test_falls_back_to_application_version_when_no_application_version_string(self):
+        """Source-level + call_count check that the else-branch fallback uses
+        str(hou.applicationVersion()) — H21 stable API returning tuple
+        (major, minor, build); str-ified yields e.g. "(21, 0, 596)".
 
+        旧测试断言 fallback 走 str(hou.build())；H21 移除了 hou.build，改用
+        str(hou.applicationVersion()) 作 fallback。注：H21 真实场景下
+        applicationVersionString 永远存在，故 else 分支不会执行；这里改为
+        source 级 + 运行期 call_count 双重校验，避免 del applicationVersionString
+        后 return dict 第 31 行无条件调用导致崩溃。
+        """
+        # Source 级：else 分支必须是 str(hou.applicationVersion())
+        self.assertIn("str(hou.applicationVersion())", self.code)
+        self.assertNotIn("hou.build()", self.code)
+
+        # 运行期：applicationVersionString 存在时走 if 分支，hou.build 必须零调用
+        h = _make_mock_hou()
         fn = self._exec_method(h)
-        result = fn(self)
-        self.assertEqual(result["hou_build"], "999")
+        fn(self)
+        self.assertEqual(
+            h.build.call_count, 0,
+            "check_connection must never call hou.build() (removed on H21); "
+            "fallback uses str(hou.applicationVersion())")
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +270,8 @@ class PingHoudiniServerTests(unittest.TestCase):
 
     def test_success_returns_pong_true(self):
         h = mock.Mock()
-        h.version.return_value = "20.5.123"
+        # fork 改用 hou.applicationVersionString()（H21 真实存在；旧 hou.version() 已移除）
+        h.applicationVersionString.return_value = "20.5.123"
         fn = self._exec_method(h)
         result = fn(self)
         self.assertTrue(result["pong"])
@@ -255,14 +282,14 @@ class PingHoudiniServerTests(unittest.TestCase):
 
     def test_elapsed_ms_is_integer(self):
         h = mock.Mock()
-        h.version.return_value = "20.5.123"
+        h.applicationVersionString.return_value = "20.5.123"
         fn = self._exec_method(h)
         result = fn(self)
         self.assertIsInstance(result["elapsed_ms"], int)
 
     def test_exception_returns_pong_false_with_error(self):
         h = mock.Mock()
-        h.version.side_effect = RuntimeError("hou not available")
+        h.applicationVersionString.side_effect = RuntimeError("hou not available")
         fn = self._exec_method(h)
         result = fn(self)
         self.assertFalse(result["pong"])
@@ -275,7 +302,7 @@ class PingHoudiniServerTests(unittest.TestCase):
         # Simulate slow hou: time advances by 10 seconds between time.time()
         # calls, so elapsed_ms >> timeout*1000.
         h = mock.Mock()
-        h.version.return_value = "20.5.123"
+        h.applicationVersionString.return_value = "20.5.123"
         # First call (start): t0=0; second call (end): t1=10 -> 10000ms
         t_values = iter([0.0, 10.0])
 
@@ -292,7 +319,7 @@ class PingHoudiniServerTests(unittest.TestCase):
 
     def test_default_timeout_does_not_break_call(self):
         h = mock.Mock()
-        h.version.return_value = "20.5.123"
+        h.applicationVersionString.return_value = "20.5.123"
         fn = self._exec_method(h)
         # No timeout kwarg -> default must work
         result = fn(self)
@@ -558,6 +585,98 @@ class PR16BridgeExecTests(unittest.TestCase):
         result = tool(object(), timeout=2)
 
         self.assertEqual(result, error)
+
+
+# ---------------------------------------------------------------------------
+# H21 compat regression tests (Task 2 — Core API replacement)
+#
+# H21 移除了 hou.version / hou.build / hou.hipFile.isUntitled；fork 必须
+# 改用 hou.applicationVersionString / hou.applicationVersion /
+# hou.hipFile.isNewFile。这些测试用 Mock 的 call_count 断言 fork 不再
+# 调用已移除 API，且确实调用了 H21 真实存在的新 API。
+# 参见 SideFX H22 HOM 索引：
+#   - hou.applicationVersionString() -> str "21.0.596"
+#     https://www.sidefx.com/docs/houdini22.0/hom/hou/applicationVersionString
+#   - hou.applicationVersion()       -> tuple (major, minor, build)
+#     https://www.sidefx.com/docs/houdini22.0/hom/hou/applicationVersion
+#   - hou.hipFile.isNewFile()        -> bool（H21 live-verified）
+# ---------------------------------------------------------------------------
+class H21CompatCheckConnectionTests(unittest.TestCase):
+    """check_connection 不得调用 H21 已移除 API。"""
+
+    def setUp(self):
+        self.src = _read(SERVER_PY)
+        self.methods = _find_server_methods(self.src, "check_connection")
+        self.code = self.methods["check_connection"]
+
+    def _exec_method(self, hou_mock):
+        namespace = {"hou": hou_mock, "os": os}
+        exec(compile(self.code, "<server_check_connection_h21>", "exec"),
+             namespace)
+        return namespace["check_connection"]
+
+    def test_does_not_call_removed_hou_version(self):
+        """hou.version() 在 H21 已移除；fork 必须用 applicationVersionString."""
+        h = _make_mock_hou()
+        fn = self._exec_method(h)
+        fn(self)
+        self.assertEqual(
+            h.version.call_count, 0,
+            "check_connection must NOT call hou.version() (removed on H21); "
+            "use hou.applicationVersionString() instead")
+        self.assertGreaterEqual(
+            h.applicationVersionString.call_count, 1,
+            "check_connection must call hou.applicationVersionString() for "
+            "hou_version field on H21")
+        # 同时确保 hou.build 也零调用（else 分支 fallback 已改为 applicationVersion）
+        self.assertEqual(
+            h.build.call_count, 0,
+            "check_connection must NOT call hou.build() (removed on H21); "
+            "fallback uses str(hou.applicationVersion())")
+
+    def test_does_not_call_removed_hipFile_isUntitled(self):
+        """hou.hipFile.isUntitled() 在 H21 已移除；fork 必须用 isNewFile()."""
+        h = _make_mock_hou(is_untitled=True)
+        fn = self._exec_method(h)
+        result = fn(self)
+        self.assertEqual(
+            h.hipFile.isUntitled.call_count, 0,
+            "check_connection must NOT call hou.hipFile.isUntitled() "
+            "(removed on H21); use hou.hipFile.isNewFile() instead")
+        self.assertGreaterEqual(
+            h.hipFile.isNewFile.call_count, 1,
+            "check_connection must call hou.hipFile.isNewFile() on H21")
+        self.assertTrue(result["is_untitled"])
+
+
+class H21CompatPingHoudiniTests(unittest.TestCase):
+    """ping_houdini 不得调用 H21 已移除的 hou.version()."""
+
+    def setUp(self):
+        self.src = _read(SERVER_PY)
+        self.methods = _find_server_methods(self.src, "ping_houdini")
+        self.code = self.methods["ping_houdini"]
+
+    def _exec_method(self, hou_mock, time_mock=None):
+        namespace = {"hou": hou_mock, "time": time_mock or time}
+        exec(compile(self.code, "<server_ping_houdini_h21>", "exec"),
+             namespace)
+        return namespace["ping_houdini"]
+
+    def test_does_not_call_removed_hou_version(self):
+        h = _make_mock_hou()
+        fn = self._exec_method(h)
+        result = fn(self)
+        self.assertEqual(
+            h.version.call_count, 0,
+            "ping_houdini must NOT call hou.version() (removed on H21); "
+            "use hou.applicationVersionString() instead")
+        self.assertGreaterEqual(
+            h.applicationVersionString.call_count, 1,
+            "ping_houdini must call hou.applicationVersionString() on H21")
+        self.assertTrue(result["pong"])
+        # _make_mock_hou 默认 application_version_string == version == "20.5.123"
+        self.assertEqual(result["hou_version"], "20.5.123")
 
 
 if __name__ == "__main__":

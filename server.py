@@ -1882,17 +1882,17 @@ class HoudiniMCPServer:
 
         仅使用既有 hou 上下文查询，不开新 socket，也不修改任何场景状态。
         字段说明：
-        - hou_version: hou.version() 字符串
-        - hou_build: hou.applicationVersionString() 优先，回退到 str(hou.build())
+        - hou_version: hou.applicationVersionString() 字符串（H21+；旧 hou.version() 已移除）
+        - hou_build: hou.applicationVersionString() 优先，回退到 str(hou.applicationVersion())
         - hip_file: 当前 .hip 文件绝对路径，未保存时为 None
         - hip_file_basename: 仅文件名（basename）
-        - is_untitled: True 表示当前 hip 未保存
+        - is_untitled: True 表示当前 hip 未保存（H21+ 用 hou.hipFile.isNewFile()）
         - node_count: root 节点 + 所有子节点总数（hou.node("/").allSubChildren() 长度 + 1）
         - desktop_count: hou.ui.desktops() 数量
         - _status: 固定为 "ok"，便于上层做健康检查
         """
         hip_path = hou.hipFile.path()
-        if hou.hipFile.isUntitled():
+        if hou.hipFile.isNewFile():
             hip_file = None
             hip_basename = None
             untitled = True
@@ -1904,10 +1904,10 @@ class HoudiniMCPServer:
         if hasattr(hou, "applicationVersionString"):
             build_str = hou.applicationVersionString()
         else:
-            build_str = str(hou.build())
+            build_str = str(hou.applicationVersion())
 
         return {
-            "hou_version": hou.version(),
+            "hou_version": hou.applicationVersionString(),
             "hou_build": build_str,
             "hip_file": hip_file,
             "hip_file_basename": hip_basename,
@@ -1920,9 +1920,10 @@ class HoudiniMCPServer:
     def ping_houdini(self, timeout=5):
         """PR 16：轻量级 Houdini 端 ping，验证响应时间。
 
-        仅在既有 hou 上下文里调用一次 hou.version()，不持久化新连接，不开
-        新 socket，不修改场景。异常被捕获后以 pong=False + error 字段返回，
-        不会传播到 bridge。
+        仅在既有 hou 上下文里调用一次 hou.applicationVersionString()（H21+
+        真实存在；旧 hou.version() 已移除），不持久化新连接，不开新 socket，
+        不修改场景。异常被捕获后以 pong=False + error 字段返回，不会传播到
+        bridge。
 
         Args:
             timeout: 最长等待毫秒对应的秒数（默认 5 秒）
@@ -1935,7 +1936,7 @@ class HoudiniMCPServer:
         """
         start = time.time()
         try:
-            v = hou.version()
+            v = hou.applicationVersionString()
             elapsed_ms = int((time.time() - start) * 1000)
             return {
                 "pong": True,

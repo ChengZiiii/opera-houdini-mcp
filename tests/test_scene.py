@@ -167,8 +167,17 @@ class _FakeHou(object):
             current = found
         return current
 
+    # 旧 API（H21 已移除）—— Task 8 会从 _FakeHou 移除
     def houdiniVersion(self):
         return self._version
+
+    # H21+ 真实存在的新 API（与 houdiniVersion 同源，便于回归）
+    def applicationVersionString(self):
+        return self._version
+
+    def applicationVersion(self):
+        # H21 真实返回 tuple (major, minor, build)；本 fake 简化为 3-tuple
+        return (21, 0, 0)
 
     def fps(self):
         return 24.0
@@ -229,6 +238,46 @@ class GetSceneInfoTests(unittest.TestCase):
         hou = _make_hou()
         info = scn.get_scene_info(hou)
         self.assertEqual(info["file_path"], "/tmp/scene.hip")
+
+
+# ===========================================================================
+# Section A2: H21 compat — get_scene_info 必须用 applicationVersionString
+# ===========================================================================
+class H21CompatGetSceneInfoTests(unittest.TestCase):
+    """get_scene_info 不得调用 H21 已移除的 hou.houdiniVersion().
+
+    H21 移除了 hou.houdiniVersion；fork 必须改用 hou.applicationVersionString
+    （参见 SideFX H22 HOM 索引：
+      https://www.sidefx.com/docs/houdini22.0/hom/hou/applicationVersionString ）。
+    """
+
+    def test_uses_application_version_string_not_houdiniVersion(self):
+        hou = _make_hou()
+        # 用 spy 包装 applicationVersionString 计数
+        calls = {"avs": 0, "hv": 0}
+        original_avs = hou.applicationVersionString
+
+        def _counting_avs():
+            calls["avs"] += 1
+            return original_avs()
+        hou.applicationVersionString = _counting_avs
+
+        original_hv = hou.houdiniVersion
+
+        def _counting_hv():
+            calls["hv"] += 1
+            return original_hv()
+        hou.houdiniVersion = _counting_hv
+
+        info = scn.get_scene_info(hou)
+        self.assertEqual(info["houdini_version"], "21.0.0")
+        self.assertGreaterEqual(
+            calls["avs"], 1,
+            "get_scene_info must call hou.applicationVersionString() on H21")
+        self.assertEqual(
+            calls["hv"], 0,
+            "get_scene_info must NOT call hou.houdiniVersion() "
+            "(removed on H21); use applicationVersionString() instead")
 
 
 # ===========================================================================
