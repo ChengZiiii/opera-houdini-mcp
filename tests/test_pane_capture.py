@@ -275,6 +275,8 @@ class _FakePaneTab(object):
         self.flipbook_calls = []
         # flipbook 失败模拟（默认成功；测试可显式置 True）
         self._flipbook_raise = False
+        # H21 flipbookSettings() 工厂方法返回的 settings 实例
+        self._flipbook_settings = _FakeFlipbookSettings()
 
     def name(self):
         return self._name
@@ -290,6 +292,12 @@ class _FakePaneTab(object):
 
     def qtWidget(self):
         return self._qt_widget
+
+    def flipbookSettings(self):
+        # H21 hou.SceneViewer.flipbookSettings() 工厂方法。
+        # 返回 mock settings（与 _FakeFlipbookSettings 同实例，测试
+        # 可以断言 .output / .frameRange 等）
+        return self._flipbook_settings
 
     def flipbook(self, *args, **kwargs):
         """记录调用（Bug B 新增 flipbook 路径，H21 API 兼容多种签名）。
@@ -380,21 +388,41 @@ class _FakeHou(object):
 
 
 class _FakeFlipbookSettings(object):
-    """Mock hou.FlipbookSettings — Bug B flipbook 路径用。"""
+    """Mock hou.FlipbookSettings — H21 走方法调用（SideFX 官方示例）。
+
+    settings.frameRange((f,f)) / settings.beautyPassOnly(True) /
+    settings.output(filename) / settings.outputToMPlay(False) — 都
+    是方法调用。Mock 同时支持 getter 反查最后一次设置的值。
+    """
     def __init__(self):
-        # 用 dict 存所有属性赋值（hou.FlipbookSettings 是 BIF 类，
-        # 但本测试不需要 BIF 真实类型，duck-typing 即可）
         self._attrs = {}
+        self.calls = []
+
+    def __getattr__(self, name):
+        if name.startswith("_") or name == "calls":
+            raise AttributeError(name)
+        if name in self._attrs:
+            return self._attrs[name]
+        def _setter(*args, **kwargs):
+            val = args[0] if len(args) == 1 else args
+            self._attrs[name] = val
+            self.calls.append((name, args))
+            return None
+        return _setter
 
     def __setattr__(self, name, value):
-        if name == "_attrs":
+        if name in ("_attrs", "calls"):
             super(_FakeFlipbookSettings, self).__setattr__(name, value)
         else:
             self._attrs[name] = value
 
-    def __getattr__(self, name):
-        # 测试断言用
-        return self._attrs.get(name)
+    def stash(self):
+        """H21 hou.FlipbookSettings.stash() — 返回当前 settings 副本。
+
+        测试场景：生产代码用 pane.flipbookSettings().stash()，
+        mock 直接返回 self（同一实例）便于断言。
+        """
+        return self
 
 
 def _make_hou_with_scene_viewer(widget):

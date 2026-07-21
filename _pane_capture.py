@@ -273,47 +273,38 @@ def _capture_sceneviewer_via_flipbook(hou, pane, save_path=None,
     except Exception:
         current_frame = 1
 
-    # 构造 FlipbookSettings（Houdini 21 标准类，hou.FlipbookSettings()）
+    # 构造 FlipbookSettings：H21 hou.FlipbookSettings 是抽象类，**必须**
+    # 用 scene.flipbookSettings().stash() 工厂方法（SideFX 官方示例）。
+    # 设置项是**方法调用**（.frameRange((f,f)) / .beautyPassOnly(True) /
+    # .outputToMPlay(False)），不是属性赋值。
     try:
-        settings = hou.FlipbookSettings()
+        settings = pane.flipbookSettings().stash()
+        settings.beautyPassOnly(True)
+        settings.frameRange((current_frame, current_frame))
+        settings.output(path_template)
+        settings.outputToMPlay(False)
     except AttributeError:
-        # 测试 mock 路径：fallback 到 duck-typed settings（属性可写）
+        # 测试 mock 路径：fallback 到 duck-typed settings
         class _StubSettings(object):
-            pass
+            def __getattr__(self, name):
+                # 测试可能调用任何方法，返个 noop lambda
+                return lambda *a, **kw: None
         settings = _StubSettings()
-
-    settings.beautyPassOnly = True
-    # Houdini FlipbookSettings.frameRange 是 (start_frame, end_frame) 二元 tuple
-    # 单帧时 start=end；不要包成 (start, end), 那样 hou 解析会失败
-    settings.frameRange = (current_frame, current_frame)
-    settings.output = path_template
-    settings.outputToMPlay = False
 
     # 视口相机从 pane.curViewport().camera() 取（不显式 set，flipbook
     # 默认使用当前视口相机；这里不新建 cam 节点符合 user spec）
     if hasattr(pane, "curViewport") and hasattr(pane.curViewport(), "camera"):
-        # 仅做存在性探测；不显式调 settings.camera 以保留 flipbook 默认
-        # 行为（避免与某些 H21 版本 camera path 解析 bug 冲突）
         _viewport_cam = pane.curViewport().camera()
 
     # 执行 flipbook。失败不回退 Qt grab（user spec 硬约束）。
-    # H21 API 实测（Phase 4 + inspect_flipbook.py 探针）：
-    #   hou.SceneViewer.flipbook(viewport, settings, open_dialog=False)
-    #     — viewport 第一参，settings 第二参
-    #   hou.GeometryViewport 没有 flipbook 方法（探针确认）
-    # 正确调用：pane.flipbook(vp, settings)
+    # H21 正确签名：pane.flipbook(viewport, settings) — viewport 第一参
+    # settings 第二参（SideFX hou.SceneViewer.html#flipbook 实测确认）
     try:
         if hasattr(pane, "curViewport"):
             vp = pane.curViewport()
         else:
             vp = None
-        # 兼容 H20 单参老版本（无 viewport 形参），默认 settings-only
-        # 通过 try/except 链回退，避免对 H21 C++ binding 误判
-        try:
-            pane.flipbook(vp, settings)
-        except TypeError:
-            # 老版本可能只接 settings
-            pane.flipbook(settings)
+        pane.flipbook(vp, settings)
     except Exception as e:
         # Bug C：失败时落错误码 png 到 <date>/failed/ 便于事后排查
         # 不静默吞错（user spec 不让回退 Qt grab），但记录失败现场

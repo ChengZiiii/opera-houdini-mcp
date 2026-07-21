@@ -61,15 +61,48 @@ def _load_pane_capture_fresh():
 # Fakes
 # ---------------------------------------------------------------------------
 class _FakeFlipbookSettings(object):
-    """Mock hou.FlipbookSettings — 记录所有属性赋值。"""
+    """Mock hou.FlipbookSettings — SideFX 官方用方法调用而非属性赋值。
+
+    settings.frameRange((f,f)) / settings.beautyPassOnly(True) /
+    settings.output(filename) / settings.outputToMPlay(False) — 都
+    是方法调用。Mock 拦截 __getattr__ 时返回当前保存的值（如果已
+    设置过）或一个 setter 函数（第一次访问时）。这样既支持测试
+    断言 getattr(settings, "frameRange") 获取最后保存值，也支持
+    production code 调用 settings.frameRange((f,f)) 触发 setter。
+    """
     def __init__(self):
-        self.attrs = {}
+        self._attrs = {}
+        self.calls = []
+
+    def __getattr__(self, name):
+        # Python 内部 dunder / private 属性
+        if name.startswith("_") or name == "calls":
+            raise AttributeError(name)
+        # 已设置过的值：返回该值（getter 语义）
+        if name in self._attrs:
+            return self._attrs[name]
+        # 未设置：返回一个 setter 函数
+        def _setter(*args, **kwargs):
+            val = args[0] if len(args) == 1 else args
+            self._attrs[name] = val
+            self.calls.append((name, args))
+            return None
+        return _setter
 
     def __setattr__(self, name, value):
-        if name == "attrs":
+        if name in ("_attrs", "calls"):
             super().__setattr__(name, value)
         else:
-            self.attrs[name] = value
+            # 允许属性赋值（兼容旧 mock 行为）
+            self._attrs[name] = value
+
+    def stash(self):
+        """H21 hou.FlipbookSettings.stash() — 返回当前 settings 副本。
+
+        测试场景：生产代码用 `pane.flipbookSettings().stash()`，
+        mock 直接返回 self（同一实例）便于断言。
+        """
+        return self
 
 
 class _FakeViewport(object):
@@ -98,6 +131,9 @@ class _FakeSceneViewerPane(object):
         # 关键：qtWidget 必须存在（说明 Houdini 端有 GUI），但调用 grab
         # 时抛 OGL 异常，模拟用户机器无 OGL 3.3 的情况。
         self._widget = _FakeWidget(raise_on_grab=True)
+        # H21 flipbookSettings() 工厂方法返回 settings 实例（H21 抽象类
+        # 必须经此方法获取，stash() 返回副本）
+        self._flipbook_settings = _FakeFlipbookSettings()
 
     def curViewport(self):
         return self._viewport
@@ -105,14 +141,20 @@ class _FakeSceneViewerPane(object):
     def qtWidget(self):
         return self._widget
 
+    def flipbookSettings(self):
+        # H21 hou.SceneViewer.flipbookSettings() 返回 viewer 当前 settings
+        # 测试返回同一实例（stash() 在 production code 内调用）
+        return self._flipbook_settings
+
     def flipbook(self, *args, **kwargs):
         # H21 实测兼容多种签名：(settings) / (viewport, settings) /
         # vp.flipbook(settings) — 测试 mock 接受任意参数。
-        # 把 settings（具有 .output / .beautyPassOnly 属性）提取出来
-        # 存到 flipbook_calls[0] 方便断言访问。
         settings_arg = None
         for a in args:
-            if hasattr(a, "output") and hasattr(a, "beautyPassOnly"):
+            # FlipbookSettings 方法调用 / 属性赋值都会被 mock 接受
+            # 通过 hasattr 检查可能命中方法名（如 'outputToMPlay'）
+            # 跳过这些，只匹配真实 settings 实例
+            if hasattr(a, "_attrs") or (hasattr(a, "calls") and hasattr(a, "_attrs")):
                 settings_arg = a
                 break
         if settings_arg is not None:
