@@ -12,8 +12,9 @@
 |------|------|------|
 | `phase4_e2e.py` | 历史 Phase 4 端到端回归（10 步核心流程）。已 refactor 从 `_e2e_helpers` 导入 `HoudiniConn` / `StepResult` / `assert_step` / `emit_summary`。原先硬编码的 host-specific `_capture_paths.py` 绝对路径已修掉，改为 `os.path.join(os.path.dirname(__file__), "_capture_paths.py")` 的相对路径模式。 | pre-existing，Wave B 维护 |
 | `phase5_full_regression.py` | Phase 5 全量回归脚本（22 步），覆盖 PR 4 / PR 11 / PR 13 / PR 14 等新增能力。 | pre-existing，out of scope for this change |
-| `_e2e_helpers.py` | 共享 socket 客户端 + 步骤断言 + Markdown 汇总。被 phase4_e2e / phase5_full_regression / e2e_demo_table 共用。 | Wave B 新增 |
+| `_e2e_helpers.py` | 共享 socket 客户端 + 步骤断言 + Markdown 汇总。被 phase4_e2e / phase5_full_regression / e2e_demo_table / h21_live_smoke 共用。 | Wave B 新增 |
 | `e2e_demo_table.py` | 程序化木桌 demo。从 0 构建一张 1.4×0.05×0.8 桌面 + 4 桌腿 + 2 横撑 + 木纹 wrangle + 木质 PBR 材质，再截 pane / Karma CPU 渲 4 视图 / 走 privileged audit。 | Wave A 启动、Wave B 完成 build + verify (4.4-4.7)、Wave C 完成 capture + render + audit + summary (4.8-4.11) |
+| `h21_live_smoke.py` | **H21 兼容审计 live smoke test**。直连 Houdini TCP 9876，跑 11 个断言验证 fork 全部 H21 compat 修复（Tasks 2-7）在真实 H21+ 实机上工作。Houdini 未运行时干净 SKIP（exit 0）。是**唯一**不依赖 conftest mock 的 H21 兼容性验证路径。 | H21 compat audit (Task 9) 新增 |
 | `README.md` | 本文件。 | Wave C 新增 |
 
 ## 跑 e2e_demo_table
@@ -36,6 +37,68 @@ python external\houdinimcp\tests\e2e_demo_table.py
 ```powershell
 C:/.../external/houdinimcp-env/python/python.exe tests/e2e_demo_table.py
 ```
+
+## 跑 h21_live_smoke（H21 兼容审计）
+
+`h21_live_smoke.py` 是 H21 兼容审计的 live 验证脚本，跑 11 个断言验证
+fork 全部 H21 compat 修复（Tasks 2-7）在真实 H21+ 实机上确实工作。它
+**完全绕过 Kilo MCP bridge**，直连 Houdini TCP socket。
+
+```powershell
+cd external/houdinimcp
+python tests/h21_live_smoke.py
+```
+
+或用嵌入式 Python：
+
+```powershell
+C:/.../external/houdinimcp-env/python/python.exe tests/h21_live_smoke.py
+```
+
+### 11 个断言
+
+| # | 断言 | 验证的 Task |
+|---|------|------------|
+| 1 | `check_connection` 返回 `status=success` + `hou_version` 非空 | 2.1-2.3 |
+| 2 | `ping_houdini` 返回 `pong=True` | 2.4 |
+| 3 | `get_scene_info` 返回 `houdini_version` 非空 | 2.5 |
+| 4 | `set_node_position` 不抛 SWIG type-check 错 | 4 (Vector2) |
+| 5 | `layout_children` 不抛 SWIG type-check 错 | 4 (Vector2) |
+| 6 | `assign_material(group=None)` 成功（既有路径，回归 guard） | — |
+| 7 | `assign_material(group='test_group')` 返回 `via=material_sop_child` | 6 |
+| 8 | `connect_nodes` SOP→OBJ 5s 内返回，`via=sop_display_flag` | 5 |
+| 9 | `get_houdini_help('sop', 'box')` 返回 `status=success` | — (baseline) |
+| 10 | `get_houdini_help('sop', 'box SOP size param')` 返回 HTTP 404 不抛 URL 错 | 3 |
+| 11 | `verify_hou_api('box', 'sop')` 返回 `status=success` + `_ai_hint` 非空 | PR 18 |
+
+### SKIP 语义
+
+- **Houdini 未运行 / MCP 未启动** → stdout 打 `[skip] Houdini socket not
+  reachable on 127.0.0.1:9876 — is Houdini running + MCP started?`，
+  exit 0（**SKIP，非失败**）。
+- **任一断言 FAIL** → 继续跑剩余断言（不短路），最终 exit 1 + Markdown
+  汇总表标注每步 PASS/FAIL。
+- **全 PASS** → exit 0 + Markdown 汇总表。
+
+### 临时资产
+
+脚本会在 `/obj/` 下建两个临时 OBJ 容器（`/obj/H21_SMOKE_TEST` +
+`/obj/H21_SMOKE_TEST_GRP`）和 `/mat/H21_SMOKE_MAT` 材质，**永不调用
+`new_scene()`**——绝不破坏用户当前 .hip 文件。无论断言成败，`finally`
+块都会 best-effort 删除这些临时资产。
+
+### 常见 FAIL 原因
+
+- **`'hipFile' object has no attribute 'isUntitled'`** — Houdini 端运行
+  的 server.py 还是旧版（未应用 Task 2 修复）。在 Houdini shelf 点
+  **Stop Opera MCP** 再点 **Start Opera MCP** 触发 reload。
+- **`URL can't contain control characters`** — 同上，Task 3 (URL encode)
+  修复未加载。
+- **`Houdini 版本不支持 assignToNode`** — Task 6 (Material SOP path)
+  修复未加载。
+- **connect_nodes `The attempted operation failed`** — Task 5 (display
+  flag path) 修复未加载；H21 OBJ.setInput 在跨 parent SOP→OBJ 场景仍
+  hang/fail。
 
 ## 前置条件
 
