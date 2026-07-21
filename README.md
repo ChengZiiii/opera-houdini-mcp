@@ -206,8 +206,40 @@ OPUS integration is optional — without a key the server still starts, only the
 | 截图 | `capture_pane_screenshot` / `render_node_network` / `list_visible_panes` / `capture_multiple_panes` | pane 截图，响应走 `apply_response_cap` |
 | 渲染 | `render_viewport_base64` / `render_quad_views_base64` | base64 版，karma cpu/xpu 双 renderer |
 | 文档 | `get_houdini_help` | SideFX 在线文档解析（urllib + stdlib html.parser） |
+| 文档 | `verify_hou_api` | python_hou 默认 + `_ai_hint` 合成 | AI-friendly wrapper over `get_houdini_help`（PR 18） |
 | 诊断 | `check_connection` / `ping_houdini` | 不持久化连接的 ping |
 | 缓存 | `manage_cache` | stats / invalidate / warmup |
+
+---
+
+## 强制约束：AI 调用 hou API 前必须查文档
+
+> **任何 AI agent 通过 `execute_code` 调用 hou API 之前 MUST 先 verify。**
+
+`hou` 是 C 扩展， 不同 major version 间会重命名 / 废弃 / 新增方法。 假定跨版本 hou API 等价 = bug 风险（hang / type-check 失败 / 行为不一致）。
+
+### F-C bug 案例（2026-07-21）
+
+orchestrator 在 `execute_code` 中尝试 `obj.setInput(0, sop, 0)`， 假定 `ObjNode.setInput` 与 `SopNode.setInput` 签名等价。 实际调用触发 hou 内部 type-check， 在 MCP worker thread 同步执行， Houdini **整进程 hang 30s+**， 最终返 `timed_out=True`， 且 `serialize_scene_state` 在同一 worker thread 排队导致 scene 状态无法快照。 诊断： 不在 doc 里假设签名 = 直接踩雷。
+
+正确工作流：
+
+1. **调 `verify_hou_api('ObjNode.<method>')` 先看 `_ai_hint`**， 绝不直接把假设的 hou API 写进 `execute_code` 的 `code` 参数；
+2. 若返 `status="success", methods=[]`（API 不存在）， 走 `sop.setDisplayFlag(True) + sop.setRenderFlag(True)` 改在 SOP 子节点设 display/render flag， **不要**在 OBJ 容器调不存在的 setDisplayNode；
+3. 若返 `status="success"` 且 `_ai_hint` 提到 thread 安全 caveat（如 `ObjNode.setInput` 需 input_index + item + output_index 三参）， 谨慎评估是否值得在 worker thread 冒险， 优先改用 SOP 子节点 flag。
+
+### 三级 fallback 指南（F0 → F1 → F2 → F3）
+
+按优先级从高到低：
+
+- **F0 — 判断 hou 版本**： verification 第一步 MUST 先 `hou.version()` 确认 major version， 因为 hou API 在跨 major 时会重命名 / 废弃 / 新增。 同一份代码在 H20 / H21 / H22 行为可能不同。
+- **F1 本地 hou help（优先， 无网络依赖， 最快）**： 调 `verify_hou_api(item_name=...)` 优先； 若 F2（网络侧）返 `status="error"`， 回退到本地：
+  - `hou.node(item_path).help()` 对**已存在**的节点有效（拿到的是 SideFX 同步到本地的 help server 内容）；
+  - `print(hou.<Class>.<method>.__doc__)` 或 `execute_code` 跑 `help(hou.<Class>.<method>)`， 把 stdout 拿到后自己解析 Python docstring。
+- **F2 联网 SideFX 文档（F1 拿不到时）**： 调 `verify_hou_api(item_name="<Class>.<method>", help_type="python_hou")`， fork 的 PR 15 `get_houdini_help` 走 stdlib `urllib.request` 抓 `https://www.sidefx.com/docs/houdini/hom/hou/<name>.html`； 不引入新 pip 依赖。
+- **F3 让用户开梯子（F2 返 `status="error"` 且 `reason` 含网络关键字时）**： AI agent MUST 在自己输出里**显式**写出 "⚠ SideFX 文档站不可达（verify_hou_api 返 `status="error"` reason=`<reason>`）， 请检查网络/梯子， 或在 Houdini 内用 `hou.helpServerUrl()` 查本地帮助。"
+
+跨工具说明： 底层 = `get_houdini_help`（PR 15）； AI-friendly wrapper = `verify_hou_api`（PR 18）。 建议优先用 `verify_hou_api` 调 hou API， `get_houdini_help` 用于 SOP/OBJ 节点本身或 vex_function 查询。
 
 ---
 

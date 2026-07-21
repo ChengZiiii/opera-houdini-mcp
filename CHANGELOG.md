@@ -48,6 +48,7 @@
 - [ ] PR 13 — `_pane_capture.py`（capture_pane_screenshot / list_visible_panes / capture_multiple_panes / render_node_network）
 - [ ] PR 14 — `_render_b64.py`（render_viewport_base64 / render_quad_views_base64，karma cpu/xpu）
 - [ ] PR 15 — `_help.py`（get_houdini_help，stdlib html.parser 替代 beautifulsoup4）
+- [x] PR 18 — AI hou-API verify 纪律（README 新增「强制约束」章节 + CHANGELOG 本行 + 测试 `tests/test_verify_hou_api.py` + `tests/test_three_tier_fallback.py`；bridge tool `verify_hou_api` 与 `_synthesize_ai_hint` 在 Wave B 合入）
 - [ ] PR 16 — 连接诊断（check_connection / ping_houdini）
 
 ### 与上游（capoomgit/houdini-mcp）的分歧点
