@@ -41,6 +41,7 @@ from . import _graph_edit as ge
 from . import _node_info as ni
 from . import _geo_summary as gs
 from . import _pane_capture as pcp
+from . import _capture_paths as cap
 from . import _render_b64 as rb64
 from . import _help as hlp
 
@@ -90,18 +91,32 @@ class HoudiniMCPServer:
 
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
+
         try:
             self.server_socket.bind((self.host, self.port))
             self.server_socket.listen(4)
             self.server_socket.setblocking(False)
-            
+
             self.timer = QtCore.QTimer()
             self.timer.timeout.connect(self._process_server)
             self.timer.start(100)
 
             self.running = True
             print(f"HoudiniMCP server started on {self.host}:{self.port}")
+
+            # Bug C（PR 21）：启动时清理 > 7 天的过期截图 / 渲染目录。
+            # 不抛异常（启动失败不影响 MCP 服务本身）。
+            try:
+                import hou as _hou  # server.py 在 Houdini 内运行
+                base = cap.resolve_base_dir(hou=_hou)
+                result = cap.cleanup_old_captures(base, max_age_days=7)
+                if result["scanned"] > 0:
+                    print(
+                        "HoudiniMCP 启动清理: base={0} scanned={1} deleted={2} kept={3} errors={4}".format(
+                            base, result["scanned"], result["deleted"],
+                            result["kept"], len(result["errors"])))
+            except Exception as cleanup_err:
+                print("HoudiniMCP 启动清理失败（不影响 MCP 服务）: " + str(cleanup_err))
         except Exception as e:
             print(f"Failed to start server: {str(e)}")
             self.stop()
