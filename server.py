@@ -49,6 +49,72 @@ from . import _help as hlp
 _before_scene = None
 _after_scene = None
 
+
+# ---------------------------------------------------------------------------
+# PR 18：verify_hou_api 调 hou API 时合成给 AI 的简短提示（_ai_hint）
+#
+# 纯字符串模板函数，无 hou / 无网络依赖，模块级以便单元测试直接 import。
+# 规则与 openspec/changes/opera-houdinimcp-unknown-api-guard/design.md §2
+# 一致；改逻辑时同步更新 tests/test_verify_hou_api.py 内的契约。
+# ---------------------------------------------------------------------------
+def _synthesize_ai_hint(item_name, help_result):
+    """根据 get_houdini_help 的返回 dict 合成一段简短 AI 提示。
+
+    返回字符串（非空 = 给 AI 看的提示；空串 = 无可用提示）。
+
+    规则：
+      - 空 / None help_result → "" （防御性）
+      - status == "error"  → F3 fallback：提示用 hou.node(path).help() 或
+        print(hou.<Class>.<method>.__doc__) 拿本地 docstring；若仍失败
+        请在输出 `## Assumptions` 段记录假设。
+      - status == "success" 且 methods == []：
+          - python_hou + item_name.startswith("ObjNode.") → F-C known
+            pattern：OBJ 容器无 setDisplayNode 等 display 方法，改用
+            SOP 子节点的 setDisplayFlag(True) + setRenderFlag(True)。
+          - 其他 → "API 不存在 / 方法集合空" 提示，建议 hasattr
+            (obj, item_name.split('.')[-1]) 兜底。
+      - status == "success" 且 methods != [] → 抽第一条 method 行
+        拼成 "已找到方法: <signature>"，让 AI 直接拿来用。
+      - 其它未知 status → "" （防御性）
+    """
+    if not help_result:
+        return ""
+    status = help_result.get("status")
+    methods = help_result.get("methods") or []
+    help_type = help_result.get("help_type", "")
+
+    if status == "error":
+        # F3 fallback：本地 hou help + 假设日志
+        err = help_result.get("error") or help_result.get("message") or ""
+        return (
+            "⚠ SideFX 文档站不可达: %s。 fallback: 试 "
+            "hou.node(item_path).help() 或 print(hou.<Class>.<method>.__doc__)"
+            " 拿本地 docstring； 若仍失败请在输出 `## Assumptions` 段记录假设。"
+            % err
+        )
+
+    if status == "success":
+        if not methods:
+            # Empty methods：API 不存在
+            if help_type == "python_hou" and item_name.startswith("ObjNode."):
+                # F-C known pattern：OBJ 容器无 setDisplayNode 等 display 方法，
+                # 改用 SOP 子节点的 setDisplayFlag + setRenderFlag
+                return (
+                    "方法不存在于 hou.ObjNode； OBJ 容器显示请设子 SOP 的 "
+                    "setDisplayFlag(True) + setRenderFlag(True)"
+                )
+            return (
+                "API 不存在 / 方法集合空； 建议 hasattr(obj, %r) 兜底"
+                % item_name.split(".")[-1]
+            )
+        # Non-empty methods：抽第一条 method 行拼接
+        first = (methods[0].get("text", "")
+                 if isinstance(methods[0], dict) else str(methods[0]))
+        return "已找到方法: %s" % first
+
+    # Unknown status
+    return ""
+
 # Imports for OPUS import
 import zipfile
 from urllib.parse import urlparse
@@ -314,6 +380,8 @@ class HoudiniMCPServer:
             "execute_hscript": self.execute_hscript,
             # PR 15: SideFX 在线文档查询（薄封装到 _help.get_houdini_help）
             "get_houdini_help": self.get_houdini_help,
+            # PR 18: AI-friendly wrapper over get_houdini_help（合 _ai_hint）
+            "verify_hou_api": self.verify_hou_api,
             # PR 16: 连接诊断（Houdini 端 check_connection / ping_houdini）
             "check_connection": self.check_connection,
             "ping_houdini": self.ping_houdini,
@@ -1776,6 +1844,34 @@ class HoudiniMCPServer:
         """
         result = hlp.get_houdini_help(
             help_type, item_name, timeout=timeout)
+        return cmn.apply_response_cap(result)
+
+    # -------------------------------------------------------------------------
+    # PR 18：verify_hou_api — AI-friendly wrapper over get_houdini_help
+    # 在 PR 15 之上额外合成 _ai_hint 字段（F-C pattern / API 不存在 /
+    # 已找到方法: <sig>），帮助 AI 在调未知 hou API 前拿到可直接使用的
+    # 简短提示，避免 2026-07-21 F-C bug 实证的 hou type-check 卡死。
+    # -------------------------------------------------------------------------
+    def verify_hou_api(self, item_name, help_type="python_hou", timeout=10):
+        """PR 18：AI-friendly wrapper over get_houdini_help（PR 15）。
+
+        与 PR 15 相同：薄封装到 _help.get_houdini_help + apply_response_cap。
+        不同：额外在 result 顶层加 `_ai_hint` 字段，由模块级
+        `_synthesize_ai_hint(item_name, result)` 合成。
+
+        `_ai_hint` 规则（参考 design.md §2）：
+          - status=error                       → F3 fallback 提示
+          - status=success + methods=[]        → "API 不存在" / F-C 提示
+          - status=success + methods=非空       → "已找到方法: <sig>" 提示
+          - 空 / 未知 status                    → "" （防御性）
+
+        AI 在调未知 hou API 前应先读 `_ai_hint`；若 hint 含 F-C
+        fallback（如 setDisplayFlag）应优先按 hint 推荐的方式调，
+        避免直接调不存在的 hou.ObjNode 方法导致 Houdini 卡死。
+        """
+        result = hlp.get_houdini_help(
+            help_type, item_name, timeout=timeout)
+        result["_ai_hint"] = _synthesize_ai_hint(item_name, result)
         return cmn.apply_response_cap(result)
 
     # -------------------------------------------------------------------------

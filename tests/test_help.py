@@ -458,19 +458,24 @@ def _find_pr15_function_nodes():
     to keep that probe green: we mark our own section with a distinct
     header line and find functions between it and the next section header
     (e.g. "# PR 7 Materials Tools") that are decorated with @mcp.tool().
+
+    PR 18 (verify_hou_api) sits between PR 15 and PR 7 with its own
+    "# PR 18 Help Wrapper Tools" section header — that boundary is also
+    a stop point so this scan picks up exactly one PR 15 tool.
     """
     src = _read(BRIDGE_PY)
     tree = ast.parse(src)
     PR15_HEADER = "# PR 15 Help Tools"
-    NEXT_HEADER = "# PR 7 Materials Tools"
+    NEXT_HEADERS = ["# PR 18 Help Wrapper Tools", "# PR 7 Materials Tools"]
     lines = src.splitlines()
     header_line = None
     next_header_line = None
     for i, line in enumerate(lines, start=1):
         if PR15_HEADER in line and header_line is None:
             header_line = i
-        if NEXT_HEADER in line and next_header_line is None:
-            next_header_line = i
+        for hdr in NEXT_HEADERS:
+            if hdr in line and next_header_line is None:
+                next_header_line = i
     if header_line is None:
         raise AssertionError(
             "PR 15 section marker not found in houdini_mcp_server.py")

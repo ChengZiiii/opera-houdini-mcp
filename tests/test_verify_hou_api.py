@@ -4,16 +4,15 @@ Stdlib unittest, no hython required. urllib is mocked via unittest.mock so
 no real network access happens in tests. The tests target TWO things:
 
 1. The pure `_synthesize_ai_hint(item_name, help_result)` string synthesis
-   logic (pure function, no hou / no network). We INLINE the synthesized
-   expected output in each test rather than calling into Wave-B code, so
-   these tests fail *correctly* (with the right reason) when Wave B hasn't
-   shipped yet — they verify the helper's contract as documented in
+   logic (pure function, no hou / no network). The function is AST-extracted
+   from `server.py` at test time and exec-loaded into an isolated namespace
+   so tests run without importing `server` (which requires `hou`). The
+   expected behavior is contractually identical to
    `openspec/changes/opera-houdinimcp-unknown-api-guard/specs/mcp-tools/spec.md`.
 
 2. The PR 18 bridge tool wiring (decorator signature, param forwarding,
-   default help_type="python_hou"). Wave B will replace the
-   `_stub_verify_hou_api` local with the real `@mcp.tool()` import from
-   `houdini_mcp_server.py`.
+   default help_type="python_hou"). AST-executes the real `@mcp.tool()` from
+   `houdini_mcp_server.py` with a recording relay stub.
 
 Tests cover (>= 8):
 
@@ -29,7 +28,8 @@ Tests cover (>= 8):
         - PR15BridgeExec-style bridge tool checks via AST
 
     - PR18BridgeStyleTests:
-        - placeholder / skip-if-missing: PR 18 section header probe
+        - real assertions (no skip): PR 18 section header probe finds the
+          verify_hou_api @mcp.tool() in houdini_mcp_server.py.
 
 Run with:
     python -m unittest tests.test_verify_hou_api -v
@@ -97,74 +97,57 @@ def _patched_urlopen(mock_urlopen, status, html_text, encode="utf-8"):
     mock_urlopen.return_value = _make_mock_urlopen(status, html_text, encode)
 
 
-# ---------------------------------------------------------------------------
-# EXPECTED _synthesize_ai_hint logic (per spec §"verify_hou_api wrapper
-# exists as a thin convenience over get_houdini_help").  Wave B will
-# replace this local definition with the real module-level function in
-# server.py.  Tests assert against THIS expected behavior — when Wave B
-# lands, the inline mirror here must match server.py exactly.
-# ---------------------------------------------------------------------------
-def _synthesize_ai_hint(item_name, help_result):
-    """Synthesize short AI-friendly hint from full get_houdini_help result.
+# ===========================================================================
+# Real _synthesize_ai_hint from server.py (AST-exec'd, no `hou` dependency).
+#
+# server.py cannot be imported without `hou`, so we AST-extract the
+# _synthesize_ai_hint FunctionDef source and exec it into an isolated
+# namespace. This mirrors the same pattern used by
+# test_help.py::_exec_pr15_bridge_tool for the bridge tool.
+# ===========================================================================
+SERVER_PY = os.path.join(ROOT, "server.py")
+BRIDGE_PY = os.path.join(ROOT, "houdini_mcp_server.py")
 
-    Returns an empty string for empty `help_result` dicts.
-    Rules (per spec):
-      - status == "error"               -> fallback hint
-      - status == "success", methods == [] + python_hou + ObjNode prefix
-                                       -> F-C pattern hint (SOP flag)
-      - status == "success", methods == [] otherwise
-                                       -> "API 不存在 / 方法集合空" hint
-      - status == "success", methods != [] -> first signature hint
-      - empty/None help_result          -> ""
 
-    NOTE: Wave B will move this function to server.py and unit-test it
-    there. Tests here are written so that they test the EXPECTED behavior
-    of that function — they should pass both against this local copy and
-    against the eventual server.py implementation.
+def _read(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _load_synthesize_ai_hint():
+    """AST-extract _synthesize_ai_hint from server.py and exec-load it.
+
+    Returns the real function. Raises AssertionError if not found (e.g.
+    Wave B hasn't shipped yet) or RuntimeError on syntax/import errors.
     """
-    if not help_result:
-        return ""
-    status = help_result.get("status")
-    methods = help_result.get("methods") or []
-    help_type = help_result.get("help_type", "")
+    src = _read(SERVER_PY)
+    tree = ast.parse(src)
+    fns = [n for n in tree.body
+           if isinstance(n, ast.FunctionDef)
+           and n.name == "_synthesize_ai_hint"]
+    assert fns, (
+        "_synthesize_ai_hint not found in server.py — Wave B must "
+        "implement task 3.3 first.")
+    assert len(fns) == 1, (
+        "Expected exactly 1 _synthesize_ai_hint in server.py, found %d"
+        % len(fns))
+    function_source = ast.get_source_segment(src, fns[0])
+    assert function_source, (
+        "Could not extract _synthesize_ai_hint source segment from server.py")
+    namespace = {}
+    exec(compile(function_source, "<server._synthesize_ai_hint>", "exec"),
+         namespace)
+    return namespace["_synthesize_ai_hint"]
 
-    if status == "error":
-        # F3 fallback: tell AI to use local hou help or record ## Assumptions
-        err = help_result.get("error") or help_result.get("message") or ""
-        return (
-            "⚠ SideFX 文档站不可达: %s。 fallback: 试 "
-            "hou.node(item_path).help() 或 print(hou.<Class>.<method>.__doc__)"
-            " 拿本地 docstring； 若仍失败请在输出 `## Assumptions` 段记录假设。"
-            % err
-        )
 
-    if status == "success":
-        if not methods:
-            # Empty methods: API 不存在
-            if help_type == "python_hou" and item_name.startswith("ObjNode."):
-                # F-C known pattern: OBJ 容器无 setDisplayNode 等 display 方法，
-                # 改用 SOP 子节点的 setDisplayFlag + setRenderFlag
-                return (
-                    "方法不存在于 hou.ObjNode； OBJ 容器显示请设子 SOP 的 "
-                    "setDisplayFlag(True) + setRenderFlag(True)"
-                )
-            return (
-                "API 不存在 / 方法集合空； 建议 hasattr(obj, %r) 兜底"
-                % item_name.split(".")[-1]
-            )
-        # Non-empty methods: 抽第一条 method 行拼接
-        first = methods[0].get("text", "") if isinstance(methods[0], dict) else str(methods[0])
-        return "已找到方法: %s" % first
-
-    # Unknown status
-    return ""
+_synthesize_ai_hint = _load_synthesize_ai_hint()
 
 
 # ===========================================================================
 # _synthesize_ai_hint tests (4.2 / 4.3 / 4.4)
 # ===========================================================================
 class SynthesizeAiHintTests(unittest.TestCase):
-    """Pure string-synthesis tests for _synthesize_ai_hint."""
+    """Pure string-synthesis tests for the real server._synthesize_ai_hint."""
 
     def test_verify_setdisplaynode_returns_not_found_hint(self):
         """4.2: ObjNode.setDisplayNode + empty methods + python_hou ->
@@ -298,48 +281,8 @@ class SynthesizeEndToEndTests(unittest.TestCase):
 # ===========================================================================
 # Bridge tool tests (4.5 / 4.6 / 4.7)
 #
-# Wave B will add the @mcp.tool() definition for verify_hou_api. Until then,
-# tests use a local _stub_verify_hou_api that mirrors the planned signature.
+# AST-extract the REAL @mcp.tool() from houdini_mcp_server.py — no stubs.
 # ===========================================================================
-SERVER_PY = os.path.join(ROOT, "server.py")
-BRIDGE_PY = os.path.join(ROOT, "houdini_mcp_server.py")
-
-
-def _read(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
-
-
-# ---------------------------------------------------------------------------
-# Stub of the PR 18 verify_hou_api bridge tool. Mirrors the planned
-# signature: @mcp.tool() def verify_hou_api(ctx, item_name,
-# help_type="python_hou", timeout=10).  Wave B TODO: replace this with
-# the real @mcp.tool() import from houdini_mcp_server.py.
-# ---------------------------------------------------------------------------
-def _stub_verify_hou_api(ctx, item_name, help_type="python_hou", timeout=10):
-    """Mirror of Wave-B verify_hou_api bridge tool. FOR TESTING ONLY.
-
-    TODO(Wave B): delete this stub and import the real @mcp.tool() from
-    houdini_mcp_server.py. Same forwarding pattern as PR 15's
-    get_houdini_help tool.
-    """
-    return _houdini_call_relay(
-        "verify_hou_api",
-        {"item_name": item_name, "help_type": help_type, "timeout": timeout})
-
-
-# Local relay stub for the bridge tests below.
-_houdini_call_relay = None
-
-
-def _install_relay_stub(response=None):
-    """Install an isolated relay stub for tests; return it."""
-    global _houdini_call_relay
-    relay = _RecordingHoudiniCallLocal(response=response)
-    _houdini_call_relay = relay
-    return relay
-
-
 class _RecordingHoudiniCallLocal(object):
     """Record bridge relay arguments; return a configurable envelope."""
 
@@ -353,23 +296,68 @@ class _RecordingHoudiniCallLocal(object):
         return self.response
 
 
-def _exec_pr18_stub_bridge_tool(response=None):
-    """Wire _stub_verify_hou_api to a recording relay."""
-    relay = _install_relay_stub(response=response)
-    # Bind globals for the stub closure.
-    ns = {"_houdini_call_relay": relay}
-    # The stub references _houdini_call_relay via the function body; we
-    # rebind the function to use our namespace by re-execing its source.
-    src = (
-        "def _stub_verify_hou_api(ctx, item_name, "
-        "help_type='python_hou', timeout=10):\n"
-        "    return _houdini_call_relay(\n"
-        "        'verify_hou_api',\n"
-        "        {'item_name': item_name, "
-        "'help_type': help_type, 'timeout': timeout})\n"
-    )
-    exec(compile(src, "<pr18_verify_hou_api_stub>", "exec"), ns)
-    return ns["_stub_verify_hou_api"], relay
+class _FakeMCPLocal(object):
+    def tool(self):
+        return lambda decorated: decorated
+
+
+# ---------------------------------------------------------------------------
+# 4.5: AST-exec the REAL PR 18 verify_hou_api @mcp.tool() (mirrors
+# test_help.py::_exec_pr15_bridge_tool pattern).
+# ---------------------------------------------------------------------------
+def _find_pr18_function_nodes():
+    """Scan houdini_mcp_server.py for the PR 18 verify_hou_api @mcp.tool().
+    Returns list of FunctionDef nodes between '# PR 18 Help Wrapper Tools'
+    and the next section header."""
+    src = _read(BRIDGE_PY)
+    tree = ast.parse(src)
+    PR18_HEADER = "# PR 18 Help Wrapper Tools"
+    NEXT_HEADER = "# PR 7 Materials Tools"  # PR 18 sits before PR 7 too
+    lines = src.splitlines()
+    header_line = None
+    next_header_line = None
+    for i, line in enumerate(lines, start=1):
+        if PR18_HEADER in line and header_line is None:
+            header_line = i
+        if NEXT_HEADER in line and next_header_line is None:
+            next_header_line = i
+    if header_line is None:
+        return []
+    upper = next_header_line if next_header_line else len(lines) + 1
+    fns = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        if node.lineno <= header_line:
+            continue
+        if node.lineno >= upper:
+            continue
+        for dec in node.decorator_list:
+            if isinstance(dec, ast.Call):
+                func = dec.func
+                if (isinstance(func, ast.Attribute)
+                        and func.attr == "tool"):
+                    fns.append(node)
+                    break
+    return fns
+
+
+def _exec_pr18_bridge_tool(response=None):
+    """AST-execute the PR 18 bridge tool with a recording relay stub.
+
+    Mirrors test_help.py::_exec_pr15_bridge_tool.
+    Returns (tool, relay) tuple.
+    """
+    functions = _find_pr18_function_nodes()
+    if len(functions) != 1:
+        raise AssertionError(
+            "Expected exactly 1 PR 18 @mcp.tool(), found %d" % len(functions))
+    function_source = ast.get_source_segment(_read(BRIDGE_PY), functions[0])
+    relay = _RecordingHoudiniCallLocal(response=response)
+    namespace = {"mcp": _FakeMCPLocal(), "_houdini_call": relay}
+    exec(compile(function_source, "<pr18_verify_hou_api>", "exec"),
+         namespace)
+    return namespace["verify_hou_api"], relay
 
 
 class PR18BridgeExecTests(unittest.TestCase):
@@ -377,7 +365,7 @@ class PR18BridgeExecTests(unittest.TestCase):
     with default help_type='python_hou' and default timeout=10."""
 
     def test_default_help_type_is_python_hou(self):
-        tool, relay = _exec_pr18_stub_bridge_tool()
+        tool, relay = _exec_pr18_bridge_tool()
         result = tool(object(), "ObjNode.X")  # no help_type kwarg
         self.assertEqual(relay.calls, [(
             "verify_hou_api",
@@ -386,11 +374,10 @@ class PR18BridgeExecTests(unittest.TestCase):
         self.assertEqual(result, relay.response)
 
     def test_explicit_help_type_overrides_default(self):
-        tool, relay = _exec_pr18_stub_bridge_tool()
+        tool, relay = _exec_pr18_bridge_tool()
         tool(object(), "grid", help_type="sop", timeout=7)
         self.assertEqual(relay.calls, [(
-            "verify_houdini_help"  # placeholder; assert overridden below
-            if False else "verify_hou_api",
+            "verify_hou_api",
             {"item_name": "grid", "help_type": "sop", "timeout": 7},
         )])
 
@@ -400,7 +387,7 @@ class PR18BridgeExecTests(unittest.TestCase):
             "message": "SideFX unavailable",
             "origin": "houdini",
         }
-        tool, relay = _exec_pr18_stub_bridge_tool(response=error)
+        tool, relay = _exec_pr18_bridge_tool(response=error)
         result = tool(object(), "ObjNode.X")
         self.assertEqual(result, error)
 
@@ -413,19 +400,25 @@ class PR18BridgeExecTests(unittest.TestCase):
 def _find_pr15_function_nodes():
     """Mirror test_help.py's _find_pr15_function_nodes for the real bridge
     tool. Returns the get_houdini_help @mcp.tool() node in
-    houdini_mcp_server.py."""
+    houdini_mcp_server.py.
+
+    Stops at either the PR 18 section header or the PR 7 header (whichever
+    comes first), so this scanner picks up exactly one PR 15 tool even
+    after PR 18 lands between them.
+    """
     src = _read(BRIDGE_PY)
     tree = ast.parse(src)
     PR15_HEADER = "# PR 15 Help Tools"
-    NEXT_HEADER = "# PR 7 Materials Tools"
+    NEXT_HEADERS = ["# PR 18 Help Wrapper Tools", "# PR 7 Materials Tools"]
     lines = src.splitlines()
     header_line = None
     next_header_line = None
     for i, line in enumerate(lines, start=1):
         if PR15_HEADER in line and header_line is None:
             header_line = i
-        if NEXT_HEADER in line and next_header_line is None:
-            next_header_line = i
+        for hdr in NEXT_HEADERS:
+            if hdr in line and next_header_line is None:
+                next_header_line = i
     if header_line is None:
         return []
     upper = next_header_line if next_header_line else len(lines) + 1
@@ -475,53 +468,9 @@ class PR15RegressionTests(unittest.TestCase):
         self.assertEqual(relay.calls[0][1]["help_type"], "sop")
 
 
-class _FakeMCPLocal(object):
-    def tool(self):
-        return lambda decorated: decorated
-
-
 # ---------------------------------------------------------------------------
-# 4.7: PR18BridgeStyleTests placeholder — Wave B will ship the actual
-# @mcp.tool() in houdini_mcp_server.py between "# PR 18 Help Wrapper Tools"
-# and the next section header. Until then, this test skips.
+# 4.7: PR18BridgeStyleTests — real assertions, no skip.
 # ---------------------------------------------------------------------------
-def _find_pr18_function_nodes():
-    """Scan houdini_mcp_server.py for the PR 18 verify_hou_api @mcp.tool().
-    Returns list of FunctionDef nodes between '# PR 18 Help Wrapper Tools'
-    and the next section header."""
-    src = _read(BRIDGE_PY)
-    tree = ast.parse(src)
-    PR18_HEADER = "# PR 18 Help Wrapper Tools"
-    NEXT_HEADER = "# PR 7 Materials Tools"  # PR 18 sits before PR 7 too
-    lines = src.splitlines()
-    header_line = None
-    next_header_line = None
-    for i, line in enumerate(lines, start=1):
-        if PR18_HEADER in line and header_line is None:
-            header_line = i
-        if NEXT_HEADER in line and next_header_line is None:
-            next_header_line = i
-    if header_line is None:
-        return []
-    upper = next_header_line if next_header_line else len(lines) + 1
-    fns = []
-    for node in tree.body:
-        if not isinstance(node, ast.FunctionDef):
-            continue
-        if node.lineno <= header_line:
-            continue
-        if node.lineno >= upper:
-            continue
-        for dec in node.decorator_list:
-            if isinstance(dec, ast.Call):
-                func = dec.func
-                if (isinstance(func, ast.Attribute)
-                        and func.attr == "tool"):
-                    fns.append(node)
-                    break
-    return fns
-
-
 def _has_cjk(s):
     if not s:
         return False
@@ -529,11 +478,9 @@ def _has_cjk(s):
 
 
 class PR18BridgeStyleTests(unittest.TestCase):
-    """4.7: Wave B will add @mcp.tool() verify_hou_api between section
-    headers. Until then, skip with a clear message.
-
-    When Wave B ships, these tests verify:
-      - exactly 1 PR 18 @mcp.tool()
+    """4.7: PR 18 @mcp.tool() verify_hou_api style contract:
+      - exactly 1 PR 18 @mcp.tool() in the section between PR 18 header
+        and PR 7 Materials Tools header
       - function name MUST be `verify_hou_api`
       - no type annotations on params / return
       - Chinese (CJK) docstring
@@ -541,11 +488,6 @@ class PR18BridgeStyleTests(unittest.TestCase):
 
     def setUp(self):
         self.fns = _find_pr18_function_nodes()
-        if not self.fns:
-            self.skipTest(
-                "PR 18 not yet implemented (Wave B) — section header "
-                "'# PR 18 Help Wrapper Tools' not found in "
-                "houdini_mcp_server.py")
         names = [f.name for f in self.fns]
         self.assertEqual(
             len(self.fns), 1,
@@ -578,3 +520,7 @@ class PR18BridgeStyleTests(unittest.TestCase):
             _has_cjk(doc),
             "verify_hou_api docstring must contain Chinese (CJK) text. "
             "Current docstring: %r" % doc)
+
+
+if __name__ == "__main__":
+    unittest.main()

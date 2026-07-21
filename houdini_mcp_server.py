@@ -1724,6 +1724,36 @@ def get_houdini_help(ctx, help_type, item_name, timeout=10):
 
 
 # -------------------------------------------------------------------
+# PR 18 Help Wrapper Tools (placed before PR 7 section so test_bridge_style
+# PR 7 probe — which scans all @mcp.tool() strictly after the "# PR 7
+# Materials Tools" header line — does not pick it up; the trailing "Tools"
+# also makes the PR 14 probe's "next section header" regex stop here)
+# -------------------------------------------------------------------
+@mcp.tool()
+def verify_hou_api(ctx, item_name, help_type="python_hou", timeout=10):
+    """AI-friendly wrapper over get_houdini_help（PR 18）。
+
+    参数说明：
+    - item_name: 要查询的 hou API / 节点 / VEX 函数名，如
+      "ObjNode.setDisplayNode" 或 "Node.setInput"。
+    - help_type: 可选，帮助类型，默认 "python_hou"；其他支持值见
+      get_houdini_help（sop / obj / dop / cop2 / chop / vop / lop /
+      top / rop / vex_function）。
+    - timeout: 可选，HTTP 请求超时秒数，默认 10。
+
+    返回 dict 包含 title / summary / parameters / inputs / outputs /
+    methods / status 等字段，并在响应末尾附 `_ai_hint` 字段，给 AI
+    一个可直接使用的简短提示（命中方法签名 / F-C pattern /
+    SideFX 不可达 fallback）。响应整体过 apply_response_cap。
+    """
+    return _houdini_call("verify_hou_api", {
+        "item_name": item_name,
+        "help_type": help_type,
+        "timeout": timeout,
+    })
+
+
+# -------------------------------------------------------------------
 # PR 7 Materials Tools (thin relay to server-side _materials)
 # -------------------------------------------------------------------
 @mcp.tool()
