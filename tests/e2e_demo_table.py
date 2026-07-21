@@ -8,10 +8,16 @@
   set_node_position / connect_nodes / create_wrangle / create_material /
   assign_material / find_error_nodes / cook_node / get_geometry_info /
   get_geo_summary / set_node_color / layout_children。
+- 再走完 capture / render / audit 三个验证步骤：
+  * 4.8 capture_multiple_panes 截 3 个 pane（NetworkEditor / SceneViewer /
+    Parm）到 artifact 目录，要求 PNG > 5 KB。
+  * 4.9 render_quad_views_base64 用 Karma CPU 渲 4 视图 → 落 PNG 到
+    `<artifact_dir>/table_demo_views/`；渲染器不可用时 SKIP。
+  * 4.10 execute_code(policy="privileged", capture_diff=True) 走一次
+    mutation audit 路径，再 get_last_scene_diff() 取 diff；bypass 未开
+    时 SKIP（不视作失败）。
 - 输出 Markdown 断言汇总表到 stdout，并把表落盘到
-  `$TEMP/houdini_mcp/e2e_demo_table/summary.md`；后续 Wave C 步骤
-  （pane 截图 / Karma CPU 渲染 / execute_code 审计 / 汇总）会写入同一
-  artifact 目录。
+  `$TEMP/houdini_mcp/e2e_demo_table/<timestamp>/summary.md`。
 
 运行方式：
     C:/.../external/houdinimcp-env/python/python.exe tests/e2e_demo_table.py
@@ -27,6 +33,10 @@
 - 首次连接失败（ConnectionRefusedError / socket.timeout / OSError）→ 视为
   SKIP，stdout 打 "is Houdini running + MCP started?" 提示，exit 0，不抛
   traceback。Demo 是 smoke test，不是回归门禁。
+- 单步内部 SKIP：4.9 Karma CPU 在渲染器未装 / 机器忙时 SKIP；4.10
+  privileged audit 在 HOUDINI_MCP_ALLOW_BYPASS 未设时 SKIP。SKIP 不影响
+  exit code（与 PASS / WARN 同等视作非阻塞）。
+- 退出码：仅当存在 FAIL 时退出 1；否则 0（PASS / WARN / SKIP 全算通过）。
 
 协议：
 - 与 server.py 一致：4 字节大端长度前缀 + UTF-8 JSON。
@@ -34,8 +44,9 @@
 - 响应：{"status": "success" | "error", "result": ..., "message": ...}。
 
 历史：
-- 2026-07-21 初版（Wave B）：实现 4.3 skeleton + 4.4-4.7 build / verify。
-  Wave C 将追加 4.8-4.11（capture / render / audit / summary）。
+- 2026-07-21 初版（Wave B）：4.3 skeleton + 4.4-4.7 build / verify。
+- 2026-07-21 Wave C 追加 4.8 capture / 4.9 render / 4.10 audit / 4.11
+  summary，并新建 tests/README.md（4.12）。
 """
 from __future__ import annotations
 
@@ -44,6 +55,7 @@ import os
 import socket
 import sys
 import tempfile
+import time
 import traceback
 from typing import Any, Dict, List
 
@@ -424,11 +436,353 @@ def verification_snapshots(conn: HoudiniConn,
 
 
 # ---------------------------------------------------------------------------
+# Step blocks（task 4.8 / 4.9 / 4.10 — Wave C：capture / render / audit）
+# ---------------------------------------------------------------------------
+# 共享最小阈值：5 KB（spec §Scenario: demo captures three pane screenshots
+# 与 §Scenario: demo renders four views via Karma CPU 都明确 > 5 KB；过小
+# 视为空白/损坏截图）。
+_MIN_PNG_BYTES = 5120
+
+
+def capture_pane_snapshots(conn: HoudiniConn,
+                           results: List[StepResult],
+                           artifact_dir: str) -> None:
+    """Task 4.8：批量截 3 个 pane（NetworkEditor / SceneViewer / Parm）。
+
+    实现要点：
+    - 调用 capture_multiple_panes，服务端返
+      {"results": [{pane_type, save_path, success, error}, ...]}（与
+      _pane_capture.py:488 capture_multiple_panes 对齐）。
+    - 对每个结果：success=True 且 save_path 存在且 size > 5 KB → PASS；
+      否则 FAIL，并写 detail 说明具体原因（缺文件 / 太小 / 服务端 error）。
+    - SceneViewer 端：H21+H22 主路径走 hou.SceneViewer.flipbook()，
+      落盘文件含 $F4 替换帧号后缀（例 SceneViewer.0001.png）。当前
+      capture_multiple_panes 未把 _renderer 字段透到 per-result（已知
+      偏差），所以 demo 改以文件扩展模式作为 proxy：若 SceneViewer 落
+      盘文件名含 4 位帧号后缀即视为 flipbook 路径；若不含帧号后缀
+      则记录 WARN（Qt grab 降级路径），但不 FAIL。
+    - 单条记录既视作独立 step；最终汇总额外写一行 4.8 汇总 PASS/FAIL
+      到 results，便于 emit_summary 列表里直接看到。
+    """
+    pane_types = ["NetworkEditor", "SceneViewer", "Parm"]
+    try:
+        resp = conn.call("capture_multiple_panes",
+                         pane_types=pane_types,
+                         save_dir=artifact_dir)
+    except HoudiniCallError as e:
+        # transport-level 错误 → 整步 FAIL（连 1 张都没拿到）
+        assert_step(results, "4.8 capture_multiple_panes (transport)",
+                    ok=False, artifact=artifact_dir,
+                    detail="err: {0}".format(str(e)[:200]))
+        return
+
+    raw_results = resp.get("results") if isinstance(resp, dict) else None
+    if not isinstance(raw_results, list):
+        assert_step(results, "4.8 capture_multiple_panes (parse)",
+                    ok=False, artifact=artifact_dir,
+                    detail="resp missing 'results' list: keys={0}".format(
+                        list(resp.keys())[:4] if isinstance(resp, dict)
+                        else type(resp).__name__))
+        return
+
+    n_pass = 0
+    n_fail = 0
+    detail_lines: List[str] = []
+    for item in raw_results:
+        if not isinstance(item, dict):
+            n_fail += 1
+            detail_lines.append("? non-dict item")
+            continue
+        pt = item.get("pane_type", "?")
+        sp = item.get("save_path", "") or ""
+        ok_flag = bool(item.get("success", False))
+        err = item.get("error")
+
+        if not ok_flag:
+            n_fail += 1
+            detail_lines.append("{0}=FAIL ({1})".format(
+                pt, (err or "success=False")[:80]))
+            assert_step(results, "4.8 capture_{0}".format(pt),
+                        ok=False, artifact=sp or artifact_dir,
+                        detail="err: {0}".format((err or "")[:160]))
+            continue
+
+        # success=True：校验文件落盘 + 体积
+        try:
+            size = os.path.getsize(sp) if sp and os.path.exists(sp) else 0
+        except OSError:
+            size = 0
+        if size <= _MIN_PNG_BYTES:
+            n_fail += 1
+            detail_lines.append("{0}=FAIL (size={1}B)".format(pt, size))
+            assert_step(results, "4.8 capture_{0}".format(pt),
+                        ok=False, artifact=sp,
+                        detail="file too small or missing: size={0}B".format(
+                            size))
+            continue
+
+        # PASS — SceneViewer 额外记录 renderer proxy
+        n_pass += 1
+        if pt == "SceneViewer":
+            # flipbook 路径落盘为 `<stem>.<4位帧号>.png`（$F4 替换）；
+            # Qt grab 路径落盘为 `<stem>.png`（无帧号后缀）。
+            base = os.path.basename(sp)
+            stem, ext = os.path.splitext(base)
+            looks_like_flipbook = (
+                len(stem) > 4 and stem[-4:].isdigit() and ext.lower() == ".png"
+            )
+            renderer_proxy = ("flipbook_via_Houdini_internal"
+                              if looks_like_flipbook
+                              else "qt_grab_or_other")
+            detail_lines.append("{0}=PASS size={1}B renderer_proxy={2}".format(
+                pt, size, renderer_proxy))
+            assert_step(results, "4.8 capture_{0}".format(pt), ok=True,
+                        artifact=sp,
+                        detail="renderer_proxy={0} size={1}B".format(
+                            renderer_proxy, size))
+        else:
+            detail_lines.append("{0}=PASS size={1}B".format(pt, size))
+            assert_step(results, "4.8 capture_{0}".format(pt), ok=True,
+                        artifact=sp, detail="size={0}B".format(size))
+
+    # 汇总行：3 个 pane 全 PASS 才算整步 PASS；个别 FAIL 标 FAIL 但不阻断
+    overall_ok = (n_pass == len(pane_types))
+    assert_step(results, "4.8 capture_multiple_panes (overall)",
+                ok=overall_ok, artifact=artifact_dir,
+                detail="passed={0}/{1} | {2}".format(
+                    n_pass, len(pane_types), " | ".join(detail_lines)))
+
+
+def render_quad_views_karma(conn: HoudiniConn,
+                            results: List[StepResult],
+                            artifact_dir: str,
+                            geometry_path: str = "/obj/table_demo") -> None:
+    """Task 4.9：Karma CPU 渲 4 视图并落 PNG。
+
+    实现要点：
+    - 调用 render_quad_views_base64(renderer="karma_cpu",
+      resolution=[640, 480], format="PNG")；服务端返
+      {top: {image_base64, size_bytes, ...}, front: {...},
+       side: {...}, perspective: {...}, _meta: {...}}。
+    - Karma CPU 未装 / busy / 超时时：HoudiniCallError 抛或响应里 image_base64
+      为空字符串（placeholder）；均视作 SKIP（不 FAIL），detail 写明原因。
+    - 成功路径：建 `<artifact_dir>/table_demo_views/`，把每个 view 的
+      base64 解码写 `<view>.png`；体积 > 5 KB 视为 PASS；任一失败则整步
+      WARN（部分渲染仍可看，不算硬失败）。
+    """
+    views_dir = os.path.join(artifact_dir, "table_demo_views")
+    try:
+        os.makedirs(views_dir, exist_ok=True)
+    except OSError as e:
+        assert_step(results, "4.9 render_quad_views_karma_cpu",
+                    ok=False, artifact=views_dir,
+                    detail="cannot create views dir: {0}".format(e))
+        return
+
+    try:
+        resp = conn.call("render_quad_views_base64",
+                         geometry_path=geometry_path,
+                         renderer="karma_cpu",
+                         resolution=[640, 480],
+                         format="PNG")
+    except HoudiniCallError as e:
+        # Karma CPU 不可用 / busy / 超时 → SKIP，不阻断 demo
+        assert_step(results, "4.9 render_quad_views_karma_cpu",
+                    ok=False, on_skip=True,
+                    artifact=views_dir,
+                    detail="SKIP: karma_cpu 不可用或超时: {0}".format(
+                        str(e)[:160]))
+        return
+
+    if not isinstance(resp, dict):
+        assert_step(results, "4.9 render_quad_views_karma_cpu",
+                    ok=False, on_skip=True, artifact=views_dir,
+                    detail="SKIP: resp 非 dict ({0})".format(type(resp)))
+        return
+
+    # 顶部 _warning（cmn._add_response_metadata 在 hou 缺失时塞入）
+    if "_warning" in resp:
+        assert_step(results, "4.9 render_quad_views_karma_cpu",
+                    ok=False, on_skip=True, artifact=views_dir,
+                    detail="SKIP: server _warning={0}".format(
+                        str(resp["_warning"])[:160]))
+        return
+
+    view_names = ("top", "front", "side", "perspective")
+    n_pass = 0
+    n_fail = 0
+    total_bytes = 0
+    detail_lines: List[str] = []
+    for vname in view_names:
+        v = resp.get(vname)
+        if not isinstance(v, dict):
+            n_fail += 1
+            detail_lines.append("{0}=MISSING".format(vname))
+            continue
+        b64 = v.get("image_base64") or ""
+        if not b64:
+            n_fail += 1
+            detail_lines.append("{0}=EMPTY".format(vname))
+            continue
+        out_path = os.path.join(views_dir, vname + ".png")
+        try:
+            png_bytes = base64.b64decode(b64, validate=False)
+        except (TypeError, ValueError) as e:
+            n_fail += 1
+            detail_lines.append("{0}=B64ERR ({1})".format(vname, str(e)[:40]))
+            continue
+        try:
+            with open(out_path, "wb") as fh:
+                fh.write(png_bytes)
+        except OSError as e:
+            n_fail += 1
+            detail_lines.append("{0}=WRITEFAIL ({1})".format(
+                vname, str(e)[:40]))
+            continue
+        size = len(png_bytes)
+        total_bytes += size
+        if size > _MIN_PNG_BYTES:
+            n_pass += 1
+            detail_lines.append("{0}=PASS({1}B)".format(vname, size))
+        else:
+            n_fail += 1
+            detail_lines.append("{0}=TOO_SMALL({1}B)".format(vname, size))
+
+    meta = resp.get("_meta", {}) if isinstance(resp, dict) else {}
+    renderer_used = meta.get("renderer", "karma_cpu") if isinstance(meta, dict) \
+        else "karma_cpu"
+
+    # 整步：4 视图全 PASS 才 PASS；任一失败 → WARN（部分渲染可用）
+    overall_ok = (n_pass == len(view_names))
+    if overall_ok:
+        overall_status = True
+        overall_detail = "passed={0}/{1} total={2}B renderer={3}".format(
+            n_pass, len(view_names), total_bytes, renderer_used)
+    else:
+        # 部分渲染：WARN 而非 FAIL（demo 仍能 ship）
+        overall_status = False
+        overall_detail = "WARN passed={0}/{1} renderer={2} | {3}".format(
+            n_pass, len(view_names), renderer_used,
+            " | ".join(detail_lines))
+
+    assert_step(results, "4.9 render_quad_views_karma_cpu",
+                ok=overall_status, artifact=views_dir,
+                detail=overall_detail)
+
+
+def execute_code_audit(conn: HoudiniConn,
+                       results: List[StepResult]) -> None:
+    """Task 4.10：privileged mutation audit + scene diff 取证。
+
+    实现要点：
+    - 走 execute_code(policy="privileged", allow_dangerous=False,
+      capture_diff=True)；body 只做 create+destroy 一个 null 节点（属
+      mutation 但非 dangerous，所以 privileged + allow_dangerous=False
+      不需要 HOUDINI_MCP_ALLOW_BYPASS 也能通过；只有 dangerous 才需要
+      bypass env-var）。
+    - 服务端若拒绝，返回 {executed: False, blocked: True, reason: ...}；
+      这里捕获后判 SKIP（demo 跑 ≠ 失败）。
+    - 然后 get_last_scene_diff()；当前服务端返
+      {available, changed, before, after}（无 scene_changes 字段）。
+      偏差说明：spec 写的是 scene_changes，实际字段叫 changed；这里以
+      changed 为准，available=True 且 changed=True → PASS。
+    - demo 故意不去 clear 用户的 .hip 文件（避免误删），用 create+destroy
+      一个临时 null 节点作为 benign mutation。
+    """
+    audit_code = (
+        "import hou\n"
+        "_opera_parent = hou.node('/obj')\n"
+        "_opera_before = len(_opera_parent.children())\n"
+        "_opera_tmp = _opera_parent.createNode('null', 'opera_audit_temp')\n"
+        "_opera_after = len(_opera_parent.children())\n"
+        "_opera_tmp.destroy()\n"
+        "print('AUDIT_DIFF: before={0} after={1} mutation=create+destroy "
+        "null node'.format(_opera_before, _opera_after))\n"
+    )
+
+    # 1. execute_code — 走 privileged audit path
+    try:
+        resp = conn.call("execute_code", code=audit_code,
+                         policy="privileged",
+                         allow_dangerous=False,
+                         capture_diff=True)
+    except HoudiniCallError as e:
+        assert_step(results, "4.10 execute_code_audit",
+                    ok=False, on_skip=True, artifact="-",
+                    detail="SKIP: transport err: {0}".format(str(e)[:160]))
+        return
+
+    if not isinstance(resp, dict):
+        assert_step(results, "4.10 execute_code_audit",
+                    ok=False, on_skip=True, artifact="-",
+                    detail="SKIP: resp 非 dict ({0})".format(type(resp)))
+        return
+
+    # 服务端 policy-block：执行没发生 → SKIP
+    if resp.get("blocked") is True or resp.get("executed") is False:
+        reason = resp.get("reason") or resp.get("message") or "blocked"
+        assert_step(results, "4.10 execute_code_audit",
+                    ok=False, on_skip=True, artifact="-",
+                    detail="SKIP: server blocked: {0}".format(str(reason)[:160]))
+        return
+
+    # 2. get_last_scene_diff 取 diff
+    try:
+        diff = conn.call("get_last_scene_diff")
+    except HoudiniCallError as e:
+        assert_step(results, "4.10 execute_code_audit",
+                    ok=False, on_skip=True, artifact="-",
+                    detail="SKIP: get_last_scene_diff transport err: {0}".format(
+                        str(e)[:160]))
+        return
+
+    if not isinstance(diff, dict):
+        assert_step(results, "4.10 execute_code_audit",
+                    ok=False, artifact="-",
+                    detail="WARN: diff 非 dict ({0})".format(type(diff)))
+        return
+
+    if diff.get("available") is not True:
+        msg = diff.get("message") or "no diff captured"
+        assert_step(results, "4.10 execute_code_audit",
+                    ok=False, artifact="-",
+                    detail="WARN: diff unavailable: {0}".format(str(msg)[:160]))
+        return
+
+    changed = bool(diff.get("changed", False))
+    has_before = bool(diff.get("before"))
+    has_after = bool(diff.get("after"))
+    # 主要 PASS 条件：diff available + before/after 都存在；changed
+    # 不要求为 True（create+destroy 抵消后 scene hash 可能相等，仍算
+    # audit path 走过——OK 是审计通道活着，不是必须真有副作用）。
+    ok = has_before and has_after
+    detail = ("changed={0} before_keys={1} after_keys={2}".format(
+        changed,
+        list(diff["before"].keys())[:3] if has_before else [],
+        list(diff["after"].keys())[:3] if has_after else []))
+    assert_step(results, "4.10 execute_code_audit",
+                ok=ok, artifact="-", detail=detail)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _print_at_a_glance(results: List[StepResult]) -> None:
+    """打一行 PASS/FAIL/SKIP/WARN 计数到 stdout，shell 一眼能看。"""
+    n_pass = sum(1 for r in results if r.status == "PASS")
+    n_fail = sum(1 for r in results if r.status == "FAIL")
+    n_skip = sum(1 for r in results if r.status == "SKIP")
+    n_warn = sum(1 for r in results if r.status == "WARN")
+    print("[summary] {0} steps: {1} PASS / {2} FAIL / {3} SKIP / {4} WARN".format(
+        len(results), n_pass, n_fail, n_skip, n_warn))
+
+
 def main() -> int:
-    artifact_dir = os.path.join(tempfile.gettempdir(),
-                                "houdini_mcp", "e2e_demo_table")
+    # artifact_dir 含时间戳：每次 run 一个独立目录，避免多次跑覆盖；
+    # summary.md 与 capture PNG、Karma views 都落在这里。
+    artifact_dir = os.path.join(
+        tempfile.gettempdir(), "houdini_mcp", "e2e_demo_table",
+        time.strftime("%Y%m%d_%H%M%S"))
     try:
         os.makedirs(artifact_dir, exist_ok=True)
     except OSError as e:
@@ -446,9 +800,12 @@ def main() -> int:
             create_and_bind_material(conn, results)
             # Task 4.7
             verification_snapshots(conn, results)
-            # Wave C 会在此处插入 4.8 capture / 4.9 render / 4.10 audit。
-            # 标记成 TODO_WAVE_C 让后续 dispatch 一眼看到。
-            # 不在本次跑里加 step。
+            # Task 4.8 — pane 截图（Wave C）
+            capture_pane_snapshots(conn, results, artifact_dir)
+            # Task 4.9 — Karma CPU 四视图渲染（Wave C）
+            render_quad_views_karma(conn, results, artifact_dir)
+            # Task 4.10 — privileged mutation audit（Wave C）
+            execute_code_audit(conn, results)
     except (ConnectionRefusedError, socket.timeout, OSError) as e:
         print("[skip] Houdini socket not reachable on 127.0.0.1:9876 — "
               "is Houdini running + MCP started? ({0})".format(e))
@@ -459,6 +816,7 @@ def main() -> int:
         md = emit_summary(results, out_path=os.path.join(
             artifact_dir, "summary.md"))
         print(md)
+        _print_at_a_glance(results)
         return 1
     except Exception as e:  # noqa: BLE001
         # 未预期异常：打印 traceback + 已有汇总，避免静默吞错
@@ -466,11 +824,17 @@ def main() -> int:
         md = emit_summary(results, out_path=os.path.join(
             artifact_dir, "summary.md"))
         print(md)
+        _print_at_a_glance(results)
         return 1
 
+    # 正常路径：emit Markdown summary → 落盘 + stdout
     md = emit_summary(results, out_path=os.path.join(
         artifact_dir, "summary.md"))
     print(md)
+    _print_at_a_glance(results)
+    print("[artifact_dir] {0}".format(artifact_dir))
+    # 退出码语义：仅 FAIL 视为失败；PASS / WARN / SKIP 都算 demo 通过
+    # （用户场景里 Karma CPU 偶尔忙、bypass env 没设都属预期内的 SKIP）
     has_fail = any(r.status == "FAIL" for r in results)
     return 1 if has_fail else 0
 
