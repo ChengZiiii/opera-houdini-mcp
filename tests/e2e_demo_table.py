@@ -262,11 +262,12 @@ def add_wood_grain_wrangle(conn: HoudiniConn,
                     detail="WARN: {0}".format(str(e)[:200]))
 
     # 4. 把 wrangle 接到 table_demo 作为 display input 0（成为显示节点）
-    # 注意：服务端 ``connect_nodes``（server.py:811-818）强制 from/to 同 parent。
-    # wood_grain 是 /obj/table_demo 下的 SOP，table_demo 是 /obj 下的 OBJ；
-    # 跨 parent 接线会失败。需要走 execute_code 才能设 display SOP，
-    # 但本 demo 默认不再用 execute_code（保留它给 4.10 audit 用）。
-    # 这里用 _ok 直接尝试，若失败 → SKIP（标记已知 fork 约束）。
+    # F-C fix（submodule commit 9fb1b89）让 ``connect_nodes``（server.py:811-831）
+    # 走智能分支 ``src.path().startswith(dst.path()+"/")`` → OBJ 容器的
+    # ``setInput(input_index, src)``（Houdini-native），跨 parent 跨网络
+    # 不再抛 "must share a parent"。本步预期 PASS；保留 try/except 仅作
+    # 兜底，未来 fork 升级若回归到旧 raise 行为，本步降级为 SKIP（不阻断
+    # demo），其余错误 → FAIL。
     try:
         resp_d = conn.call("connect_nodes",
                            from_path=wrangle_path,
@@ -278,7 +279,7 @@ def add_wood_grain_wrangle(conn: HoudiniConn,
     except HoudiniCallError as e:
         msg = str(e) or ""
         if "must share a parent" in msg.lower() or "parent network" in msg.lower():
-            # fork 限制：connect_nodes 跨 OBJ 容器接 display 不支持；
+            # fork 限制回归：connect_nodes 又不支持跨 OBJ 容器接 display。
             # demo 用 execute_code audit path 走后端的 cross-parent setInput
             # 即可，这里降级为 SKIP，不阻断后续步骤。
             assert_step(results, "4.5d connect wood_grain -> table_demo display",
@@ -292,10 +293,12 @@ def add_wood_grain_wrangle(conn: HoudiniConn,
                         detail="err: {0}".format(msg[:200]))
 
     # 5. 校验：get_node_info 看 table_demo 的 input 0 是不是 wood_grain
-    # 服务端 _node_info.py:141 调 ``node.isCooking()``，对 hou.ObjNode 抛
-    # AttributeError（isCooking 仅存在于 hou.SopNode）。这是 fork 服务端 bug
-    # （不在本 demo 修复范围）；此处捕获后判 PASS-WARN，不阻断后续步骤。
-    # 同时 conn.call 返回 envelope，需要 ``info["result"]`` 拿真正字段。
+    # F-A fix（submodule commit 9fb1b89）：_node_info.py:141 把
+    # ``node.isCooking()`` 改为 ``hasattr(node, "isCooking")`` 守门，缺失
+    # 时返回 None（不再抛 AttributeError）。本步预期在 hou.ObjNode 上直接
+    # 返回 dict（is_cooking=None），正常走输入校验逻辑。若服务端再抛任何
+    # HoudiniCallError → 视为真 FAIL，不再单独 catch isCooking 分支。
+    # conn.call 返回 envelope，需要 ``info["result"]`` 拿真正字段。
     try:
         info = conn.call("get_node_info",
                          node_path=table_path,
@@ -321,18 +324,11 @@ def add_wood_grain_wrangle(conn: HoudiniConn,
                     ok=ok, artifact=table_path,
                     detail="inputs[0].from_node={0}".format(first_from))
     except HoudiniCallError as e:
-        msg = str(e) or ""
-        # _node_info.isCooking 在 hou.ObjNode 上抛 AttributeError — 视为已知
-        # 服务端 bug，降级为 PASS-WARN（SKIP 等价非阻塞），仍标 detail 给事后排查。
-        if "isCooking" in msg or "AttributeError" in msg:
-            assert_step(results, "4.5e verify table_demo input 0 == wood_grain",
-                        ok=False, on_skip=True, artifact=table_path,
-                        detail="SKIP(server-bug): get_node_info on ObjNode "
-                               "fail: {0}".format(msg[:160]))
-        else:
-            assert_step(results, "4.5e verify table_demo input 0 == wood_grain",
-                        ok=False, artifact=table_path,
-                        detail="err: {0}".format(msg[:200]))
+        # 兜底：未来 fork 若回归到 isCooking AttributeError，仍算真 FAIL
+        # （不再 SKIP 兜底，因为 F-A 修复后应当稳定）。
+        assert_step(results, "4.5e verify table_demo input 0 == wood_grain",
+                    ok=False, artifact=table_path,
+                    detail="err: {0}".format(str(e)[:200]))
 
 
 def create_and_bind_material(conn: HoudiniConn,
@@ -362,25 +358,25 @@ def create_and_bind_material(conn: HoudiniConn,
     try:
         info = conn.call("get_material_info", material_path=mat_path)
         # conn.call 返 envelope；get_material_info 的真实字段在 result.parameters。
-        # 验证：服务端的 MATERIAL_PARM_WHITELIST 包含 "basecolor" 和 "rough"。
-        # 注意：Houdini 21+ 的 principledshader::2.0 把 basecolor 拆成多 parm
-        # （basecolorr/g/b），而 whitelist 没列出这些子键——这是 fork 服务端
-        # 限制（不在本 demo 修复范围）。这里用 ``rough``（白名单中、单 float
-        # 形式）作为"材质 PBR parm 已被设置"的代理信号；并附加 basecolorr/g/b
-        # 任意一个非 None 也算 OK（覆盖部分 server 版本）。
+        # F-B fix（submodule commit 9fb1b89）：MATERIAL_PARM_WHITELIST 已扩展，
+        # H21+ ``principledshader::2.0`` 的多 parm 子键（basecolorr/g/b、
+        # emitcolorr/g/b、sheenr/g/b 等）现已收录到白名单。本步把
+        # ``basecolorr`` 作为主信号（H21+ schema 的标志），``basecolor``
+        # 作为 H20 schema fallback；不再 fallback 到 ``rough``（它是
+        # 不相关的浮点字段，不能严格证明 PBR 颜色通道已被服务端读到）。
         inner = info.get("result", {}) if isinstance(info, dict) else {}
         params = inner.get("parameters", {}) if isinstance(inner, dict) else {}
         bc = params.get("basecolor")
         bcr = (params.get("basecolorr") or params.get("basecolorr1") or
                params.get("basecolor_red"))
-        rough = params.get("rough")
-        # 至少一种"颜色或粗糙度"被读出来 → PASS（材质 parm 至少读到一个值）。
-        ok = (bc is not None) or (bcr is not None) or (rough is not None)
+        rough = params.get("rough")  # 仅记录到 detail，不参与 PASS 判定
+        # 至少一种 PBR 颜色 parm 被读出来 → PASS；不再用 rough 兜底。
+        ok = (bcr is not None) or (bc is not None)
         assert_step(results, "4.6d verify wood_mat PBR parm readable",
                     ok=ok, artifact=mat_path,
-                    detail="basecolor={0} basecolorr={1} rough={2} "
+                    detail="basecolorr={0} basecolor={1} rough={2} "
                            "n_params={3}".format(
-                               bc, bcr, rough,
+                               bcr, bc, rough,
                                len(params) if isinstance(params, dict) else 0))
     except HoudiniCallError as e:
         assert_step(results, "4.6d verify wood_mat PBR parm readable",
@@ -388,8 +384,10 @@ def create_and_bind_material(conn: HoudiniConn,
                     detail="err: {0}".format(str(e)[:200]))
 
     # 5. 校验：桌体节点有材质引用（不需要严格 — 多数 SOP 节点只 render flag 时挂材质）
-    # 服务端 _node_info.py:141 ``node.isCooking()`` 对 hou.ObjNode 抛
-    # AttributeError（fork 服务端 bug）；捕获后判 PASS-WARN，不阻断 demo。
+    # F-A fix（submodule commit 9fb1b89）：_node_info.py:141 ``isCooking``
+    # 走 hasattr 守门，hou.ObjNode 上不再抛 AttributeError。本步预期直接
+    # 返回 dict；任何 HoudiniCallError → 视为真 FAIL，不再 catch isCooking
+    # 分支做 SKIP 兜底。
     try:
         info = conn.call("get_node_info", node_path=table_path,
                          include_errors=False, force_cook=False,
@@ -403,16 +401,10 @@ def create_and_bind_material(conn: HoudiniConn,
                     ok=True, artifact=table_path,
                     detail="type={0}".format(node_type))
     except HoudiniCallError as e:
-        msg = str(e) or ""
-        if "isCooking" in msg or "AttributeError" in msg:
-            assert_step(results, "4.6e verify table_demo get_node_info OK",
-                        ok=False, on_skip=True, artifact=table_path,
-                        detail="SKIP(server-bug): get_node_info on ObjNode "
-                               "fail: {0}".format(msg[:160]))
-        else:
-            assert_step(results, "4.6e verify table_demo get_node_info OK",
-                        ok=False, artifact=table_path,
-                        detail="err: {0}".format(msg[:200]))
+        # 兜底：未来 fork 若回归到 isCooking AttributeError，仍算真 FAIL。
+        assert_step(results, "4.6e verify table_demo get_node_info OK",
+                    ok=False, artifact=table_path,
+                    detail="err: {0}".format(str(e)[:200]))
 
 
 def verification_snapshots(conn: HoudiniConn,
