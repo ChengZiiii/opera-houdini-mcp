@@ -124,8 +124,11 @@ def capture_pane_screenshot(hou, pane_type_name, save_path=None,
     Returns:
         dict with keys: pane_type, save_path, width, height, size_bytes,
         _qt_backend；SceneViewer 分支额外含 _renderer=
-        "flipbook_via_Houdini_internal"。无 PySide 时（非 SceneViewer
-        类型）额外含 _warning 字段。
+        "flipbook_via_Houdini_internal"。其他 30 种 pane 额外含 _renderer
+        三态标记：H21+H22 "qtScreenGeometry_QScreen_grabWindow" /
+        H20 老路径 "qtWidget_fallback_H20" /
+        H20 widget 降级 "qtScreenGeometry_fallback_H20_widget_None"。
+        无 PySide 时（非 SceneViewer 类型）额外含 _warning 字段。
 
     Raises:
         ValueError: hou.paneTabType 上找不到 pane_type_name / 当前 UI 无
@@ -176,16 +179,75 @@ def capture_pane_screenshot(hou, pane_type_name, save_path=None,
     if fit_contents:
         _fit_pane_contents(pane, pane_type_name)
 
-    widget = pane.qtWidget() if hasattr(pane, "qtWidget") else None
-    if widget is None:
-        raise RuntimeError("无法获取 " + str(pane_type_name) + " Qt widget")
+    # Bug 1 H21+H22 截屏路径（opera-houdinimcp-h21-compat）：
+    # H21+ hou.PaneTab.qtWidget() API 已移除（SideFX H22 文档确认）。
+    # 改走 hou.PaneTab.qtScreenGeometry() 返 QRect(x, y, w, h)，
+    # 再用 QScreen.grabWindow(0, x, y, w, h) 直接从屏幕像素缓冲读 pane 区域。
+    # 不依赖 Houdini 内部 OGL，规避用户 H21 缺 OGL 3.3 时 widget.grab() 触发
+    # GUI Fatal Error 的 fatal combination（项目记忆 env-houdini-opengl-driver-missing）。
+    #
+    # H20 best-effort fallback：hasattr(pane, "qtWidget") and callable(...) 时
+    # 仍走老 widget.grab() 路径（保持现有 H20 行为），widget 返 None 或抛异常
+    # 时 fail-soft 到下方 QScreen 兜底。
+    #
+    # _renderer 三态标记区分走的哪条路径：
+    #   "qtScreenGeometry_QScreen_grabWindow"    — H21+H22 主路径（pane 无 qtWidget）
+    #   "qtWidget_fallback_H20"                   — H20 老 widget.grab() 成功
+    #   "qtScreenGeometry_fallback_H20_widget_None" — H20 widget 失败/None，降级到 QScreen
+    pixmap = None
+    _renderer_marker = None
+    _h20_attempted = False  # 是否尝试过 H20 widget 路径（决定 _renderer 三态）
 
-    try:
-        pixmap = widget.grab()
-    except Exception as e:
-        raise RuntimeError(str(pane_type_name) + " widget.grab() 失败: " + str(e)) from e
+    # H20 best-effort：仅当 pane 有可调用的 qtWidget 方法时尝试
+    if hasattr(pane, "qtWidget") and callable(getattr(pane, "qtWidget", None)):
+        _h20_attempted = True
+        try:
+            _widget = pane.qtWidget()
+            if _widget is not None:
+                try:
+                    _p = _widget.grab()
+                    if _p is not None and not _p.isNull():
+                        pixmap = _p
+                        _renderer_marker = "qtWidget_fallback_H20"
+                except Exception:
+                    # H20 widget.grab() 抛异常（如用户机缺 OGL 3.3）
+                    pixmap = None
+        except Exception:
+            # H20 SWIG bug 或 qtWidget() 自身抛异常
+            pixmap = None
+
+    # H21+H22 主路径（qtScreenGeometry + QScreen.grabWindow）：
+    # H21 时直接走此处（无 qtWidget 方法）；H20 widget=None/失败时降级到此处。
+    if pixmap is None:
+        try:
+            # SideFX hou.PaneTab H22 文档：qtScreenGeometry() 返 PySide6.QtCore.QRect
+            # x/y/width/height 为 pane 屏幕坐标（top-left corner + size）
+            geom = pane.qtScreenGeometry()
+            # QApplication.instance() 已存在（Houdini 内）时不能 QApplication([])
+            # 否则抛 RuntimeError（Qt 文档：QApplication 必须单例）
+            _app = QtWidgets.QApplication.instance()
+            if _app is None:
+                _app = QtWidgets.QApplication([])
+            _screen = _app.primaryScreen()
+            # QScreen.grabWindow(WId window=0, int x=0, int y=0,
+            #                    int width=-1, int height=-1) -> QPixmap
+            # window=0 表示截整个屏幕 + 指定矩形区域（Qt 文档）
+            pixmap = _screen.grabWindow(
+                0, geom.x(), geom.y(), geom.width(), geom.height())
+            if _h20_attempted:
+                # H20 widget 路径已尝试但失败（None 或抛异常），降级到 QScreen
+                _renderer_marker = "qtScreenGeometry_fallback_H20_widget_None"
+            else:
+                # H21+H22 主路径（pane 无 qtWidget 方法，H20 路径未尝试）
+                _renderer_marker = "qtScreenGeometry_QScreen_grabWindow"
+        except Exception as _e:
+            if pixmap is None:
+                raise RuntimeError(
+                    str(pane_type_name) + " 截屏失败: " + str(_e)) from _e
+
     if pixmap is None or pixmap.isNull():
-        raise RuntimeError(str(pane_type_name) + " widget.grab() 返回无效 pixmap")
+        raise RuntimeError(
+            str(pane_type_name) + " 截屏返回无效 pixmap")
     try:
         img = pixmap.toImage()
     except Exception as e:
@@ -212,6 +274,7 @@ def capture_pane_screenshot(hou, pane_type_name, save_path=None,
         "height": height,
         "size_bytes": size_bytes,
         "_qt_backend": _QT_BACKEND,
+        "_renderer": _renderer_marker,
     }
 
 

@@ -178,6 +178,9 @@ class _FakeQtFixture(object):
         fake_qtgui.QImage = _FakeQImage
         fake_qtwidgets = types.ModuleType(self.version + ".QtWidgets")
         fake_qtwidgets.QWidget = _FakeQWidget
+        # Bug 1 H21+ 截屏路径需要 QApplication.instance() +
+        # primaryScreen().grabWindow()。注入 fake _FakeQApplication。
+        fake_qtwidgets.QApplication = _FakeQApplication
         fake_pkg = types.ModuleType(self.version)
         fake_pkg.QtCore = fake_qtcore
         fake_pkg.QtGui = fake_qtgui
@@ -277,6 +280,14 @@ class _FakePaneTab(object):
         self._flipbook_raise = False
         # H21 flipbookSettings() 工厂方法返回的 settings 实例
         self._flipbook_settings = _FakeFlipbookSettings()
+        # Bug 1 H21+H22：qtScreenGeometry 返 QRect（SideFX H22 文档）
+        # 默认 1024x768 让大多数测试无需关心尺寸。widget 提供的尺寸优先
+        # （H20 widget 与 QRect 一致时返回的 pixmap 尺寸一致便于断言）。
+        if widget is not None and hasattr(widget, "_w"):
+            self._geom = _FakeQRect(0, 0, widget._w, widget._h)
+        else:
+            self._geom = _FakeQRect(0, 0, 1024, 768)
+        self.qtscreen_calls = []
 
     def name(self):
         return self._name
@@ -292,6 +303,12 @@ class _FakePaneTab(object):
 
     def qtWidget(self):
         return self._qt_widget
+
+    def qtScreenGeometry(self):
+        # Bug 1 H21+H22：pane.qtScreenGeometry() 返 QRect(x, y, w, h)
+        # SideFX hou.PaneTab H22 文档确认。
+        self.qtscreen_calls.append(True)
+        return self._geom
 
     def flipbookSettings(self):
         # H21 hou.SceneViewer.flipbookSettings() 工厂方法。
@@ -525,8 +542,60 @@ class _FakeQWidget(object):
         return _FakeQPixmap(self._w, self._h)
 
 
+class _FakeQRect(object):
+    """PySide6.QtCore.QRect stub — x/y/width/height 方法。"""
+    def __init__(self, x, y, w, h):
+        self._x, self._y, self._w, self._h = x, y, w, h
+
+    def x(self):
+        return self._x
+
+    def y(self):
+        return self._y
+
+    def width(self):
+        return self._w
+
+    def height(self):
+        return self._h
+
+
+class _FakeScreen(object):
+    """PySide6.QtGui.QScreen stub — grabWindow 记录调用 + 返 fake QPixmap。"""
+    def __init__(self, w=1920, h=1080):
+        self._w = w
+        self._h = h
+        self.grabWindow_calls = []
+
+    def grabWindow(self, wid, x, y, w, h):
+        self.grabWindow_calls.append((wid, x, y, w, h))
+        return _FakeQPixmap(w if w > 0 else self._w,
+                            h if h > 0 else self._h)
+
+
+class _FakeQApplication(object):
+    """PySide6.QtWidgets.QApplication stub — instance() + primaryScreen()。
+
+    Bug 1 H21+ 截屏路径需要 QApplication.instance() 返非 None（已存在）或
+    自动 new QApplication([])。_instance 单例 + primaryScreen() 返带
+    grabWindow 的 fake screen。"""
+    _instance = None
+
+    @classmethod
+    def instance(cls):
+        return cls._instance
+
+    def __init__(self, *args):
+        _FakeQApplication._instance = self
+        self._screen = _FakeScreen()
+
+    def primaryScreen(self):
+        return self._screen
+
+
 class _FakeQtWidgets(object):
     QWidget = _FakeQWidget
+    QApplication = _FakeQApplication
 
 
 class _FakeQtGui(object):
@@ -723,13 +792,18 @@ class CapturePaneScreenshotWithQtTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.pcp.capture_pane_screenshot(hou, "SceneViewer")
 
-    def test_no_widget_raises_runtime_error(self):
-        # Bug B：SceneViewer 不再走 Qt grab，widget 检查无意义；
-        # 改测 NetworkEditor（仍走 Qt grab 路径，widget=None 应 RuntimeError）
+    def test_no_widget_falls_back_to_qscreen(self):
+        """Bug 1 H21+ 设计：pane.qtWidget() 返 None 时不再抛 RuntimeError，
+        而是 fail-soft 到 QScreen.grabWindow 路径（qtScreenGeometry 兜底）。
+        _renderer 必须 = "qtScreenGeometry_fallback_H20_widget_None"。"""
         pane = _FakePaneTab(widget=None)
         hou = _FakeHou(pane_tabs_by_type={_FakePaneTabType.NetworkEditor: pane})
-        with self.assertRaises(RuntimeError):
-            self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
+        result = self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
+        self.assertEqual(result["pane_type"], "NetworkEditor")
+        self.assertGreater(result["width"], 0)
+        self.assertGreater(result["height"], 0)
+        self.assertEqual(result["_renderer"],
+            "qtScreenGeometry_fallback_H20_widget_None")
 
     def test_fit_contents_false_skips_fit(self):
         widget = _FakeQWidget()
@@ -741,45 +815,55 @@ class CapturePaneScreenshotWithQtTests(unittest.TestCase):
                                          fit_contents=False)
         self.assertEqual(pane._home_calls, [])
 
-    # ----- Important 1: grab exception handling (RED) -----
-    def test_grab_returns_none_raises_runtime_error(self):
-        """widget.grab() 返回 None 必须抛 RuntimeError，不能 AttributeError.
-        Bug B：SceneViewer 改走 flipbook，Qt grab 测试改用 NetworkEditor."""
+    # ----- Bug 1 H20 best-effort + QScreen 兜底（替代旧 widget.grab() 强校验）-----
+    def test_grab_returns_none_falls_back_to_qscreen(self):
+        """Bug 1 H20 best-effort：widget.grab() 返 None 时 fail-soft 到
+        QScreen.grabWindow，不抛 RuntimeError。_renderer 必须 =
+        "qtScreenGeometry_fallback_H20_widget_None"。"""
         class _NoneGrabWidget(_FakeQWidget):
             def grab(self):
                 return None
         widget = _NoneGrabWidget()
         hou, ne = _make_hou_with_network_editor(widget=widget)
-        with self.assertRaises(RuntimeError):
-            self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
+        result = self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
+        self.assertEqual(result["_renderer"],
+            "qtScreenGeometry_fallback_H20_widget_None")
+        self.assertGreater(result["width"], 0)
+        self.assertGreater(result["height"], 0)
 
-    def test_grab_raises_runtime_error_wraps_with_cause(self):
-        """widget.grab() 自身抛异常时必须包装为 RuntimeError 并保留 __cause__.
-        Bug B：Qt grab 测试改用 NetworkEditor."""
+    def test_grab_raises_falls_back_to_qscreen(self):
+        """Bug 1 H20 best-effort：widget.grab() 自身抛异常时**不**包装
+        RuntimeError（best-effort 静默降级），改走 QScreen.grabWindow。"""
         class _ExplodingGrabWidget(_FakeQWidget):
             def grab(self):
                 raise RuntimeError("explosion in grab")
         widget = _ExplodingGrabWidget()
         hou, ne = _make_hou_with_network_editor(widget=widget)
-        with self.assertRaises(RuntimeError) as cm:
-            self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
-        # Must preserve original cause chain
-        self.assertIsNotNone(cm.exception.__cause__)
-        self.assertIn("explosion in grab", str(cm.exception.__cause__))
+        result = self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
+        self.assertEqual(result["_renderer"],
+            "qtScreenGeometry_fallback_H20_widget_None")
+        # 原 explosion 不应被包装/传播（best-effort 设计）
+        self.assertNotIn("explosion in grab", str(result))
 
-    def test_pixmap_is_null_raises_runtime_error(self):
-        """widget.grab() 返回 isNull()==True pixmap 必须抛 RuntimeError.
-        Bug B：Qt grab 测试改用 NetworkEditor."""
+    def test_pixmap_is_null_falls_back_to_qscreen(self):
+        """Bug 1 H20 best-effort：widget.grab() 返 isNull pixmap 时降级
+        到 QScreen.grabWindow。"""
         class _NullPixmapGrabWidget(_FakeQWidget):
             def grab(self):
                 return _FakeQPixmap(100, 100, null=True)
         widget = _NullPixmapGrabWidget()
         hou, ne = _make_hou_with_network_editor(widget=widget)
-        with self.assertRaises(RuntimeError):
-            self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
+        result = self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
+        self.assertEqual(result["_renderer"],
+            "qtScreenGeometry_fallback_H20_widget_None")
 
-    def test_to_image_returns_none_raises_runtime_error(self):
-        """pixmap.toImage() 返回 None 必须抛 RuntimeError. Bug B: NetworkEditor."""
+    def test_to_image_returns_none_falls_back_to_qscreen(self):
+        """Bug 1 H20 best-effort：pixmap.toImage() 返 None 时降级到 QScreen。
+        注意：toImage() 是 pixmap 方法而非 widget 方法，H20 best-effort 只
+        覆盖 widget.grab() 失败场景；pixmap.toImage() 失败需要更宽松兜底。
+        这里验证：widget.grab() 返正常 pixmap → 走 H20 路径，toImage() 失败
+        → 整路径失败（因为已经用 H20 pixmap，不再 fallback 到 QScreen）。
+        期望 RuntimeError。"""
         class _NoneImagePixmap(_FakeQPixmap):
             def toImage(self):
                 return None
@@ -788,12 +872,14 @@ class CapturePaneScreenshotWithQtTests(unittest.TestCase):
                 return _NoneImagePixmap(100, 100)
         widget = _NoneImageWidget()
         hou, ne = _make_hou_with_network_editor(widget=widget)
+        # widget.grab() 返 pixmap（_renderer = qtWidget_fallback_H20），
+        # 然后 pixmap.toImage() 返 None → 抛 RuntimeError
         with self.assertRaises(RuntimeError):
             self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
 
     def test_to_image_raises_runtime_error_wraps_with_cause(self):
-        """pixmap.toImage() 抛异常时必须包装为 RuntimeError 并保留 __cause__.
-        Bug B：Qt grab 测试改用 NetworkEditor."""
+        """pixmap.toImage() 抛异常时仍包装为 RuntimeError 并保留 __cause__
+        （这是 widget.grab() 成功之后的二次检查，与 H20 best-effort 无关）。"""
         class _ExplodingToImagePixmap(_FakeQPixmap):
             def toImage(self):
                 raise RuntimeError("explosion in toImage")
@@ -808,8 +894,8 @@ class CapturePaneScreenshotWithQtTests(unittest.TestCase):
         self.assertIn("explosion in toImage", str(cm.exception.__cause__))
 
     def test_image_is_null_raises_runtime_error(self):
-        """pixmap.toImage() 返回 isNull()==True image 必须抛 RuntimeError.
-        Bug B：Qt grab 测试改用 NetworkEditor."""
+        """pixmap.toImage() 返 isNull image 必须抛 RuntimeError
+        （同 toImage 失败，与 H20 best-effort 无关）。"""
         class _NullImageWidget(_FakeQWidget):
             def grab(self):
                 p = _FakeQPixmap(100, 100, null=True)
@@ -817,17 +903,27 @@ class CapturePaneScreenshotWithQtTests(unittest.TestCase):
                 return p
         widget = _NullImageWidget()
         hou, ne = _make_hou_with_network_editor(widget=widget)
-        with self.assertRaises(RuntimeError):
-            self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
+        # widget.grab() 返 isNull pixmap → best-effort 不接受，降级 QScreen
+        # 但 QScreen fake 返有效 pixmap → 成功
+        result = self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
+        self.assertEqual(result["_renderer"],
+            "qtScreenGeometry_fallback_H20_widget_None")
 
     def test_grab_error_message_includes_pane_type(self):
-        """RuntimeError 消息必须包含 pane 类型名便于排错.
-        Bug B：Qt grab 测试改用 NetworkEditor."""
-        class _NoneGrabWidget(_FakeQWidget):
+        """Bug 1：当两条路径全失败时 RuntimeError 消息必须含 pane 类型名
+        便于排错。模拟 qtScreenGeometry 也失败的情况。"""
+        class _FakeBadPaneTab(_FakePaneTab):
+            def qtScreenGeometry(self):
+                raise RuntimeError("qtScreenGeometry boom")
+
+        pane = _FakeBadPaneTab(widget=_FakeQWidget())
+        # 让 widget.grab() 也失败 → 两条路径全失败 → RuntimeError
+        class _BadWidget(_FakeQWidget):
             def grab(self):
                 return None
-        widget = _NoneGrabWidget()
-        hou, ne = _make_hou_with_network_editor(widget=widget)
+        pane._qt_widget = _BadWidget()
+        hou = _FakeHou(pane_tabs_by_type={
+            _FakePaneTabType.NetworkEditor: pane})
         try:
             self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
             self.fail("Expected RuntimeError")

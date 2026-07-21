@@ -121,6 +121,24 @@ class _FakeCamera(object):
         self.name = name
 
 
+class _FakeQRect(object):
+    """PySide6.QtCore.QRect stub — x/y/width/height 方法。"""
+    def __init__(self, x, y, w, h):
+        self._x, self._y, self._w, self._h = x, y, w, h
+
+    def x(self):
+        return self._x
+
+    def y(self):
+        return self._y
+
+    def width(self):
+        return self._w
+
+    def height(self):
+        return self._h
+
+
 class _FakeSceneViewerPane(object):
     """Mock SceneViewer pane，flipbook / curViewport / qtWidget 全部可探测。"""
     def __init__(self, camera=None, raise_on_flipbook=False):
@@ -134,12 +152,21 @@ class _FakeSceneViewerPane(object):
         # H21 flipbookSettings() 工厂方法返回 settings 实例（H21 抽象类
         # 必须经此方法获取，stash() 返回副本）
         self._flipbook_settings = _FakeFlipbookSettings()
+        # Bug 1 H21+H22：qtScreenGeometry stub（SideFX H22 文档）。
+        # SceneViewer 走 flipbook 路径不会触达此处，但加方法避免未来重构
+        # 或 H21 实际调用时的 AttributeError（spec task 5.2）。
+        self._geom = _FakeQRect(0, 0, 1024, 768)
 
     def curViewport(self):
         return self._viewport
 
     def qtWidget(self):
         return self._widget
+
+    def qtScreenGeometry(self):
+        # Bug 1 H21+H22：SceneViewer 路径短路到 flipbook，不触达此方法。
+        # 仍 stub 返回避免任何 AttributeError。
+        return self._geom
 
     def flipbookSettings(self):
         # H21 hou.SceneViewer.flipbookSettings() 返回 viewer 当前 settings
