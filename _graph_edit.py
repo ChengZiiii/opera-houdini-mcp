@@ -93,7 +93,10 @@ def layout_children(hou, parent_path, horizontal_spacing=2.0,
             pos = (0.0, -i * vertical_spacing)
         else:
             pos = (i * horizontal_spacing, 0.0)
-        child.setPosition(pos)
+        # H21+ SWIG 要求 hou.Vector2 实例，raw tuple 会抛
+        # 'argument 2 of type std::vector<double>...' type-check 错。
+        # 参考 HoudiniMCPRender.py:124,133 的正确用法。
+        child.setPosition(hou.Vector2(pos[0], pos[1]))
 
     return {
         "parent_path": parent.path(),
@@ -118,7 +121,8 @@ def set_node_position(hou, node_path, x, y):
     node = hou.node(node_path)
     if node is None:
         raise ValueError(u"节点不存在: {0}".format(node_path))
-    node.setPosition((x, y))
+    # H21+ SWIG 要求 hou.Vector2 实例，raw tuple 会抛 type-check 错。
+    node.setPosition(hou.Vector2(x, y))
     return {
         "path": node.path(),
         "position": [x, y],

@@ -72,6 +72,44 @@ class _FakeColor(object):
         return "_FakeColor({0!r})".format(self.rgb)
 
 
+class _FakeVector2(object):
+    """Records the (x, y) pair passed to hou.Vector2(x, y).
+
+    H21+ SWIG type-map 要求 Node.setPosition 接收 hou.Vector2 实例，
+    拒绝 raw tuple/list。此 stub 让单测能断言 setPosition 收到的是
+    Vector2 类型（通过 isinstance 判定），同时保持与既有 tuple 比较
+    断言的向后兼容（__eq__ 接受 tuple/list）。
+    """
+
+    def __init__(self, x, y):
+        self.x = float(x)
+        self.y = float(y)
+
+    def __iter__(self):
+        # 让 tuple(vec) / 解包仍能工作
+        return iter((self.x, self.y))
+
+    def __getitem__(self, idx):
+        # 让 vec[0] / vec[1] 索引访问工作（既有测试用到）
+        return (self.x, self.y)[idx]
+
+    def __len__(self):
+        return 2
+
+    def __eq__(self, other):
+        if isinstance(other, _FakeVector2):
+            return (self.x, self.y) == (other.x, other.y)
+        if isinstance(other, (tuple, list)):
+            return [self.x, self.y] == list(other)
+        return False
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __repr__(self):
+        return "_FakeVector2({0!r}, {1!r})".format(self.x, self.y)
+
+
 class _FakeConnector(object):
     """Mimics hou.Node.inputConnectors() output tuples."""
 
@@ -124,7 +162,9 @@ class _FakeNode(object):
         )
 
     def setPosition(self, pos):
-        self.set_position_calls.append(tuple(pos))
+        # 保留原始类型：测试可断言传入的是 hou.Vector2 实例
+        # （H21+ SWIG 拒绝 raw tuple/list），不能在此处 tuple(pos) 归一化。
+        self.set_position_calls.append(pos)
 
     def setColor(self, color):
         self.set_color_calls.append(color)
@@ -170,6 +210,11 @@ class _FakeHou(object):
     @staticmethod
     def Color(rgb):
         return _FakeColor(rgb)
+
+    @staticmethod
+    def Vector2(x, y):
+        # H21+ Node.setPosition 要求 hou.Vector2 实例（spec: 节点位置）
+        return _FakeVector2(x, y)
 
 
 def _make_node(name, parent=None):
@@ -334,6 +379,32 @@ class LayoutChildrenTests(unittest.TestCase):
         result = ge.layout_children(hou, "/obj/container")
         self.assertEqual(result["children_count"], 0)
 
+    def test_layout_children_uses_hou_vector2(self):
+        """H21+ SWIG 要求 setPosition 接收 hou.Vector2，不接受 raw tuple。
+
+        回归 A5：_graph_edit.py:96 修复前 layout_children 内部传 tuple，
+        H21 抛 SWIG type-check 错，整个 layout_children 工具不可用。
+        """
+        hou = _make_hou()
+        container = _make_node("container")
+        hou.add_node("/obj/container", container)
+        for nm in ("a", "b", "c"):
+            child = _make_node(nm, parent=container)
+            hou.add_node("/obj/container/" + nm, child)
+
+        ge.layout_children(hou, "/obj/container")
+
+        # 每个子节点最后一次 setPosition 必须收到 _FakeVector2 实例
+        for child in container.children():
+            self.assertTrue(
+                child.set_position_calls,
+                "child {0} 应至少被 setPosition 一次".format(child.name()))
+            last_call = child.set_position_calls[-1]
+            self.assertIsInstance(
+                last_call, _FakeVector2,
+                "layout_children must pass hou.Vector2 to setPosition for "
+                "child {0}, got {1!r}".format(child.name(), type(last_call)))
+
     def test_parent_missing_raises_value_error(self):
         hou = _make_hou()
         with self.assertRaises(ValueError):
@@ -364,6 +435,27 @@ class SetNodePositionTests(unittest.TestCase):
 
         result = ge.set_node_position(hou, "/obj/n", 0, 0)
         self.assertEqual(n.set_position_calls[-1], (0, 0))
+
+    def test_set_node_position_uses_hou_vector2(self):
+        """H21+ SWIG 要求 setPosition 接收 hou.Vector2，不接受 raw tuple。
+
+        回归 A5：_graph_edit.py:121 修复前传 (x, y) tuple，H21 抛
+        'argument 2 of type std::vector<double>...' SWIG type-check 错。
+        """
+        hou = _make_hou()
+        n = _make_node("n")
+        hou.add_node("/obj/n", n)
+
+        ge.set_node_position(hou, "/obj/n", 3.5, -2.0)
+
+        last_call = n.set_position_calls[-1]
+        self.assertIsInstance(
+            last_call, _FakeVector2,
+            "set_node_position must pass hou.Vector2 to setPosition, "
+            "got {0!r}".format(type(last_call)))
+        # 坐标值不被破坏
+        self.assertEqual(last_call.x, 3.5)
+        self.assertEqual(last_call.y, -2.0)
 
     def test_node_missing_raises_value_error(self):
         hou = _make_hou()
