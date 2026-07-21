@@ -349,10 +349,14 @@ class HoudiniMCPServer:
         # PR 9: 图编辑增强命令均修改场景
         "reorder_inputs", "set_node_position", "set_node_color",
         "create_network_box",
-        # PR 13: pane 截图。截图视为写文件状态；render_node_network 通过
-        # pane.cd() 修改 NetworkEditor 当前路径（UI 状态）。三者均纳入 undo group。
-        "capture_pane_screenshot", "capture_multiple_panes",
-        "render_node_network",
+        # PR 13: pane 截图本应在此处，但 H21 实测 hou.undos.group() 上下文
+        # 会让 hou.SceneViewer.flipbook() SWIG 立即抛
+        # "argument 2 of type HOM_GeometryViewport*"（type check 在 undo
+        # 上下文中行为异常）。截图不改场景数据，移出 undo group 是正确
+        # 语义且修复 H21 兼容。render_node_network 改 NetworkEditor 当前
+        # 路径（UI 状态，非场景数据），同理移出。
+        # "capture_pane_screenshot", "capture_multiple_panes",
+        # "render_node_network",
     })
 
     @contextmanager
