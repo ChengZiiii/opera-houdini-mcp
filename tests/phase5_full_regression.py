@@ -263,9 +263,14 @@ def main():
     print("=" * 70)
 
     # 加载 capture_paths 模块用于直接调用 default_capture_path / failed_capture_path
+    # 修复 F1：原先用硬编码 host-specific 绝对路径加载 _capture_paths.py，
+    # 违反 fork 跨主机可移植约束；改为相对本文件所在目录的 _capture_paths.py（与 phase4_e2e.py 一致）：
     from importlib.util import spec_from_file_location, module_from_spec
-    cap_spec = spec_from_file_location("_cap",
-        r"C:\Users\chengsongren\Documents\HoudiniLibs\CsrLib-Houdini\external\houdinimcp\_capture_paths.py")
+    cap_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "_capture_paths.py",
+    )
+    cap_spec = spec_from_file_location("_cap", cap_path)
     cap_mod = module_from_spec(cap_spec)
     cap_spec.loader.exec_module(cap_mod)
 
