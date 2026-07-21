@@ -19,6 +19,7 @@ requests-html）。
 from html.parser import HTMLParser
 import socket
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -186,7 +187,16 @@ def get_houdini_help(help_type, item_name, timeout=_DEFAULT_TIMEOUT):
                 help_type, sorted(HELP_TYPE_URLS.keys())))
 
     base_url = HELP_TYPE_URLS[help_type]
-    url = base_url + item_name
+    # A6 (H21 compat audit): percent-encode item_name before concatenation.
+    # Raw spaces / special chars in item_name (e.g. "box SOP size param"
+    # or nested namespaces like "hou.Node.setPosition") cause
+    # `urllib.request.urlopen` to raise
+    # `ValueError: URL can't contain control characters`, which is NOT
+    # caught by the URLError/HTTPError/socket.timeout handlers below and
+    # would surface as a generic error to the MCP bridge.
+    # safe="" encodes ALL reserved chars (incl. "/") so nested namespaces
+    # round-trip safely.
+    url = base_url + urllib.parse.quote(item_name, safe="")
     req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
 
     try:

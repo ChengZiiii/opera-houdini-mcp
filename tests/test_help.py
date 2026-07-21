@@ -25,6 +25,7 @@ Tests cover (>= 30):
         - mock timeout -> error status
         - unknown help_type -> error status
         - URL is HELP_TYPE_URLS[help_type] + item_name
+        - URL is percent-encoded when item_name has spaces (A6 H21 audit)
         - User-Agent header is set
         - bytes HTML (non-utf8) decoded with errors=replace
         - _response_size = len(html_bytes)
@@ -436,6 +437,48 @@ class GetHoudiniHelpTests(unittest.TestCase):
         self.assertEqual(
             result["url"],
             "https://www.sidefx.com/docs/houdini/nodes/sop/grid")
+
+    def test_get_houdini_help_url_encodes_special_chars(self):
+        """A6 (URL encode, H21 compat audit): item_name with spaces / special
+        chars MUST be percent-encoded before being appended to the SideFX
+        doc URL.
+
+        Pre-fix `url = base_url + item_name` produced a URL containing raw
+        spaces, which (a) violates RFC 3986 and (b) caused
+        `urllib.request.urlopen` to raise
+        `ValueError: URL can't contain control characters` whenever the
+        bridge was not mocked — the ValueError was NOT caught by the
+        existing URLError/HTTPError/socket.timeout handlers and surfaced
+        as a generic error to the MCP bridge.
+
+        With urlopen mocked here we verify encoding at the Request layer:
+        the URL echoed in the response envelope AND the URL actually
+        passed to `urllib.request.Request` must both carry the encoded
+        form `box%20SOP%20size%20param` (not raw spaces).
+        """
+        err_mod = __import__("urllib.error", fromlist=["HTTPError"])
+        with mock.patch("urllib.request.urlopen") as mu:
+            mu.side_effect = err_mod.HTTPError(
+                url="x", code=404, msg="Not Found", hdrs=None, fp=None)
+            result = self.mod.get_houdini_help("sop", "box SOP size param")
+
+        # No ValueError raised — get_houdini_help returns a dict envelope.
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["status"], "error")
+        self.assertIn("404", result["error"])
+        self.assertEqual(result["status_code"], 404)
+
+        # The echoed url field must carry the ENCODED form (no raw spaces).
+        self.assertIn("box%20SOP%20size%20param", result["url"])
+        last_segment = result["url"].rsplit("/", 1)[-1]
+        self.assertNotIn(" ", last_segment)
+
+        # The URL actually handed to urllib.request.Request must be encoded.
+        called_req = mu.call_args[0][0]
+        called_url = (called_req.full_url
+                      if hasattr(called_req, "full_url") else called_req)
+        self.assertIn("box%20SOP%20size%20param", called_url)
+        self.assertNotIn(" ", called_url.rsplit("/", 1)[-1])
 
 
 # ===========================================================================
