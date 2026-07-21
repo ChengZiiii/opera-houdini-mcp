@@ -812,6 +812,23 @@ class HoudiniMCPServer:
         """Wire from_path's output into to_path's input."""
         src = self._resolve_node(from_path)
         dst = self._resolve_node(to_path)
+        # F-C fix: OBJ-display cross-parent wiring (SOP descendant → OBJ
+        # container). Houdini's OBJ Node accepts any SOP descendant as a
+        # display input via its own setInput() (which differs from the
+        # same-parent 3-arg signature). Detect this case via path-prefix
+        # and route to dst.setInput(input_index, src); pure cross-network
+        # SOP/SOP or OBJ/OBJ pairings still fall through to the raise.
+        src_path = src.path() or ""
+        dst_path = dst.path() or ""
+        if src_path.startswith(dst_path + "/"):
+            dst.setInput(input_index, src)
+            return {
+                "from": src_path,
+                "to": dst_path,
+                "input_index": input_index,
+                "output_index": output_index,
+                "_cross_parent": True,
+            }
         if src.parent() != dst.parent():
             raise ValueError(
                 f"Nodes must share a parent network: {src.parent().path()} != {dst.parent().path()}"

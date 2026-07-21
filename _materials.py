@@ -27,7 +27,11 @@ from . import _common as cmn
 MATERIAL_PARM_WHITELIST = (
     # basecolor / albedo
     "basecolor", "basecolor_useTexture", "basecolor_texture",
+    # H21+ principledshader 2.0 basecolor multi-parm sub-keys
+    "basecolorr", "basecolorg", "basecolorb",
     "diffuse", "diffuse_useTexture", "diffuse_texture",
+    # H21+ diffuse multi-parm sub-keys (mtlx alias)
+    "diffuser", "diffuseg", "diffuseb",
     # roughness
     "rough", "rough_useTexture", "rough_texture", "roughness",
     # metallic / reflectivity
@@ -42,6 +46,8 @@ MATERIAL_PARM_WHITELIST = (
     # emissive
     "emit", "emitcolor", "emitcolor_useTexture", "emitcolor_texture",
     "emitColor", "emitIntensity",
+    # H21+ emitcolor multi-parm sub-keys
+    "emitcolorr", "emitcolorg", "emitcolorb",
     # opacity
     "alpha", "alphaclip", "opacity", "opacity_useTexture",
     "opacity_texture", "transparency", "transparency_useTexture",
@@ -52,15 +58,23 @@ MATERIAL_PARM_WHITELIST = (
     # sheen
     "sheen", "sheen_useTexture", "sheen_color", "sheen_texture",
     "sheen_roughness", "sheen_opacity",
+    # H21+ sheen_color multi-parm sub-keys
+    "sheenr", "sheeng", "sheenb",
     # coat
     "coat", "coat_useTexture", "coat_color", "coat_roughness",
     "coat_texture", "coatRough_useTexture", "coatRough_texture",
+    # H21+ coat_color multi-parm sub-keys
+    "coat_colorr", "coat_colorg", "coat_colorb",
     # anisotropy
     "anisotropic", "anisotropic_useTexture", "anisotropy_texture",
     "anisotropicdirection", "anisoangle",
     # SSS / scattering
     "sss", "sss_useTexture", "sss_color", "sss_texture",
     "scattering", "scattering_color", "scattering_texture",
+    # H21+ sss_color multi-parm sub-keys
+    "sssr", "sssg", "sssb",
+    # H21+ scattering_color multi-parm sub-keys
+    "scattering_colorr", "scattering_colorg", "scattering_colorb",
     # utility
     "ambient", "shadowMask", "dispBoundingBox",
 )

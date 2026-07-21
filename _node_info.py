@@ -138,7 +138,9 @@ def get_node_info(hou, node_path, include_errors=True, force_cook=False,
         "parameters": _collect_parameters(node),
         "cook_state": _cook_state(hou, node),
         "needs_to_cook": node.needsToCook(),
-        "is_cooking": node.isCooking(),
+        "is_cooking": (
+            node.isCooking() if hasattr(node, "isCooking") else None
+        ),
     }
 
     if include_input_details:
