@@ -105,13 +105,15 @@ class DefaultCapturePathTest(unittest.TestCase):
         try:
             now = time.mktime(time.strptime("2026-07-21 14:30:45",
                                              "%Y-%m-%d %H:%M:%S"))
-            # resolve_base_dir 会在 fallback 下加 houdini_mcp 子目录，
-            # 所以预期 BASE = tmp/houdini_mcp
+            # Bug 3 修复后契约变更（2026-07-21）：caller 传 fallback_base 时
+            # 必须传已拼好 houdini_mcp 的完整 BASE；不再由 resolve_base_dir
+            # 二次拼接 houdini_mcp（避免 /<x>/houdini_mcp/houdini_mcp 双层）。
+            # 见 test_capture_paths_h22.py::test_default_capture_path_with_fallback_base_no_double_houdini_mcp
             base = os.path.join(tmp, "houdini_mcp")
             path = self.cp.default_capture_path(
                 hou=None, pane_type="SceneViewer", engine="flipbook",
                 scene_basename="test.hip", frame=5, now=now,
-                fallback_base=tmp)
+                fallback_base=base)
             # 路径组件检查
             self.assertTrue(path.startswith(base),
                 "路径必须以 <BASE>/houdini_mcp 开头，实际: " + path)

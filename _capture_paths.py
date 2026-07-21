@@ -38,23 +38,42 @@ def _now_ts(now):
 def resolve_base_dir(hou=None, fallback=None):
     """解析截图基础目录。
 
-    优先 hou.expandString('$TEMP')；无 hou 或失败时回退 fallback（默认
-    os.environ['TEMP'] 或 /tmp）。
+    H22/H21/H20 三态 fallback chain（H22 → H21 → H20 → 无 hou）：
+      1. hou.text.expandString("$TEMP")  — H22+ 推荐
+         （SideFX 文档：hou.text 模块 H22 引入，替代 hou.expandString）
+      2. hou.expandString("$TEMP")       — H21 fallback（H22 已 deprecated）
+         （SideFX 文档 hou.expandString：
+          "This method is deprecated in favor of hou.text.expandString."）
+      3. hou.text / hou.expandString 均不可用 → os.environ 兜底
+         （H20 / 测试环境 / hou 未加载场景）
 
     Args:
-        hou: hou 模块（注入）。可为 None。
-        fallback: hou 不可用时的回退路径，默认 None → 自动选
-                  os.environ.get('TEMP') or os.environ.get('TMP') or '/tmp'。
+        hou: hou 模块（注入）。可为 None（测试或 hou 未加载）。
+        fallback: hou 不可用时的回退路径；默认 None → 自动选
+                  os.environ.get("TEMP") or "TMP" or "/tmp"。
 
     Returns:
         str: 基础目录路径。默认 `<TEMP>/houdini_mcp`。
     """
     base = None
-    if hou is not None and hasattr(hou, "expandString"):
-        try:
-            base = hou.expandString("$TEMP")
-        except Exception:
-            base = None
+    if hou is not None:
+        # H22+ 优先 hou.text.expandString（SideFX 文档推荐）
+        if hasattr(hou, "text") and hasattr(hou.text, "expandString"):
+            try:
+                _t = hou.text.expandString("$TEMP")
+                if _t:
+                    base = _t
+            except Exception:
+                base = None
+        # H21 / H22 兼容：fallback hou.expandString（顶层；H22 已 deprecated
+        # 但仍可用；H20 仅有此 API）
+        if base is None and hasattr(hou, "expandString"):
+            try:
+                _t = hou.expandString("$TEMP")
+                if _t:
+                    base = _t
+            except Exception:
+                base = None
     if not base:
         if fallback is None:
             fallback = (os.environ.get("TEMP")
@@ -85,13 +104,20 @@ def default_capture_path(hou=None, pane_type="unknown", engine="capture",
         scene_basename: 场景文件名（去后缀）。默认 "untitled"。
         frame: 当前帧号。默认 1。
         now: mock 时间戳（unix）。None 用 wall clock。
-        fallback_base: 测试用，绕过 hou.expandString 直接指定 BASE。
+        fallback_base: 调用方已拼好完整 BASE 的路径（含 houdini_mcp 子目录）。
+            传 None 时走 resolve_base_dir（仍拼一次 houdini_mcp）。
 
     Returns:
         str: 落盘绝对路径（含 .png 扩展名）。目录会被自动创建。
     """
     now_ts = _now_ts(now)
-    base = resolve_base_dir(hou=hou, fallback=fallback_base)
+    # caller 显式传 fallback_base 时信任 caller（caller 已拼 houdini_mcp）；
+    # 不调 resolve_base_dir，避免重复拼 "houdini_mcp" 造成
+    # "<tmp>/houdini_mcp/houdini_mcp/<date>/..." 的双层目录。
+    if fallback_base is not None:
+        base = fallback_base
+    else:
+        base = resolve_base_dir(hou=hou, fallback=None)
     date_dir = _date_subdir(now_ts)
     full_dir = os.path.join(base, date_dir)
     os.makedirs(full_dir, exist_ok=True)
@@ -114,7 +140,12 @@ def failed_capture_path(hou=None, pane_type="unknown", engine="capture",
                         fallback_base=None):
     """生成失败截图落盘路径（failed/ 子目录）。详见 default_capture_path。"""
     now_ts = _now_ts(now)
-    base = resolve_base_dir(hou=hou, fallback=fallback_base)
+    # 同 default_capture_path：caller 传 fallback_base 时信任 caller，
+    # 不再走 resolve_base_dir 重复拼 houdini_mcp。
+    if fallback_base is not None:
+        base = fallback_base
+    else:
+        base = resolve_base_dir(hou=hou, fallback=None)
     date_dir = _date_subdir(now_ts)
     full_dir = os.path.join(base, date_dir, "failed")
     os.makedirs(full_dir, exist_ok=True)
