@@ -255,6 +255,7 @@ class HoudiniMCPServer:
             "save_scene": self.save_scene,
             "load_scene": self.load_scene,
             "new_scene": self.new_scene,
+            "serialize_scene": self.serialize_scene,
             "create_node": self.create_node,
             "modify_node": self.modify_node,
             "delete_node": self.delete_node,
@@ -444,6 +445,16 @@ class HoudiniMCPServer:
     def new_scene(self):
         """PR 5: 新建空白场景（suppress_save_prompt=True）；自动调用 invalidate_all_caches()。"""
         return scn.new_scene(hou)
+
+    def serialize_scene(self, root_path="/obj", include_params=False, max_depth=10):
+        """PR 5: 递归序列化 root_path 下的节点树为 dict。
+
+        thin wrapper to scn.serialize_scene（spec `Scenario: serialize_scene`）。
+        不在 MUTATING_COMMANDS 内（只读，AI 用于场景结构对比 / 文档生成）。
+        """
+        return scn.serialize_scene(hou, root_path=root_path,
+                                   include_params=include_params,
+                                   max_depth=max_depth)
 
     def list_node_types(self, category=None, name_filter=None, limit=50, cursor=None):
         """PR 6: 列出 Houdini 节点类型（paginated）。thin wrapper to disc.list_node_types."""

@@ -779,6 +779,23 @@ def new_scene(ctx: Context) -> str:
     return _houdini_call("new_scene", {})
 
 
+@mcp.tool()
+def serialize_scene(ctx: Context, root_path: str = "/obj",
+                    include_params: bool = False,
+                    max_depth: int = 10) -> str:
+    """递归序列化 root_path 下的节点树为 dict。
+
+    只读操作，AI 用于场景结构对比 / 文档生成。
+    include_params=False 时每节点只含 path/type/name/children；
+    True 时增加 parameters dict。
+    """
+    return _houdini_call("serialize_scene", {
+        "root_path": root_path,
+        "include_params": include_params,
+        "max_depth": max_depth,
+    })
+
+
 # -------------------------------------------------------------------
 # PR 6: Node Discovery & Cache Management Tools
 # -------------------------------------------------------------------
