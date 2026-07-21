@@ -1,22 +1,33 @@
 # opera-houdini-mcp · Houdini MCP 的 Opera Fork
 
-> 本仓库是 [`capoomgit/houdini-mcp`](https://github.com/capoomgit/houdini-mcp) 的独立 fork，面向 [CsrLib-Houdini](https://github.com/ChengZiiii/CsrLib-Houdini) 的生产使用。MIT 协议完整保留，Capoom 2025 原版权声明与致谢保留在最末。
+> 本仓库是 [`capoomgit/houdini-mcp`](https://github.com/capoomgit/houdini-mcp) 的独立 fork，作为可嵌入任意项目的 git submodule 使用。MIT 协议完整保留，Capoom 2025 原版权声明与致谢保留在最末。
 >
 > 上游基线：`capoomgit/houdini-mcp` @ `de4fd93`（2026-07-17 同步）。
-> 同步策略：以 cherry-pick 为主，禁止 merge（避免污染 opera 自己的提交图）。
+> 同步策略：以 cherry-pick 为主，禁止 merge（保持 opera 自身的提交图干净可审计）。
 
 ---
 
-## 关于本 Fork
+## Why opera-houdini-mcp exists
 
-`opera-houdini-mcp` 是为 [CsrLib-Houdini](https://github.com/ChengZiiii/CsrLib-Houdini) 工作流量身定制的 Houdini MCP 服务端。它在功能上与上游完全兼容，但额外提供：
+`opera-houdini-mcp` 是 `capoomgit/houdini-mcp` 的独立增强 fork，专注 Tier 1 工具集与代码执行安全。它在功能上与上游完全兼容，但额外提供：
 
 - **Tier 1 工具集**（13 个独立模块，详见 `Tier 1 工具清单`）：
   场景 CRUD、节点发现、图编辑增强、`get_node_info` 增强、材质、几何摘要、错误节点扫描（含 warnings）、`execute_code` 安全护栏、pane 截图与 base64 渲染、SideFX 在线文档查询、连接诊断、缓存管理、基础设施（`_common.py`）。
 - **execute_code 安全模型**：三档 policy（read-only / normal / privileged）+ dangerous / heavy / mutation 三套模式黑名单（正则 + AST 别名双检）+ 双开关 bypass（请求端 `allow_dangerous` 配服务端环境变量 `HOUDINI_MCP_ALLOW_BYPASS`）+ 结构化 audit。
 - **零新增 pip 依赖**：`get_houdini_help` 用 stdlib `html.parser` 替代 `beautifulsoup4`，仍然保持 `mcp[cli]==1.12.2 + requests + python-dotenv` 三件套。
 
-老用户升级路径：在 CsrLib-Houdini 仓库根目录执行 `git submodule update --remote external/houdinimcp && git submodule sync`，无需重装 env、无需改动 AI 工具 JSON。
+For the full change history see `CHANGELOG.md`.
+
+### Upgrading a submodule consumer
+
+If you consume this fork as a git submodule in your project, bump it with the canonical submodule flow:
+
+```bash
+git submodule update --remote <submodule-path>
+git submodule sync
+```
+
+无需重装 env（每个第三方工具的运行环境独立放在 `external/<工具名>-env/` 下，与 `<工具名>/` 源码完全解耦，互不影响）。
 
 ---
 
@@ -38,6 +49,7 @@
 7. [execute_code 安全模型](#execute_code-安全模型)
 8. [Troubleshooting](#troubleshooting)
 9. [Acknowledgement](#acknowledgement)
+10. [Embedding in your project](#embedding-in-your-project)
 
 ---
 
@@ -231,7 +243,30 @@ OPUS integration is optional — without a key the server still starts, only the
 
 Houdini-MCP was built following [blender-mcp](https://github.com/ahujasid/blender-mcp). We thank them for the contribution.
 
-opera-houdini-mcp 是 [capoomgit/houdini-mcp](https://github.com/capoomgit/houdini-mcp) 的独立 fork，遵循 MIT 协议，原版权归 Capoom 2025 所有。本 fork 在 [CsrLib-Houdini](https://github.com/ChengZiiii/CsrLib-Houdini) 工作流下使用，提交通过 cherry-pick 而非 merge 同步上游。
+opera-houdini-mcp 是 [capoomgit/houdini-mcp](https://github.com/capoomgit/houdini-mcp) 的独立 fork，遵循 MIT 协议，原版权归 Capoom 2025 所有。提交通过 cherry-pick 而非 merge 同步上游。
+
+---
+
+## Embedding in your project
+
+opera-houdini-mcp is designed to live inside another project as a git submodule. The canonical wiring is:
+
+```bash
+# 从你的项目根目录执行
+git submodule add <opera-houdini-mcp-url> external/houdinimcp
+git submodule update --init --recursive
+```
+
+之后在你的项目里就可以直接 import 包（前提是把 `external/` 加进 `sys.path`）：
+
+```python
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "external"))
+
+from houdinimcp import start_server, is_server_running
+```
+
+每个第三方工具的运行环境独立放在 `external/<工具名>-env/` 下（内含 `python/` 与 `pylibs/`），与 `<工具名>/` 源码完全解耦。这样未来新增其他第三方工具时，各自环境互不冲突。
 
 ---
 

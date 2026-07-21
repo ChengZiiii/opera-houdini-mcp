@@ -8,6 +8,31 @@
 
 > 本节列出计划合入的 13 个 Tier 1 模块。每次合入时把该子项从「计划中」移到下方「已合入」对应版本块。
 
+### Fork rebrand (option B 全面重塑)
+
+`opera-houdinimcp-rebrand-and-e2e-demo` change 的 rebrand 部分落地。Fork 不再绑定具体宿主仓库，作为可嵌入任意项目的 git submodule 独立存在。
+
+- **README 重塑（option B full rebrand）**：
+  - 删除「关于本 Fork」/「老用户升级路径」/「Acknowledgement」三个章节中对宿主仓库（CsrLib-Houdini）的指代与 GitHub 链接；
+  - 「关于本 Fork」改名为「Why opera-houdini-mcp exists」，定位为对上游 `capoomgit/houdini-mcp` 的独立增强 fork；
+  - 「老用户升级路径」改名为「Upgrading a submodule consumer」，给通用 `git submodule update --remote` 片段，不指代任何宿主；
+  - 新增「Embedding in your project」章节：canonical submodule wiring + `__init__.py` import note，nest-aware 但不指代宿主；
+  - 保留 Capoom 2025 + blender-mcp 的 Attribution；
+  - TOC 与新增章节对齐。
+- **Install / UI 重塑**（`scripts/python/Soren/mcp_control.py`，宿主侧）：
+  - `_info()` 弹窗标题 `Houdini-MCP` → `Opera Houdini MCP`；
+  - `_print_ai_tool_config()` 提示语以 `Opera Houdini MCP 安装完成` 开头；
+  - `_install_embedded_python()` `_pth` 追加注释 `# Opera Houdini MCP 依赖目录`；
+  - `_patch_mcp_win32_imports()` marker `# CsrLib-patched: win32 容错导入` → `# opera-houdini-mcp-patched: win32 容错导入`，对应 `_progress()` 日志字符串同步；
+  - 模块 header docstring 重写为通用 submodule 消费者使用说明，去掉 CsrLib-Houdini 特定路径/升级提示。
+- **Toolbar 按钮重塑**（`toolbar/default.shelf`，宿主侧，design.md §7 Option B）：
+  - `MCPInstall` label → `Opera Houdini MCP Install`；
+  - `MCPStart` label → `Start Opera MCP`；
+  - `MCPStop` label → `Stop Opera MCP`；
+  - 三按钮 `<script>` body 保持不变（仍调用 `mcp_control.install()` / `start()` / `stop()`）。
+- **不变量保留**：submodule 路径 `external/houdinimcp/`、TCP `127.0.0.1:9876`、MCP JSON 键（`mcpServers.houdini` / `mcp.houdini` / `mcp_servers.houdini`）一字不动，老用户 AI 工具配置零改动。
+- **变更下游影响**：消费者升级后，Houdini 内 shelf 上点 Install/Start/Stop 按钮的标签变为 Opera 品牌；弹窗标题与提示语同步；运行环境的 `pylibs/mcp/os/win32/utilities.py` 里 marker grep 字符串由 `CsrLib-patched` 改为 `opera-houdini-mcp-patched`（已有 marker 不会自动迁移——若 env 目录里留有旧 marker 文本，下次 Install 会重写为新 marker，因为代码里读的是固定字符串常量）。
+
 ### 计划中（按 PR 顺序）
 
 - [ ] PR 3 — `_common.py` 基础设施（handle_connection_errors / validate_resolution / apply_response_cap / DANGEROUS_PATTERNS / HEAVY_GEOMETRY_PATTERNS / MUTATION_PATTERNS / _detect_dangerous_code / _detect_heavy_geometry_code / _detect_import_hou / _truncate_output / paginate_list / _json_safe_hou_value / _flatten_parm_templates / ExecutionTimeoutError）
