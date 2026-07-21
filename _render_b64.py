@@ -71,6 +71,11 @@ def _grab_viewport_image(hou, width, height):
 
     真正的 Houdini 内实现走 ``hou.ui.paneTabOfType(SceneViewer).curViewport()
     .saveImage(...)``，此处只暴露接口签名供单测 monkey-patch。
+
+    B4 (opera-houdinimcp-h21-compat-audit) 注意：H21 上
+    ``hou.GeometryViewport.saveImage`` 已移除，本函数在 H21 上必返 None；
+    ``render_viewport`` 在调用本函数前先用 ``_saveimage_available`` 检测，
+    False 时直接走 ``_grab_viewport_via_pane_capture`` 降级路径。
     """
     qimg_cls = _ensure_qimage()
     if qimg_cls is None:
@@ -85,6 +90,12 @@ def _grab_viewport_image(hou, width, height):
         vp = pane.curViewport()
         if vp is None:
             return None
+        # B4 防御：如果 vp 真的没 saveImage（H21），不要进入下面 try 块
+        # 让 AttributeError 被吞；render_viewport 应已通过 _saveimage_available
+        # 提前分流。这里做一道兜底 has type 检查，避免 silent None。
+        if not hasattr(type(vp), "saveImage") and not callable(
+                getattr(vp, "saveImage", None)):
+            return None
         buf = io.BytesIO()
         vp.saveImage(buf, width, height)
         data = buf.getvalue()
@@ -95,6 +106,138 @@ def _grab_viewport_image(hou, width, height):
     img = qimg_cls()
     img.loadFromData(data, "PNG")
     return img
+
+
+def _saveimage_available(hou):
+    """检测当前 SceneViewer viewport 是否有 ``saveImage`` 方法。
+
+    H21+ ``hou.GeometryViewport.saveImage`` 已移除（SideFX H22 文档 +
+    live-verified ``dir(hou.GeometryViewport)`` 列表确认）。本函数让
+    ``render_viewport`` 在 H21 上**主动降级**到 ``_pane_capture`` 路径，
+    而不是依赖 ``_grab_viewport_image`` 内的 broad except 把
+    ``AttributeError`` 静默吞成 None。
+
+    Returns:
+        True  -- saveImage 可用，**或无法判断**（测试 mock 无 .ui 时保旧行为）。
+        False -- 确认当前 viewport 的 type 上无 saveImage 方法（H21+）。
+
+    决策依据：spec ``_render_b64 saveImage fallback`` Scenario
+    "render_viewport_base64 on H21 (saveImage absent)"。探测语义跟
+    design.md D5 一致：``hasattr(type(vp), "saveImage")``。
+    """
+    try:
+        if not hasattr(hou, "ui"):
+            # 测试 mock / 无 UI 环境 -> 保旧行为（让 _grab_viewport_image
+            # 走 monkey-patched 成功路径，或自己返 None）。
+            return True
+        pane_type_enum = getattr(hou.paneTabType, "SceneViewer", None)
+        if pane_type_enum is None:
+            return True
+        pane = hou.ui.paneTabOfType(pane_type_enum)
+        if pane is None or not hasattr(pane, "curViewport"):
+            return True
+        vp = pane.curViewport()
+        if vp is None:
+            return True
+        # type(vp) 上的 saveImage 属性检查（H21 真实 GeometryViewport class
+        # 上无此属性；老 Houdini 上有）。
+        return hasattr(type(vp), "saveImage") or callable(
+            getattr(vp, "saveImage", None))
+    except Exception:
+        # 探测本身出错 -> 不强制降级，保旧路径
+        return True
+
+
+def _grab_viewport_via_pane_capture(hou, width, height, fmt):
+    """H21+ saveImage 缺失时的降级渲染路径（B4）。
+
+    复用 ``_pane_capture.capture_pane_screenshot`` 已在 H21 验证可工作的
+    SceneViewer 截图路径（内部走 flipbook，user 实机验证不依赖 OGL 3.3），
+    把 PNG 读回 bytes → base64 编码，返回 envelope 标 ``_renderer=
+    "qscreen_fallback"``。
+
+    Args:
+        hou: hou 模块或 stub。
+        width: 期望宽度（_pane_capture 实际宽度由 flipbook 决定，此处仅
+            作为 fallback 元数据）。
+        height: 期望高度。
+        fmt: ``PNG`` / ``JPEG``（决定扩展名 + base64 解码后期校验）。
+
+    Returns:
+        dict: ``{image_base64, size_bytes, width, height, _renderer}``，
+        ``_renderer`` 恒为 ``"qscreen_fallback"``（标 saveImage 未走）。
+        ``_pane_capture`` 不可用 / 抛异常 / PNG 读失败时返 None，调用方
+        再降级到既有 ``_warning`` 路径。
+
+    Note:
+        ``_pane_capture`` 用 deferred import，避免顶层依赖（测试环境通常
+        不加载 ``_pane_capture``，且失败不应阻塞模块导入）。
+    """
+    # Deferred import：测试环境可能没装 _pane_capture，prod 环境必然有。
+    try:
+        from . import _pane_capture as _pc
+    except Exception:
+        return None
+
+    fmt_str = "JPEG" if str(fmt).upper() == "JPEG" else "PNG"
+    ext = ".jpg" if fmt_str == "JPEG" else ".png"
+
+    # tempfile.mkstemp 返回 fd + path；fd 立即关闭让 _pane_capture 写入。
+    fd, tmp_path = tempfile.mkstemp(suffix=ext)
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+    actual_path = None
+    try:
+        cap = _pc.capture_pane_screenshot(
+            hou, "SceneViewer", save_path=tmp_path, fit_contents=True)
+    except Exception:
+        cap = None
+
+    if cap is not None:
+        # _pane_capture SceneViewer 路径下 save_path 是 flipbook 实际落盘
+        # 路径（含 $F4 替换帧号），与请求的 tmp_path 不同；Qt grab 路径
+        # 下两者相同。优先用 cap["save_path"] 兜齐两条路径。
+        actual_path = cap.get("save_path") or tmp_path
+
+    data = b""
+    if actual_path:
+        try:
+            with open(actual_path, "rb") as f:
+                data = f.read()
+        except Exception:
+            data = b""
+
+    # 清理：tmp_path（Qt grab 路径） + actual_path（flipbook 路径）。
+    # 两者可能相同也可能不同，分别 try 避免一个失败影响另一个。
+    for p in (tmp_path, actual_path):
+        if not p:
+            continue
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
+
+    if not data:
+        return None
+
+    b64 = base64.b64encode(data).decode("ascii")
+    cap_w = cap.get("width", width) if cap else width
+    cap_h = cap.get("height", height) if cap else height
+    # _pane_capture SceneViewer flipbook 路径下 width/height=0（Houdini 内部
+    # 管线不直接给尺寸），此时用 caller 传入的 resolution 兜底。
+    final_w = cap_w if cap_w else width
+    final_h = cap_h if cap_h else height
+    return {
+        "image_base64": b64,
+        "size_bytes": len(data),
+        "width": final_w,
+        "height": final_h,
+        "_renderer": "qscreen_fallback",
+    }
 
 
 def _resolve_camera_path(camera_path):
@@ -202,6 +345,35 @@ def render_viewport(hou, camera_path=None, geometry_path=None,
                                           camera_path=resolved_camera,
                                           geometry_path=geom_str,
                                           format=format)
+
+    # B4 (opera-houdinimcp-h21-compat-audit)：H21+ saveImage 缺失时降级到
+    # _pane_capture 的 SceneViewer 路径。spec scenario
+    # "render_viewport_base64 on H21 (saveImage absent)" 要求复用
+    # _pane_capture 已验证可工作的截图路径，返回 envelope 带
+    # ``_renderer: "qscreen_fallback"`` 标记；fallback 也失败时落 _warning。
+    if not _saveimage_available(hou):
+        fallback = _grab_viewport_via_pane_capture(hou, width, height, format)
+        if fallback is not None:
+            result = {
+                "image_base64": fallback["image_base64"],
+                "format": format,
+                "width": fallback["width"],
+                "height": fallback["height"],
+                "renderer": norm_renderer,
+                "camera_path": resolved_camera,
+                "geometry_path": geom_str,
+                "size_bytes": fallback["size_bytes"],
+                "_renderer": "qscreen_fallback",
+                "_meta": {"renderer": norm_renderer,
+                          "camera_path": resolved_camera,
+                          "geometry_path": geom_str, "format": format},
+            }
+            return cmn._add_response_metadata(
+                result, renderer=norm_renderer,
+                camera_path=resolved_camera, geometry_path=geom_str,
+                format=format)
+        # fallback 返 None（_pane_capture 不可用 / 抛异常 / PNG 读失败）→
+        # 落到下方既有 _warning 路径（graceful degradation，不崩）。
 
     img = _grab_viewport_image(hou, width, height)
     if img is None:

@@ -458,6 +458,274 @@ class RenderViewportSuccessTests(unittest.TestCase):
 
 
 # ===========================================================================
+# Section C2: H21+ saveImage fallback (B4 / opera-houdinimcp-h21-compat-audit)
+# ===========================================================================
+# H21 hou.GeometryViewport 已移除 saveImage 方法（live-verified: dir() 列表
+# 只有 saveViewToCamera / draw / queryInspectedGeometry 等，无 saveImage）。
+# _render_b64.render_viewport SHALL 检测 saveImage 缺失并降级到
+# _pane_capture.capture_pane_screenshot 的 SceneViewer 路径，把 PNG 读成 bytes
+# 后 base64 编码返回，envelope 标 "_renderer": "qscreen_fallback"。
+class _FakeViewportNoSaveImage(object):
+    """H21 hou.GeometryViewport stub：没有 saveImage 方法。
+
+    列举的方法名参考 SideFX H22 文档（dir(hou.GeometryViewport) live 验证）：
+    saveViewToCamera / draw / queryInspectedGeometry / home 等。
+    """
+
+    def draw(self):
+        pass
+
+    def queryInspectedGeometry(self, *a, **kw):
+        return None
+
+    def saveViewToCamera(self, *a, **kw):
+        return None
+
+    def home(self):
+        pass
+
+
+class _FakeViewportWithSaveImage(_FakeViewportNoSaveImage):
+    """老 Houdini GeometryViewport stub：**有** saveImage 方法。"""
+
+    def __init__(self):
+        self.saveImage_calls = []
+
+    def saveImage(self, buf, width, height):
+        self.saveImage_calls.append((width, height))
+        # 写一个最小 PNG 头让生产代码能 loadFromData 解码
+        buf.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 40)
+
+
+class _FakeSceneViewerPane(object):
+    """hou.ui.paneTabOfType(SceneViewer) stub。"""
+
+    def __init__(self, vp):
+        self._vp = vp
+
+    def curViewport(self):
+        return self._vp
+
+
+class _FakeHouUI(object):
+    def __init__(self, pane):
+        self._pane = pane
+
+    def paneTabOfType(self, pane_type_enum):
+        return self._pane
+
+
+class _FakeHouPaneTabType(object):
+    SceneViewer = "SceneViewer_enum"
+
+
+class _FakeHouWithUI(object):
+    """hou stub 带 .ui / .paneTabType / .hipFile，用于 saveImage 探测。"""
+
+    def __init__(self, vp):
+        self.hipFile = object()
+        self.ui = _FakeHouUI(_FakeSceneViewerPane(vp))
+        self.paneTabType = _FakeHouPaneTabType()
+
+
+def _install_fake_pane_capture_module(capture_result=None, capture_raises=None,
+                                      write_png_bytes=None):
+    """安装 stub houdinimcp._pane_capture 模块供 fallback 测试使用。
+
+    stub 的 capture_pane_screenshot 把真实 PNG（或自定义 bytes）写到请求的
+    save_path，让生产代码能读回并 base64 编码。返回 stub 模块，便于断言。
+    """
+    fake_pc = types.ModuleType("houdinimcp._pane_capture")
+    fake_pc.calls = []
+
+    def fake_capture_pane_screenshot(hou, pane_type_name, save_path=None,
+                                     fit_contents=True):
+        fake_pc.calls.append({
+            "pane_type_name": pane_type_name,
+            "save_path": save_path,
+            "fit_contents": fit_contents,
+        })
+        if capture_raises is not None:
+            raise capture_raises
+        png_bytes = write_png_bytes if write_png_bytes is not None else (
+            b"\x89PNG\r\n\x1a\n" + b"\x00" * 50)
+        if save_path is not None:
+            with open(save_path, "wb") as f:
+                f.write(png_bytes)
+        return capture_result if capture_result is not None else {
+            "pane_type": pane_type_name,
+            "save_path": save_path,
+            "width": 320,
+            "height": 240,
+            "size_bytes": len(png_bytes),
+            "_qt_backend": "PySide6",
+            "_renderer": "flipbook_via_Houdini_internal",
+        }
+
+    fake_pc.capture_pane_screenshot = fake_capture_pane_screenshot
+    sys.modules["houdinimcp._pane_capture"] = fake_pc
+    return fake_pc
+
+
+def _uninstall_fake_pane_capture_module():
+    sys.modules.pop("houdinimcp._pane_capture", None)
+
+
+class SaveImageAvailableTests(unittest.TestCase):
+    """_saveimage_available helper 单测（B4 H21 compat）。"""
+
+    def setUp(self):
+        self.mod, _ = _load_render_b64_fresh()
+
+    def test_returns_true_when_no_ui(self):
+        """测试 mock / 无 .ui → True（保旧行为，不误触发 fallback）。"""
+        hou = _FakeHou(has_hipfile=True)  # 无 .ui 属性
+        self.assertTrue(self.mod._saveimage_available(hou))
+
+    def test_returns_true_when_ui_but_no_pane(self):
+        class _Hou(object):
+            hipFile = object()
+
+            class _UI(object):
+                def paneTabOfType(self, t):
+                    return None
+            ui = _UI()
+
+            class _PT(object):
+                SceneViewer = "x"
+            paneTabType = _PT()
+        # 无 pane → True（让 _grab_viewport_image 处理 None 路径）
+        self.assertTrue(self.mod._saveimage_available(_Hou()))
+
+    def test_returns_false_when_vp_lacks_saveImage(self):
+        """H21 vp 无 saveImage → False（应触发 fallback）。"""
+        vp = _FakeViewportNoSaveImage()
+        hou = _FakeHouWithUI(vp)
+        self.assertFalse(self.mod._saveimage_available(hou))
+
+    def test_returns_true_when_vp_has_saveImage(self):
+        """老 Houdini vp 有 saveImage → True（保旧路径）。"""
+        vp = _FakeViewportWithSaveImage()
+        hou = _FakeHouWithUI(vp)
+        self.assertTrue(self.mod._saveimage_available(hou))
+
+
+class GrabViewportViaPaneCaptureTests(unittest.TestCase):
+    """_grab_viewport_via_pane_capture helper 单测。"""
+
+    def setUp(self):
+        self.mod, _ = _load_render_b64_fresh()
+
+    def test_reads_png_and_encodes_to_base64(self):
+        """helper 把 _pane_capture 写的 PNG 读回 → base64，标 qscreen_fallback。"""
+        png_payload = b"\x89PNG\r\n\x1a\n" + b"abc" * 10
+        _install_fake_pane_capture_module(write_png_bytes=png_payload)
+        try:
+            hou = _FakeHou(has_hipfile=True)
+            result = self.mod._grab_viewport_via_pane_capture(
+                hou, 640, 480, "PNG")
+            self.assertIsNotNone(result)
+            self.assertEqual(result["_renderer"], "qscreen_fallback")
+            decoded = base64.b64decode(result["image_base64"])
+            self.assertEqual(decoded, png_payload)
+            self.assertEqual(result["size_bytes"], len(png_payload))
+        finally:
+            _uninstall_fake_pane_capture_module()
+
+    def test_returns_none_when_pane_capture_raises(self):
+        """_pane_capture 抛异常时 helper 返 None（让上层降级 _warning）。"""
+        _install_fake_pane_capture_module(
+            capture_raises=RuntimeError("SceneViewer missing"))
+        try:
+            hou = _FakeHou(has_hipfile=True)
+            result = self.mod._grab_viewport_via_pane_capture(
+                hou, 640, 480, "PNG")
+            self.assertIsNone(result)
+        finally:
+            _uninstall_fake_pane_capture_module()
+
+    def test_cleans_up_temp_file(self):
+        """helper 必须清理临时 PNG（不泄漏）。"""
+        fake_pc = _install_fake_pane_capture_module()
+        try:
+            hou = _FakeHou(has_hipfile=True)
+            self.mod._grab_viewport_via_pane_capture(hou, 640, 480, "PNG")
+            self.assertEqual(len(fake_pc.calls), 1)
+            save_path = fake_pc.calls[0]["save_path"]
+            self.assertFalse(
+                os.path.exists(save_path),
+                "临时文件必须清理: " + str(save_path))
+        finally:
+            _uninstall_fake_pane_capture_module()
+
+
+class RenderViewportSaveImageFallbackTests(unittest.TestCase):
+    """B4 (H21 compat)：saveImage 缺失时 render_viewport 走 _pane_capture。"""
+
+    def setUp(self):
+        self.mod, _ = _load_render_b64_fresh()
+
+    def test_fallback_path_returns_qscreen_marker(self):
+        """saveImage 缺失 + _pane_capture 成功 → 响应带 _renderer=
+        'qscreen_fallback' + 合法 base64 PNG。"""
+        # 强制 fallback 分支
+        self.mod._saveimage_available = lambda hou: False
+        fake_pc = _install_fake_pane_capture_module()
+        try:
+            hou = _FakeHou(has_hipfile=True)
+            result = self.mod.render_viewport(hou, format="PNG")
+            self.assertNotIn(
+                "_warning", result,
+                "fallback 成功路径不应有 _warning: " + repr(result))
+            self.assertEqual(result.get("_renderer"), "qscreen_fallback")
+            b64 = result.get("image_base64")
+            self.assertIsInstance(b64, str)
+            self.assertGreater(len(b64), 0)
+            decoded = base64.b64decode(b64)
+            self.assertEqual(decoded[:8], b"\x89PNG\r\n\x1a\n")
+            # _pane_capture 必须被调，pane_type_name=SceneViewer
+            self.assertEqual(len(fake_pc.calls), 1)
+            self.assertEqual(fake_pc.calls[0]["pane_type_name"], "SceneViewer")
+            self.assertTrue(fake_pc.calls[0]["fit_contents"])
+        finally:
+            _uninstall_fake_pane_capture_module()
+
+    def test_fallback_returns_warning_when_pane_capture_raises(self):
+        """_pane_capture 抛异常 → render_viewport 优雅降级 _warning，不崩。"""
+        self.mod._saveimage_available = lambda hou: False
+        _install_fake_pane_capture_module(
+            capture_raises=RuntimeError("flipbook failed"))
+        try:
+            hou = _FakeHou(has_hipfile=True)
+            result = self.mod.render_viewport(hou)
+            self.assertIn("_warning", result)
+            # fallback 失败 → 不应有 qscreen_fallback 标记
+            self.assertNotIn("_renderer", result)
+            self.assertEqual(result.get("image_base64"), "")
+        finally:
+            _uninstall_fake_pane_capture_module()
+
+    def test_saveimage_present_does_not_use_fallback(self):
+        """saveImage 存在 → render_viewport 不走 _pane_capture。
+
+        验证：_saveimage_available=True + 不安装 _pane_capture stub +
+        patch _grab_viewport_image 走旧路径。
+        """
+        self.mod._saveimage_available = lambda hou: True
+        captured = _install_fake_pyside_for_render(self.mod)
+        _uninstall_fake_pane_capture_module()  # 确保无 stub 残留
+        hou = _FakeHou(has_hipfile=True)
+        result = self.mod.render_viewport(hou)
+        # 旧路径不应有 _renderer 标记
+        self.assertNotIn(
+            "_renderer", result,
+            "saveImage 路径不应 emit _renderer: " + repr(result))
+        self.assertNotIn("_warning", result)
+        # 确认 _grab_viewport_image 真被调
+        self.assertEqual(len(captured["calls"]), 1)
+
+
+# ===========================================================================
 # Section D: render_quad_views
 # ===========================================================================
 class RenderQuadViewsTests(unittest.TestCase):
