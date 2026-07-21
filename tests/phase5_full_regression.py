@@ -228,26 +228,34 @@ def main():
         size = os.path.getsize(actual_path) if actual_path and os.path.exists(actual_path) else 0
         record("B.4 render_node_network", size > 100, "size={0}B".format(size))
 
-    # B.5 capture_multiple_panes（H21 + NetworkEditor/ParameterEditor → 限制）
+    # B.5 capture_multiple_panes（opera-houdinimcp-h21-compat 修复后：B.2 + B.3 变 PASS，
+    # capture_multiple_panes 走 alias map 后 2 种 pane 都 success=True，PNG 真实落盘）
+    # disclosed deviation：result 是 dict {"results": [list]} 而非 dict 包 dict 包 list
     mp_dir = os.path.join(tempfile.gettempdir(), "houdini_mcp", "phase5_batch")
     os.makedirs(mp_dir, exist_ok=True)
     res = conn.send_command("capture_multiple_panes", {
         "pane_types": ["NetworkEditor", "ParameterEditor"],
         "save_dir": mp_dir,
     })
-    items = res.get("result", [])
+    result = res.get("result", {})
+    items = []
+    if isinstance(result, dict) and "results" in result:
+        items = result["results"] or []
+    elif isinstance(result, list):
+        # 兼容老版本（fix brief 之前）：result 直接是 list
+        items = result
     if isinstance(items, list) and len(items) >= 2:
-        # 期望每条都返 success=False 但带 error 字段（H21 限制）
-        all_reported = all(("success" in item) for item in items)
-        record("B.5 capture_multiple_panes 批量 2 种 [KNOWN_LIMIT H21 qtWidget + 别名]",
-               all_reported, "items=" + str(len(items)) + " all_reported=" + str(all_reported))
-    elif isinstance(items, dict):
-        # 整个调用 fail 也是一个可接受的 failure mode
-        record("B.5 capture_multiple_panes 批量 2 种 [KNOWN_LIMIT H21]",
-               False, "dict_err=" + str(items)[:100])
+        # 修复后期望：2 条都 success=True（B.2 + B.3 变 PASS 后）
+        successes = [item for item in items if item.get("success")]
+        all_ok = len(successes) == len(items)
+        record("B.5 capture_multiple_panes 批量 2 种（H21 修复后全 PASS）",
+               all_ok, "items=" + str(len(items))
+               + " success=" + str(len(successes))
+               + " types=" + str([i.get("pane_type") for i in items]))
     else:
         record("B.5 capture_multiple_panes", False,
-               "items type=" + str(type(items).__name__))
+               "items type=" + str(type(items).__name__)
+               + " keys=" + str(list(result.keys())[:5]) if isinstance(result, dict) else "")
 
     # ====== C. Bug C 验证：temp 目录规范 + cleanup ======
     print("\n" + "=" * 70)
