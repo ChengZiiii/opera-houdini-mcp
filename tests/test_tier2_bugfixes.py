@@ -19,8 +19,9 @@ Covers:
 
     F-C: server.HoudiniMCPServer.connect_nodes cross-parent OBJ-display
         smart branch
-        - SOP child → OBJ parent (cross-parent) routes to dst.setInput
-          (2-arg form) with _cross_parent=True
+        - SOP child → OBJ parent (cross-parent) routes to src.setDisplayFlag
+          + src.setRenderFlag (B2 H21 compat: dst.setInput hangs 30s+ on
+          H21), returns via="sop_display_flag", does NOT call dst.setInput
         - Same-parent connect still uses the legacy 3-arg setInput form
         - Cross-parent non-ancestor (sibling SOPs) still raises ValueError
 
@@ -426,7 +427,7 @@ class F_B_principledshader_v2_readback(unittest.TestCase):
 
 
 # ===========================================================================
-# Section C — F-C: connect_nodes cross-parent OBJ-display smart branch
+# Section C — F-C/B2: connect_nodes cross-parent OBJ-display smart branch
 # ===========================================================================
 class _FC_FakeConnector(object):
     """Mimics hou.NodeConnection for inputConnectors()."""
@@ -449,15 +450,33 @@ class _FC_FakeConnector(object):
 class _FC_FakeNode(object):
     """Minimal graph node stub for F-C. Captures setInput calls so tests
     can assert which signature was used (2-arg cross-parent vs 3-arg
-    same-parent)."""
+    same-parent).
 
-    def __init__(self, name, parent=None):
+    ``kind`` selects which Houdini-role-specific APIs are exposed:
+        - "sop"  → has setDisplayFlag / setRenderFlag (hou.SopNode API)
+        - "obj"  → no SOP-specific APIs (hou.ObjNode container)
+
+    SOP nodes capture setDisplayFlag / setRenderFlag calls in
+    ``set_display_flag_calls`` / ``set_render_flag_calls`` so the B2
+    regression tests can assert the H21 display-flag path was taken
+    instead of dst.setInput.
+    """
+
+    def __init__(self, name, parent=None, kind="obj"):
         self._name = name
         self._parent = parent
         self._path = None
         self._children = []
         self._inputs = {}
         self.set_input_calls = []
+        self.set_display_flag_calls = []
+        self.set_render_flag_calls = []
+        # SOP-kind nodes expose the hou.SopNode display/render flag API.
+        # OBJ-kind (default) nodes do not — mirroring the real hou class
+        # hierarchy where only SopNode has setDisplayFlag.
+        if kind == "sop":
+            self.setDisplayFlag = self._setDisplayFlag
+            self.setRenderFlag = self._setRenderFlag
 
     def name(self):
         return self._name
@@ -474,6 +493,12 @@ class _FC_FakeNode(object):
 
     def children(self):
         return list(self._children)
+
+    def _setDisplayFlag(self, value):
+        self.set_display_flag_calls.append(value)
+
+    def _setRenderFlag(self, value):
+        self.set_render_flag_calls.append(value)
 
     def setInput(self, *args):
         """Capture all call signatures (2-arg cross-parent and
@@ -585,22 +610,26 @@ def _fc_make_server(hou):
 
 
 class F_C_connect_nodes_cross_parent(unittest.TestCase):
-    """F-C: connect_nodes must accept cross-parent SOP child → OBJ parent
-    wiring (OBJ-display mode), preserve same-parent behavior, and still
-    reject cross-network non-ancestor pairings."""
+    """F-C/B2: connect_nodes must accept cross-parent SOP child → OBJ parent
+    wiring via the H21 display-flag path (src.setDisplayFlag +
+    src.setRenderFlag; dst.setInput hangs 30s+ on H21), preserve
+    same-parent behavior, and still reject cross-network non-ancestor
+    pairings."""
 
     def test_cross_parent_sop_child_to_obj_parent_succeeds(self):
-        """Cross-parent SOP child → OBJ parent routes to dst.setInput
-        2-arg form (the OBJ-display API), returns _cross_parent=True."""
+        """Cross-parent SOP child → OBJ parent routes to the B2 H21
+        display-flag path (src.setDisplayFlag(True) + src.setRenderFlag(True)),
+        returns via="sop_display_flag", and does NOT call dst.setInput
+        (which would hang 30s on H21)."""
         hou = _FC_FakeHou()
         # /obj container
         obj_root = _FC_FakeNode("obj")
         hou.add_node("/obj", obj_root)
-        # /obj/table_demo (OBJ container)
+        # /obj/table_demo (OBJ container, default kind="obj")
         obj_container = _FC_FakeNode("table_demo", parent=obj_root)
         hou.add_node("/obj/table_demo", obj_container)
         # /obj/table_demo/wood_grain (SOP child)
-        sop_child = _FC_FakeNode("wood_grain", parent=obj_container)
+        sop_child = _FC_FakeNode("wood_grain", parent=obj_container, kind="sop")
         hou.add_node("/obj/table_demo/wood_grain", sop_child)
 
         server = _fc_make_server(hou)
@@ -608,19 +637,20 @@ class F_C_connect_nodes_cross_parent(unittest.TestCase):
             server, "/obj/table_demo/wood_grain",
             "/obj/table_demo", input_index=0, output_index=0)
 
-        # Result reflects cross-parent path
-        self.assertTrue(result.get("_cross_parent"))
+        # Result reflects B2 display-flag path
+        self.assertEqual(result.get("via"), "sop_display_flag")
         self.assertEqual(result["from"], "/obj/table_demo/wood_grain")
         self.assertEqual(result["to"], "/obj/table_demo")
         self.assertEqual(result["input_index"], 0)
         self.assertEqual(result["output_index"], 0)
-        # OBJ container's setInput was called with the 2-arg cross-parent
-        # signature: (input_index, src) — NOT the 3-arg same-parent form.
-        self.assertEqual(obj_container.set_input_calls, [(0, sop_child)])
+        # SOP display + render flag set on src — NOT dst.setInput
+        self.assertEqual(sop_child.set_display_flag_calls, [True])
+        self.assertEqual(sop_child.set_render_flag_calls, [True])
+        self.assertEqual(obj_container.set_input_calls, [])
 
     def test_cross_parent_deeper_descendant_succeeds(self):
         """Cross-parent with a deeper SOP descendant (through a subnet)
-        also routes to dst.setInput 2-arg form."""
+        also routes to the B2 display-flag path."""
         hou = _FC_FakeHou()
         obj_root = _FC_FakeNode("obj")
         hou.add_node("/obj", obj_root)
@@ -628,7 +658,7 @@ class F_C_connect_nodes_cross_parent(unittest.TestCase):
         hou.add_node("/obj/table_demo", obj_container)
         subnet = _FC_FakeNode("subnet", parent=obj_container)
         hou.add_node("/obj/table_demo/subnet", subnet)
-        leaf_sop = _FC_FakeNode("leaf_sop", parent=subnet)
+        leaf_sop = _FC_FakeNode("leaf_sop", parent=subnet, kind="sop")
         hou.add_node("/obj/table_demo/subnet/leaf_sop", leaf_sop)
 
         server = _fc_make_server(hou)
@@ -636,8 +666,11 @@ class F_C_connect_nodes_cross_parent(unittest.TestCase):
             server, "/obj/table_demo/subnet/leaf_sop",
             "/obj/table_demo", input_index=2, output_index=0)
 
-        self.assertTrue(result.get("_cross_parent"))
-        self.assertEqual(obj_container.set_input_calls, [(2, leaf_sop)])
+        self.assertEqual(result.get("via"), "sop_display_flag")
+        # SOP display + render flag set on src — NOT dst.setInput
+        self.assertEqual(leaf_sop.set_display_flag_calls, [True])
+        self.assertEqual(leaf_sop.set_render_flag_calls, [True])
+        self.assertEqual(obj_container.set_input_calls, [])
 
     def test_same_parent_legacy_path_preserved(self):
         """Same-parent connect still uses the legacy 3-arg setInput

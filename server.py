@@ -880,15 +880,38 @@ class HoudiniMCPServer:
         """Wire from_path's output into to_path's input."""
         src = self._resolve_node(from_path)
         dst = self._resolve_node(to_path)
-        # F-C fix: OBJ-display cross-parent wiring (SOP descendant → OBJ
-        # container). Houdini's OBJ Node accepts any SOP descendant as a
-        # display input via its own setInput() (which differs from the
-        # same-parent 3-arg signature). Detect this case via path-prefix
-        # and route to dst.setInput(input_index, src); pure cross-network
-        # SOP/SOP or OBJ/OBJ pairings still fall through to the raise.
+        # B2 fix (H21 compat): OBJ-display cross-parent wiring (SOP
+        # descendant → OBJ container). On H21, hou.ObjNode.setInput(
+        # 0, sop_descendant) HANGS 30s+ (live-verified via
+        # execute_houdini_code at 30002ms timeout). H21 OBJ containers
+        # do not accept setInput for display wiring; the H21-correct
+        # path is to set the SOP's display + render flag so Houdini
+        # picks it up as the OBJ container's display SOP (pattern
+        # documented in this fork's own _synthesize_ai_hint at lines
+        # ~99-105). Pure cross-network SOP/SOP or OBJ/OBJ pairings
+        # still fall through to the same-parent raise below.
         src_path = src.path() or ""
         dst_path = dst.path() or ""
         if src_path.startswith(dst_path + "/"):
+            # SOP→OBJ: src has setDisplayFlag (hou.SopNode-only API).
+            # Detect via callable getattr to avoid catching class-level
+            # attributes on non-SOP nodes.
+            if callable(getattr(src, "setDisplayFlag", None)):
+                src.setDisplayFlag(True)
+                # setRenderFlag is also SopNode-only; guard older Houdini
+                # / non-SOP edge cases defensively.
+                if callable(getattr(src, "setRenderFlag", None)):
+                    src.setRenderFlag(True)
+                return {
+                    "from": src_path,
+                    "to": dst_path,
+                    "input_index": input_index,
+                    "output_index": output_index,
+                    "via": "sop_display_flag",
+                }
+            # Non-SOP descendant (rare; e.g. OBJ→OBJ container nesting):
+            # fall back to the legacy cross-parent setInput. The H21 hang
+            # only affects the SOP→OBJ case handled above.
             dst.setInput(input_index, src)
             return {
                 "from": src_path,
