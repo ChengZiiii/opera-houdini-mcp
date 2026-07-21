@@ -69,6 +69,27 @@ VALID_PANE_TYPES = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# H21+ hou.paneTabType 重命名兼容 map（Bug 2 / opera-houdinimcp-h21-compat）：
+# 用户传历史名（如 ParameterEditor / ChannelEditorPane）时，先查
+# hou.paneTabType 真实名失败后再查 alias list 找第一个可见实例。
+# 真实名字（如 NetworkEditor / ParmSpreadsheet）始终优先匹配 hou.paneTabType。
+# 依据 SideFX hou.paneTabType H22 文档：ParameterEditor 已移除，真实名是
+# ParmSpreadsheet / Parm / DetailsView；ChannelEditorPane 改名为
+# ChannelEditor（hou.ChannelEditorPane.html 显式标记 Deprecated）；其余
+# 旧 *Pane 尾缀名一并并入新名（不带 Pane 后缀）。alias 仅在 H21+ hou.paneTabType
+# 未保留这些旧名时作为兜底；装了老 plugin 或 H20 时 hou.paneTabType 上仍可能
+# 存在旧名，D5 决策：alias **不覆盖**真实名字。
+# ---------------------------------------------------------------------------
+_PANETYPE_ALIASES = {
+    "ParameterEditor":   ["ParmSpreadsheet", "Parm", "DetailsView"],
+    "ParameterPane":     ["ParmSpreadsheet", "Parm"],
+    "ChannelEditorPane": ["ChannelEditor"],
+    "ChannelViewerPane": ["ChannelViewer"],
+    "ChannelListPane":   ["ChannelList"],
+}
+
+
 def _fit_pane_contents(pane, pane_type_name):
     """按 pane 类型调用对应的 fit 方法。
 
@@ -148,12 +169,33 @@ def capture_pane_screenshot(hou, pane_type_name, save_path=None,
         }
 
     pane_type_enum = getattr(hou.paneTabType, pane_type_name, None)
-    if pane_type_enum is None:
-        raise ValueError("未找到 pane 类型: " + str(pane_type_name))
+    # Bug 2：alias 兜底。attempted 列表用于失败时给出排查信息，含用户原名
+    # 加上尝试过的 alias（如 ["ParameterEditor", "ParmSpreadsheet", ...]）。
+    attempted = [pane_type_name]
 
-    pane = hou.ui.paneTabOfType(pane_type_enum)
-    if pane is None:
-        raise ValueError("未找到 " + str(pane_type_name) + " pane")
+    if pane_type_enum is not None:
+        pane = hou.ui.paneTabOfType(pane_type_enum)
+        if pane is None:
+            # 真实名在 hou.paneTabType 上，但当前 UI 无该类型 pane
+            raise ValueError("未找到 " + str(pane_type_name) + " pane")
+    else:
+        # 用户传了 hou.paneTabType 上没有的属性名 → 试 _PANETYPE_ALIASES
+        # 中预定义的历史别名（D4 决策）。第一个可见实例胜出。
+        pane = None
+        aliases = _PANETYPE_ALIASES.get(pane_type_name, [])
+        for alias_name in aliases:
+            attempted.append(alias_name)
+            alias_enum = getattr(hou.paneTabType, alias_name, None)
+            if alias_enum is None:
+                # 用户的 hou 版本连 alias 名都没有（H20 之前的极老版本）→ 跳过
+                continue
+            pane = hou.ui.paneTabOfType(alias_enum)
+            if pane is not None:
+                break  # 第一个可见实例即胜出
+        if pane is None:
+            raise ValueError(
+                "未找到 pane 类型: " + str(pane_type_name)
+                + "（已尝试别名: " + str(attempted) + "）")
 
     # save_path 为 None 时按 Bug C 规范走 BASE 目录自动生成
     # （SceneViewer flipbook 需要路径，否则 ValueError；Qt grab 路径
