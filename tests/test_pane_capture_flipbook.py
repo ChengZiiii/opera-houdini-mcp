@@ -105,8 +105,18 @@ class _FakeSceneViewerPane(object):
     def qtWidget(self):
         return self._widget
 
-    def flipbook(self, settings, viewport=None):
-        self.flipbook_calls.append(settings)
+    def flipbook(self, *args, **kwargs):
+        # H21 实测兼容多种签名：(settings) / (viewport, settings) /
+        # vp.flipbook(settings) — 测试 mock 接受任意参数。
+        # 把 settings（具有 .output / .beautyPassOnly 属性）提取出来
+        # 存到 flipbook_calls[0] 方便断言访问。
+        settings_arg = None
+        for a in args:
+            if hasattr(a, "output") and hasattr(a, "beautyPassOnly"):
+                settings_arg = a
+                break
+        if settings_arg is not None:
+            self.flipbook_calls.append(settings_arg)
         if self.raise_on_flipbook:
             raise RuntimeError("simulated flipbook failure")
         return None

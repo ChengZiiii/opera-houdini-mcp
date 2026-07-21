@@ -297,13 +297,17 @@ def _capture_sceneviewer_via_flipbook(hou, pane, save_path=None,
         _viewport_cam = pane.curViewport().camera()
 
     # 执行 flipbook。失败不回退 Qt grab（user spec 硬约束）。
-    # H21 API：pane.flipbook(settings, viewport) — viewport 是必传第二参
-    # （错误信息 "argument 2 of type 'HOM_GeometryViewport *" 反推）。
-    # 老版本 H20 / H19 可能只接 settings，签名差异由 hou 内部处理。
+    # H21 API 实测（Phase 4 端到端验证）：
+    #   hou.SceneViewer.flipbook(viewport, settings) — viewport 第一参
+    #   hou.GeometryViewport.flipbook(settings) — viewport 自带方法
+    # 优先 vp.flipbook(settings)（最简洁）；不行再回退 pane.flipbook(vp, settings)
     try:
         if hasattr(pane, "curViewport"):
             vp = pane.curViewport()
-            pane.flipbook(settings, vp)
+            if vp is not None and hasattr(vp, "flipbook"):
+                vp.flipbook(settings)
+            else:
+                pane.flipbook(vp, settings)
         else:
             pane.flipbook(settings)
     except Exception as e:

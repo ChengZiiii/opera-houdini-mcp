@@ -291,14 +291,25 @@ class _FakePaneTab(object):
     def qtWidget(self):
         return self._qt_widget
 
-    def flipbook(self, settings, viewport=None):
-        """记录调用（Bug B 新增 flipbook 路径，H21 API 接受 viewport 第二参）。"""
-        self.flipbook_calls.append(settings)
+    def flipbook(self, *args, **kwargs):
+        """记录调用（Bug B 新增 flipbook 路径，H21 API 兼容多种签名）。
+
+        接受 (settings) / (viewport, settings) / (settings, viewport=None)
+        等任意签名；测试 mock 不严格区分。
+        """
+        if args:
+            self.flipbook_calls.append(args)
         if self._flipbook_raise:
             raise RuntimeError("simulated flipbook failure")
         # 模拟 hou.SceneViewer.flipbook 真实行为：写出文件到 $F4 替换后路径
         # 便于测试断言 size_bytes > 0
         try:
+            # 兼容 settings 作为第一参（最常见）
+            settings = args[0] if args and hasattr(args[0], "output") else None
+            if settings is None and len(args) >= 2 and hasattr(args[1], "output"):
+                settings = args[1]
+            if settings is None:
+                return
             output = getattr(settings, "output", None)
             if output and "$F4" in output:
                 # 取 frameRange 第一个元素（start frame）作为 $F4 替换
