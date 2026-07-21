@@ -87,16 +87,23 @@ def _make_mock_hou(
 ):
     """Build a Mock that mimics the subset of hou API PR 16 uses.
 
-    Returns a Mock that responds to .version(), .applicationVersionString(),
-    .applicationVersion(), .build(), .hipFile.path(), .hipFile.basename(),
-    .hipFile.isUntitled(), .hipFile.isNewFile(), .node("/").allSubChildren()
-    and .ui.desktops() with sensible defaults.
+    Returns a Mock that responds to .applicationVersionString(),
+    .applicationVersion(), .hipFile.path(), .hipFile.basename(),
+    .hipFile.isNewFile(), .node("/").allSubChildren() and .ui.desktops()
+    with sensible defaults.
 
-    H21 compat 备注：H21 已移除 .version / .build / .hipFile.isUntitled；
-    H21 真实存在的 API 是 .applicationVersionString / .applicationVersion /
-    .hipFile.isNewFile / .hipFile.basename / .hipFile.name。Task 8（conftest
-    揭露性）会从 conftest.py 移除 legacy lambda；本 helper 暂时**并存**
-    提供，让旧测试与 H21-aware 新测试同时跑通。
+    H21 compat 备注（Task 8 — conftest 揭露性增强 / opera-houdinimcp-h21-compat-audit）：
+    H21 已移除 .version / .build / .hipFile.isUntitled；本 helper **不再显式
+    provision** 这些 mock。由于使用 mock.Mock()，访问 h.version / h.build /
+    h.hipFile.isUntitled 仍会 auto-create child Mock（让 anti-regression 测试
+    能查 .call_count == 0），但**不会**让 hou.version() 返回有意义字符串——
+    若 fork 代码误调 hou.version() 并依赖返回值，测试会 FAIL。
+    真正的 AttributeError 揭露发生在 conftest.py 的 module-level stub（不是
+    这里）—— 那里 hou.version 完全不存在。
+
+    `version` / `build` / `is_untitled` 参数保留在签名里以兼容现有调用方，
+    但仅 `version` 仍用于 application_version_string 默认值、`is_untitled`
+    仍用于 hipFile.isNewFile 默认值；`build` 参数已无效果（legacy, ignored）。
 
     默认让 application_version_string == version，避免「fork 改用新 API 后
     旧 assertion 取到不同值」的契约漂移。调用方仍可显式传不同值。
@@ -104,11 +111,7 @@ def _make_mock_hou(
     if application_version_string is None:
         application_version_string = version
     h = mock.Mock()
-    # 旧 API（H21 已移除，但 Mock 不揭露）—— Task 8 会清理依赖它们的测试
-    h.version.return_value = version
-    h.build.return_value = build
-    h.hipFile.isUntitled.return_value = is_untitled
-    # H21+ 真实存在的新 API
+    # H21+ 真实存在的新 API（fork 代码已全部改用这些）
     h.applicationVersionString.return_value = application_version_string
     h.applicationVersion.return_value = application_version
     h.hipFile.isNewFile.return_value = is_untitled

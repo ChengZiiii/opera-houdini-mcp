@@ -167,11 +167,10 @@ class _FakeHou(object):
             current = found
         return current
 
-    # 旧 API（H21 已移除）—— Task 8 会从 _FakeHou 移除
-    def houdiniVersion(self):
-        return self._version
-
-    # H21+ 真实存在的新 API（与 houdiniVersion 同源，便于回归）
+    # H21+ 真实存在的新 API
+    # Task 8（conftest 揭露性增强 / opera-houdinimcp-h21-compat-audit）：
+    # 已移除旧 hou.houdiniVersion() 方法 —— H21 不存在该 API。
+    # 若 fork 代码误调 hou.houdiniVersion()，会抛 AttributeError 让单测 FAIL。
     def applicationVersionString(self):
         return self._version
 
@@ -253,8 +252,9 @@ class H21CompatGetSceneInfoTests(unittest.TestCase):
 
     def test_uses_application_version_string_not_houdiniVersion(self):
         hou = _make_hou()
+        # H21 已移除 hou.houdiniVersion；_FakeHou 不再提供（Task 8 揭露性增强）。
         # 用 spy 包装 applicationVersionString 计数
-        calls = {"avs": 0, "hv": 0}
+        calls = {"avs": 0}
         original_avs = hou.applicationVersionString
 
         def _counting_avs():
@@ -262,22 +262,17 @@ class H21CompatGetSceneInfoTests(unittest.TestCase):
             return original_avs()
         hou.applicationVersionString = _counting_avs
 
-        original_hv = hou.houdiniVersion
-
-        def _counting_hv():
-            calls["hv"] += 1
-            return original_hv()
-        hou.houdiniVersion = _counting_hv
-
         info = scn.get_scene_info(hou)
         self.assertEqual(info["houdini_version"], "21.0.0")
         self.assertGreaterEqual(
             calls["avs"], 1,
             "get_scene_info must call hou.applicationVersionString() on H21")
-        self.assertEqual(
-            calls["hv"], 0,
-            "get_scene_info must NOT call hou.houdiniVersion() "
-            "(removed on H21); use applicationVersionString() instead")
+        # 回归保护：_FakeHou 不再提供 hou.houdiniVersion（H21 已移除），
+        # 若 fork 代码误调 hou.houdiniVersion()，会抛 AttributeError 让本测试 FAIL。
+        self.assertFalse(
+            hasattr(hou, "houdiniVersion"),
+            "_FakeHou must NOT provide houdiniVersion (removed on H21); "
+            "mock contract enforced by Task 8 conftest 揭露性增强")
 
 
 # ===========================================================================

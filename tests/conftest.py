@@ -30,10 +30,14 @@ def _stub_hou():
     hou.session = types.SimpleNamespace()
 
     # hou.hipFile：scene-level state；测试极少真用，SimpleNamespace 足够
+    # Task 8（conftest 揭露性增强 / opera-houdinimcp-h21-compat-audit）：
+    # 移除 isUntitled lambda —— H21 已无 hou.hipFile.isUntitled()，改用 isNewFile()。
+    # 保留 path / basename / save / load / clear（H21 仍存在）。
+    # 注意：本 stub 不提供 isNewFile —— 各测试按需在自己 mock 里设置；
+    # 这样 fork 代码若误调 hou.hipFile.isUntitled() 会抛 AttributeError 让单测 FAIL。
     hou.hipFile = types.SimpleNamespace(
         path=lambda: "",
         basename=lambda: "untitled",
-        isUntitled=lambda: True,
         save=lambda **kw: None,
         load=lambda **kw: None,
         clear=lambda **kw: None,
