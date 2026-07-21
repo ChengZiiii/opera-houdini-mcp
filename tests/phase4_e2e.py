@@ -27,7 +27,7 @@ class HoudiniConn:
         struct.pack('>I', len(payload)) + payload
     """
 
-    def __init__(self, host=HOST, port=PORT, timeout=120):
+    def __init__(self, host=HOST, port=PORT, timeout=300):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.settimeout(timeout)
         self.sock.connect((host, port))
@@ -156,6 +156,9 @@ def main():
     step(7, "capture_pane_screenshot SceneViewer (Bug B 验证：flipbook 路径)")
     sv_path = os.path.join(tempfile.gettempdir(), "houdini_mcp",
                             "phase4_sv_test.png")
+    # Bug B fix 实测：flipbook 调通但耗时较长（>30s），给足 timeout。
+    # 如果 flippedbook 仍报 argument 2 错误，说明 Houdini 加载的 server.py
+    # 仍是旧版——用户需在 shelf 再次 MCP Stop + Start 触发 reload。
     res = conn.send_command("capture_pane_screenshot", {
         "pane_type_name": "SceneViewer",
         "save_path": sv_path,
