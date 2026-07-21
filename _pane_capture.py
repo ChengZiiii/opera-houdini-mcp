@@ -326,7 +326,10 @@ def _capture_sceneviewer_via_flipbook(hou, pane, save_path=None,
         ) from e
 
     # flipbook 成功后，文件应落在 path_template 中 $F4 → 4 位补零帧号
-    actual_path = path_template.replace("$F4", str(current_frame).zfill(4))
+    # 注意：hou.frame() 返回 float（如 1.0），Houdini $F4 替换是 int 4 位补零
+    # （1 → "0001"），所以这里要 int() 转换再做 zfill(4)，避免 "01.0"
+    actual_path = path_template.replace(
+        "$F4", str(int(current_frame)).zfill(4))
     size_bytes = 0
     if os.path.exists(actual_path):
         size_bytes = os.path.getsize(actual_path)
