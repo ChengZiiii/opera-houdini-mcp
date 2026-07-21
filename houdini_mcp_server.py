@@ -1077,9 +1077,17 @@ def render_single_view(ctx: Context,
                        rotation: List[float] = [0, 90, 0],
                        render_path: str = "C:/temp/",
                        render_engine: str = "opengl",
-                       karma_engine: str = "cpu") -> str:
+                       karma_engine: str = "cpu") -> dict:
     """
-    Render a single view inside Houdini and return the rendered image path.
+    Render a single view inside Houdini and return a structured result dict.
+
+    Returns a dict (carrying renderer / image_path / size_bytes / etc.)
+    instead of a string. Pydantic-typed MCP output models reject dicts
+    when the return annotation is `str`; this tool is the one that broke
+    live with `1 validation error for render_single_viewOutput / result
+    Input should be a valid string [type=string_type, input_type=dict]`.
+    Server-side always returns a dict; we forward it verbatim and only
+    fall back to an error envelope on exception.
     """
     try:
         conn = get_houdini_connection()
@@ -1093,20 +1101,31 @@ def render_single_view(ctx: Context,
 
         if response.get("status") == "error":
             origin = response.get("origin", "houdini")
-            return f"Error ({origin}): {response.get('message', 'Unknown error')}"
+            return {"status": "error", "origin": origin,
+                    "message": response.get("message", "Unknown error")}
 
-        return response.get("result", "Render completed but no output path returned.")
+        result = response.get("result")
+        if isinstance(result, dict):
+            return result
+        return {"status": "unknown", "raw": str(result)}
     except Exception as e:
         logger.error(f"render_single_view failed: {e}", exc_info=True)
-        return f"Render failed: {str(e)}"
+        return {"status": "error", "origin": "bridge",
+                "message": f"Render failed: {str(e)}"}
 
 @mcp.tool()
 def render_quad_views(ctx: Context,
                       render_path: str = "C:/temp/",
                       render_engine: str = "opengl",
-                      karma_engine: str = "cpu") -> str:
+                      karma_engine: str = "cpu") -> dict:
     """
-    Render 4 canonical views from Houdini and return the image paths.
+    Render 4 canonical views from Houdini and return a structured result dict.
+
+    Returns a dict (4 views × {image_path, size_bytes, ...}) instead of a
+    string. See render_single_view docstring for the dict-vs-str Pydantic
+    background. The legacy bridge command name is `render_quad_view`
+    (singular) — kept for backward compatibility with the server-side
+    handler dictionary in opera-houdini-mcp/server.py.
     """
     try:
         conn = get_houdini_connection()
@@ -1118,21 +1137,30 @@ def render_quad_views(ctx: Context,
 
         if response.get("status") == "error":
             origin = response.get("origin", "houdini")
-            return f"Error ({origin}): {response.get('message', 'Unknown error')}"
+            return {"status": "error", "origin": origin,
+                    "message": response.get("message", "Unknown error")}
 
-        return response.get("result", "Render completed but no output returned.")
+        result = response.get("result")
+        if isinstance(result, dict):
+            return result
+        return {"status": "unknown", "raw": str(result)}
     except Exception as e:
         logger.error(f"render_quad_views failed: {e}", exc_info=True)
-        return f"Render failed: {str(e)}"
+        return {"status": "error", "origin": "bridge",
+                "message": f"Render failed: {str(e)}"}
 
 @mcp.tool()
 def render_specific_camera(ctx: Context,
                            camera_path: str,
                            render_path: str = "C:/temp/",
                            render_engine: str = "opengl",
-                           karma_engine: str = "cpu") -> str:
+                           karma_engine: str = "cpu") -> dict:
     """
     Render from a specific camera path in the Houdini scene.
+
+    Returns a structured dict (renderer / image_path / size_bytes) instead
+    of a string. See render_single_view docstring for the dict-vs-str
+    Pydantic background.
     """
     try:
         conn = get_houdini_connection()
@@ -1145,12 +1173,17 @@ def render_specific_camera(ctx: Context,
 
         if response.get("status") == "error":
             origin = response.get("origin", "houdini")
-            return f"Error ({origin}): {response.get('message', 'Unknown error')}"
+            return {"status": "error", "origin": origin,
+                    "message": response.get("message", "Unknown error")}
 
-        return response.get("result", "Render completed but no output path returned.")
+        result = response.get("result")
+        if isinstance(result, dict):
+            return result
+        return {"status": "unknown", "raw": str(result)}
     except Exception as e:
         logger.error(f"render_specific_camera failed: {e}", exc_info=True)
-        return f"Render failed: {str(e)}"
+        return {"status": "error", "origin": "bridge",
+                "message": f"Render failed: {str(e)}"}
 
 # -------------------------------------------------------------------
 # NEW OPUS API Tools
