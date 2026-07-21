@@ -2,9 +2,10 @@
 
 模块职责：
 - create_material: 创建材质节点（hou.node(parent).createNode）并可选应用参数
-- assign_material: 把材质绑定到几何节点（通过 shop_materialpath parm 实现，
-  与 server.py 中既有 set_material 的 OBJ-level 方式兼容；这是跨 Houdini
-  版本最稳定的实现路径）
+- assign_material: 把材质绑定到几何节点。H21 compat audit (A4) 后实现：
+  - group=None：通过 shop_materialpath parm 实现（跨 Houdini 版本最稳定）
+  - group!=None：优先 mat.assignToNode（老 Houdini），失败走 Material SOP
+    子节点（H21+ 标准 per-group 绑定，assignToNode 在 H21 已移除）
 - get_material_info: 返回材质节点的 path/type/name/parameters（白名单过滤）/
   texture_references（识别 .png 等贴图路径）
 
@@ -12,9 +13,6 @@
 - 不顶层 import hou；hou 通过参数注入（测试 mock）
 - 不引入类型注解与 f-string
 - 不新增 pip 依赖
-- hou.assignToNode(geo, group=...) 是 Houdini 较新版本 API；旧版本会
-  AttributeError。本模块以 shop_materialpath parm 为主路径，HOU 17+
-  均稳定。
 """
 from . import _common as cmn
 
@@ -143,22 +141,35 @@ def create_material(hou, material_type, name=None, parent_path="/mat",
 def assign_material(hou, geometry_path, material_path, group=None):
     """把 material_path 处的材质绑定到 geometry_path 处的几何节点。
 
-    实现策略：
-    - group 非 None 时：必须走 mat.assignToNode(geo, group=group)，
-      Houdini 版本不支持 group kwarg（TypeError）或缺少 assignToNode
-      (AttributeError) 时直接抛 ValueError，不再 fallback 到
-      shop_materialpath
-    - group 为 None 时：优先用 geo.parm("shop_materialpath") 设值
-      （跨 Houdini 版本最稳定），缺失 parm 时尝试
-      mat.assignToNode(geo)；两条路径都不可用时抛 ValueError
-    - 任何绑定路径抛错都转为 ValueError，调用方不会再收到
-      success:True 的虚假成功响应
+    实现策略（H21 compat audit, A4）：
+    - group 非 None 时（按优先级降级）：
+        1. 优先尝试 mat.assignToNode(geo, group=group) —— 老版本 Houdini
+           可能有此 API；成功即返回（via="assignToNode"）。
+        2. assignToNode 不存在或调用失败 -> H21+ 路径：在 geo 容器下创建
+           Material SOP 子节点，设其 group 过滤 parm + shop_materialpath
+           parm（via="material_sop_child"）。这是 H21+ per-group 绑定的
+           标准做法（assignToNode 在 H21 已移除）。
+        3. Material SOP 创建失败 -> 终极兜底：在 geo 上设 shop_materialpath
+           parm（与 group=None 路径相同），返回 via="fallback_shop_materialpath"
+           + warning 字段说明 group 信息丢失。不硬失败。
+        4. shop_materialpath parm 也不存在 -> 抛 ValueError。
+    - group 为 None 时：保持既有 shop_materialpath 优先策略不变
+      （跨 Houdini 版本最稳定）。
+
+    Args:
+        hou: hou mock / real hou 模块（参数注入）
+        geometry_path: SOP / OBJ 几何节点路径
+        material_path: 材质节点路径
+        group: 可选，primitive group 名；None 时整节点绑定
 
     Returns:
-        dict {"geometry_path", "material_path", "group", "success": True}
+        dict 至少含 {"geometry_path", "material_path", "group", "success"}
+        + "via" 标记走哪条路径（assignToNode / material_sop_child /
+        fallback_shop_materialpath）。material_sop_child 路径额外返回
+        "material_sop_path" / "group_parm" / "material_parm" 字段。
 
     Raises:
-        ValueError: 节点不存在，或所有绑定路径都失败
+        ValueError: 节点不存在；或所有绑定路径（包括最终兜底）都失败
     """
     geo = hou.node(geometry_path)
     mat = hou.node(material_path)
@@ -172,19 +183,59 @@ def assign_material(hou, geometry_path, material_path, group=None):
             "几何或材质节点不存在: {0}".format(", ".join(missing)))
 
     if group is not None:
-        # group 绑定路径：必须经过 assignToNode，不能用 shop_materialpath
-        # 兜底，否则 group 信息会静默丢失。
+        # ---- group 绑定：assignToNode 优先（老 Houdini），失败走 Material SOP ----
         assign = getattr(mat, "assignToNode", None)
-        if not callable(assign):
-            raise ValueError("Houdini 版本不支持 assignToNode")
+        if callable(assign):
+            try:
+                assign(geo, group=group)
+                return {
+                    "geometry_path": geometry_path,
+                    "material_path": material_path,
+                    "group": group,
+                    "success": True,
+                    "via": "assignToNode",
+                }
+            except Exception:
+                # assignToNode 存在但调用失败（如 TypeError 拒绝 group kwarg
+                # 或 RuntimeError）—— 降级到 Material SOP 路径，不再硬抛
+                pass
+
+        # H21+ per-group 绑定：Material SOP 子节点
         try:
-            assign(geo, group=group)
-        except TypeError:
-            raise ValueError("Houdini 版本不支持 group 绑定")
-        except Exception as e:
-            raise ValueError("assignToNode 调用失败: {0}".format(e))
+            sop_node, group_parm, mat_parm = _bind_material_to_group_via_sop(
+                hou, geo, mat, group)
+            return {
+                "geometry_path": geometry_path,
+                "material_path": material_path,
+                "group": group,
+                "success": True,
+                "via": "material_sop_child",
+                "material_sop_path": sop_node.path(),
+                "group_parm": group_parm,
+                "material_parm": mat_parm,
+            }
+        except Exception as sop_err:
+            # 终极兜底：在 geo 上设 shop_materialpath（group 信息会丢失，
+            # 但能保证材质生效到整节点；调用方据 warning 决定是否补刀）
+            parm = geo.parm("shop_materialpath")
+            if parm is not None:
+                parm.set(mat.path())
+                return {
+                    "geometry_path": geometry_path,
+                    "material_path": material_path,
+                    "group": group,
+                    "success": True,
+                    "via": "fallback_shop_materialpath",
+                    "warning": (
+                        "Material SOP creation failed ({0}); group={1} "
+                        "NOT applied - assigned to whole geometry"
+                    ).format(str(sop_err), group),
+                }
+            raise ValueError(
+                "Material SOP 创建失败且无 shop_materialpath 兜底: {0}"
+                .format(sop_err))
     else:
-        # 整节点绑定：保留既有 shop_materialpath 优先策略
+        # ---- 整节点绑定：保留既有 shop_materialpath 优先策略（不变） ----
         parm = geo.parm("shop_materialpath")
         if parm is not None:
             parm.set(mat.path())
@@ -205,6 +256,188 @@ def assign_material(hou, geometry_path, material_path, group=None):
         "group": group,
         "success": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# H21 compat audit (A4): per-group 绑定的 Material SOP 子节点路径
+# 设计依据 SideFX H22 Material SOP 文档：
+#   https://www.sidefx.com/docs/houdini22.0/nodes/sop/material.html
+# Material SOP 用 "Number of materials" multiparm，每个 slot 含 Group + Material
+# 两个 parm。num_materials=1 时 slot 1 的 parm 名为 group1 / shop_materialpath1。
+# 老版本 Material SOP 可能有顶层 group / shop_materialpath（无后缀），代码同时
+# 兼容。
+# ---------------------------------------------------------------------------
+
+def _resolve_material_sop_container(geo):
+    """决定 Material SOP 应该创建在哪个容器下。
+
+    - geo 是 OBJ 容器（Object category）：直接返回 geo（在其内创建子 SOP）
+    - geo 是 SOP / 其他：返回 geo.parent()（在父 OBJ 容器下创建兄弟节点）
+    - parent() 不可用或返回 None：回退到 geo 自身（best-effort）
+    """
+    try:
+        cat_name = geo.type().category().name()
+    except Exception:
+        cat_name = None
+    if cat_name == "Object":
+        return geo
+    # SOP / 其他类型 —— 找父容器
+    parent_attr = getattr(geo, "parent", None)
+    if callable(parent_attr):
+        try:
+            parent_node = parent_attr()
+            if parent_node is not None:
+                return parent_node
+        except Exception:
+            pass
+    return geo  # 最后兜底
+
+
+def _unique_material_sop_name(container, base="material"):
+    """在 container 下找一个未占用的 Material SOP 名（material / material1 / ...）。
+
+    通过 children() 收集现有子节点名，避开冲突。
+    """
+    existing_names = set()
+    children_attr = getattr(container, "children", None)
+    if callable(children_attr):
+        try:
+            for child in (children_attr() or []):
+                try:
+                    existing_names.add(child.name())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    if base not in existing_names:
+        return base
+    i = 1
+    while True:
+        cand = "{0}{1}".format(base, i)
+        if cand not in existing_names:
+            return cand
+        i += 1
+
+
+def _set_first_existing_parm(node, candidate_names, value):
+    """在 node 上按 candidate_names 顺序找第一个存在的 parm 并 set(value)。
+
+    Returns:
+        命中的 parm 名（str）；若全部不存在返回 None。
+    """
+    for name in candidate_names:
+        try:
+            pt = node.parm(name)
+        except Exception:
+            pt = None
+        if pt is not None:
+            pt.set(value)
+            return name
+    return None
+
+
+def _wire_material_sop_after_display(geo, material_sop, container):
+    """Best-effort：把 Material SOP 的 input 0 接到当前 display SOP 之后。
+
+    - geo 是 OBJ 容器：用 geo.displayNode() 找当前 display SOP 作为源
+    - geo 自身是 SOP：直接用 geo 作为源（Material SOP 是 geo 的兄弟）
+    - 任何步骤失败都静默跳过 —— wiring 是 best-effort，不影响材质生效
+    """
+    src = None
+    # OBJ 容器：用 displayNode() 找源
+    display_method = getattr(geo, "displayNode", None)
+    if callable(display_method):
+        try:
+            src = display_method()
+        except Exception:
+            src = None
+    # geo 自身是 SOP（container 是其 parent）—— 直接用 geo 作为源
+    if src is None:
+        try:
+            cat_name = geo.type().category().name()
+        except Exception:
+            cat_name = None
+        if cat_name and cat_name != "Object":
+            src = geo
+    if src is None:
+        return  # 无源可接
+
+    set_input = getattr(material_sop, "setInput", None)
+    if callable(set_input):
+        try:
+            set_input(0, src)
+        except Exception:
+            pass
+
+    # 把 Material SOP 设为新 display flag（让 viewport 立即看到效果）
+    set_display = getattr(material_sop, "setDisplayFlag", None)
+    if callable(set_display):
+        try:
+            set_display(True)
+        except Exception:
+            pass
+
+
+def _bind_material_to_group_via_sop(hou, geo, mat, group):
+    """H21+ per-group 材质绑定：创建 Material SOP 子节点。
+
+    流程：
+        1. 解析容器（OBJ 容器自身或 SOP 的父）
+        2. 在容器下找唯一名（material / material1 / ...）createNode("material")
+        3. 设 group 过滤 parm（group1 / group）
+        4. 设 material 路径 parm（shop_materialpath1 / shop_materialpath）
+        5. Best-effort：wire Material SOP 到当前 display SOP 之后
+
+    Args:
+        hou: hou 模块（参数注入）
+        geo: 几何节点（OBJ 容器或 SOP）
+        mat: 材质节点
+        group: primitive group 名
+
+    Returns:
+        (material_sop_node, group_parm_name, material_parm_name)
+
+    Raises:
+        RuntimeError: Material SOP 创建失败，或 group/material parm 都不存在
+    """
+    container = _resolve_material_sop_container(geo)
+    sop_name = _unique_material_sop_name(container, base="material")
+
+    create_attr = getattr(container, "createNode", None)
+    if not callable(create_attr):
+        raise RuntimeError(
+            "container has no createNode method: {0}".format(container))
+    try:
+        material_sop = create_attr("material", node_name=sop_name)
+    except Exception as e:
+        raise RuntimeError(
+            "createNode('material') failed: {0}".format(e))
+
+    # group 过滤 parm：H21+ multiparm slot 1 是 group1；老版本是 group（无后缀）
+    group_parm_name = _set_first_existing_parm(
+        material_sop, ["group1", "group"], group)
+    if group_parm_name is None:
+        raise RuntimeError(
+            "Material SOP exposes neither group1 nor group parm")
+
+    # material 路径 parm：同理 slot 1 是 shop_materialpath1
+    mat_parm_name = _set_first_existing_parm(
+        material_sop,
+        ["shop_materialpath1", "shop_materialpath"],
+        mat.path())
+    if mat_parm_name is None:
+        raise RuntimeError(
+            "Material SOP exposes neither shop_materialpath1 nor "
+            "shop_materialpath parm")
+
+    # Best-effort wiring（失败不影响返回）
+    try:
+        _wire_material_sop_after_display(geo, material_sop, container)
+    except Exception:
+        pass
+
+    return material_sop, group_parm_name, mat_parm_name
 
 
 def get_material_info(hou, material_path):

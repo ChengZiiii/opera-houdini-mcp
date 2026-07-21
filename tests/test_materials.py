@@ -101,6 +101,9 @@ class _FakeMaterialNode(object):
         self._parm_dict = {}
         self._children = []
         self._created = []  # children created via createNode
+        self._input_connections = []  # setInput(0, src) calls
+        self._display_flag = False
+        self._display_node = None  # for OBJ containers: which child is display
         if parms:
             for p in parms:
                 self._parm_dict[p.name()] = p
@@ -116,6 +119,33 @@ class _FakeMaterialNode(object):
 
     def type(self):
         return self._type
+
+    # graph lineage (real hou API surface used by _materials helpers)
+    def parent(self):
+        return self._parent
+
+    def children(self):
+        return list(self._children)
+
+    # display flag / display node (OBJ container API)
+    def displayNode(self):
+        return self._display_node
+
+    def setDisplayFlag(self, value):
+        self._display_flag = bool(value)
+
+    def displayFlag(self):
+        return self._display_flag
+
+    # input wiring (used by Material SOP fallback)
+    def setInput(self, input_index, src):
+        # Extend list if needed
+        while len(self._input_connections) <= input_index:
+            self._input_connections.append(None)
+        self._input_connections[input_index] = src
+
+    def inputs(self):
+        return list(self._input_connections)
 
     # parms
     def parm(self, name):
@@ -141,6 +171,15 @@ class _FakeMaterialNode(object):
                 "basecolor_texture": _FakeParm("basecolor_texture", ""),
                 "rough_texture": _FakeParm("rough_texture", ""),
                 "metallic_texture": _FakeParm("metallic_texture", ""),
+            }
+        elif node_type == "material":
+            # H21 Material SOP multiparm slot 1 parms (verified via
+            # SideFX H22 docs: "Number of materials" multiparm creates
+            # group1 / shop_materialpath1 for slot 1).
+            child._parm_dict = {
+                "group1": _FakeParm("group1", ""),
+                "shop_materialpath1": _FakeParm("shop_materialpath1", ""),
+                "num_materials": _FakeParm("num_materials", 1),
             }
         self._children.append(child)
         self._created.append(child)
@@ -377,37 +416,116 @@ class AssignMaterialTests(unittest.TestCase):
         self.assertEqual(result["group"], "piece7")
         self.assertEqual(mat.assignToNode_calls, [(geo, "piece7")])
 
-    def test_group_assignToNode_missing_raises_value_error(self):
-        """group= non-None + geo has NO shop_materialpath + mat has NO
-        assignToNode attribute -> must raise ValueError, not silent success.
+    # ---- H21 compat audit (A4): group path via Material SOP child ----
+    # The 3 prior tests asserted "assignToNode failure -> ValueError".
+    # After the H21 fix, assignToNode failure falls through to a Material
+    # SOP child node. These replacement tests verify the new contract.
+    def test_assign_material_with_group_creates_material_sop(self):
+        """group= non-None + mat has NO assignToNode (H21 reality) -> a
+        `material` type child SOP is created under the geo container, with
+        its group filter parm set to the group name and its material path
+        parm set to mat.path().
         """
         hou = _make_hou()
-        geo = _FakeMaterialNode("noParmGeo2", node_type_name="geo",
-                                category_name="Sop")
+        # geo as OBJ container (category Object) -> Material SOP created inside
+        geo = _FakeMaterialNode("sopGeo", node_type_name="geo",
+                                category_name="Object")
         geo._parent = hou.node("/obj")
         hou.node("/obj")._children.append(geo)
-        hou.add_node("/obj/noParmGeo2", geo)
+        hou.add_node("/obj/sopGeo", geo)
 
-        mat = hou.node("/mat").createNode("principledshader", "noAssignMat")
-        # default _FakeMaterialNode has no assignToNode -> AttributeError path
+        mat = hou.node("/mat").createNode("principledshader", "msgMat")
+        # default _FakeMaterialNode has NO assignToNode -> H21 path
 
-        with self.assertRaises(ValueError):
-            mat_mod.assign_material(hou, "/obj/noParmGeo2",
-                                     mat.path(), group="pieceX")
+        result = mat_mod.assign_material(hou, "/obj/sopGeo",
+                                          mat.path(), group="leg_group")
+        self.assertTrue(result["success"])
+        self.assertEqual(result["group"], "leg_group")
 
-    def test_group_assignToNode_rejects_group_kwarg_raises_value_error(self):
-        """group= non-None + geo has NO shop_materialpath + mat.assignToNode
-        raises TypeError on group= kwarg -> must raise ValueError (not
-        silently fall back to no-group call).
+        # A `material` type child must have been created under geo
+        created = [c for c in geo._created
+                   if c.type().name() == "material"]
+        self.assertEqual(len(created), 1,
+                         "exactly one Material SOP child expected")
+        mat_sop = created[0]
+        # Group filter parm set to the requested group name
+        group_parm = mat_sop.parm("group1")
+        self.assertIsNotNone(group_parm,
+                             "Material SOP must expose group1 multiparm slot")
+        self.assertEqual(group_parm._value, "leg_group")
+        # Material path parm set to mat.path()
+        smp_parm = mat_sop.parm("shop_materialpath1")
+        self.assertIsNotNone(smp_parm,
+                             "Material SOP must expose shop_materialpath1")
+        self.assertEqual(smp_parm._value, mat.path())
+
+    def test_assign_material_with_group_returns_via_marker(self):
+        """group= non-None + assignToNode absent -> response envelope
+        carries `"via": "material_sop_child"` marker and the new node path.
         """
         hou = _make_hou()
-        geo = _FakeMaterialNode("kwGeo", node_type_name="geo",
-                                category_name="Sop")
+        geo = _FakeMaterialNode("viaGeo", node_type_name="geo",
+                                category_name="Object")
         geo._parent = hou.node("/obj")
         hou.node("/obj")._children.append(geo)
-        hou.add_node("/obj/kwGeo", geo)
+        hou.add_node("/obj/viaGeo", geo)
 
-        mat = hou.node("/mat").createNode("principledshader", "kwMat")
+        mat = hou.node("/mat").createNode("principledshader", "viaMat")
+
+        result = mat_mod.assign_material(hou, "/obj/viaGeo",
+                                          mat.path(), group="top_group")
+        self.assertEqual(result.get("via"), "material_sop_child")
+        self.assertIn("material_sop_path", result)
+        # The returned path must point to a `material` child of geo
+        ms_path = result["material_sop_path"]
+        self.assertTrue(ms_path.startswith("/obj/viaGeo/"),
+                        "Material SOP path must live under geo container")
+        # And it must be resolvable via hou.node()
+        ms_node = hou.node(ms_path)
+        self.assertIsNotNone(ms_node)
+        self.assertEqual(ms_node.type().name(), "material")
+
+    def test_assign_material_without_group_unchanged(self):
+        """Regression guard: group=None still uses shop_materialpath
+        directly on the geo container (legacy path unchanged). NO Material
+        SOP child must be created.
+        """
+        hou = _make_hou()
+        geo = _FakeMaterialNode("legacyGeo", node_type_name="geo",
+                                category_name="Object")
+        geo._parm_dict["shop_materialpath"] = _FakeParm(
+            "shop_materialpath", "")
+        geo._parent = hou.node("/obj")
+        hou.node("/obj")._children.append(geo)
+        hou.add_node("/obj/legacyGeo", geo)
+
+        mat = hou.node("/mat").createNode("principledshader", "legacyMat")
+
+        result = mat_mod.assign_material(hou, "/obj/legacyGeo", mat.path())
+        self.assertTrue(result["success"])
+        self.assertIsNone(result["group"])
+        # shop_materialpath on geo was set directly to mat.path()
+        self.assertEqual(
+            geo._parm_dict["shop_materialpath"]._value, mat.path())
+        # NO Material SOP child was created
+        material_children = [c for c in geo._created
+                             if c.type().name() == "material"]
+        self.assertEqual(material_children, [],
+                         "group=None must NOT create a Material SOP child")
+
+    def test_group_assignToNode_failure_falls_back_to_material_sop(self):
+        """group= non-None + mat.assignToNode exists but raises TypeError
+        on group= kwarg -> must NOT raise; instead fall through to the
+        Material SOP path and succeed.
+        """
+        hou = _make_hou()
+        geo = _FakeMaterialNode("fbTyGeo", node_type_name="geo",
+                                category_name="Object")
+        geo._parent = hou.node("/obj")
+        hou.node("/obj")._children.append(geo)
+        hou.add_node("/obj/fbTyGeo", geo)
+
+        mat = hou.node("/mat").createNode("principledshader", "fbTyMat")
 
         def _reject_kwarg(g, group=None):
             if group is not None:
@@ -416,31 +534,85 @@ class AssignMaterialTests(unittest.TestCase):
 
         mat.assignToNode = _reject_kwarg
 
-        with self.assertRaises(ValueError):
-            mat_mod.assign_material(hou, "/obj/kwGeo",
-                                     mat.path(), group="pieceY")
+        result = mat_mod.assign_material(hou, "/obj/fbTyGeo",
+                                          mat.path(), group="kwgroup")
+        self.assertTrue(result["success"])
+        # Must have fallen through to Material SOP, not raised
+        self.assertEqual(result.get("via"), "material_sop_child")
 
-    def test_group_assignToNode_runtime_error_raises_value_error(self):
-        """group= non-None + assignToNode raises a non-TypeError exception
-        -> must propagate as ValueError.
+    def test_group_assignToNode_runtime_error_falls_back_to_material_sop(self):
+        """group= non-None + mat.assignToNode raises RuntimeError -> must
+        NOT raise; fall through to Material SOP path.
         """
         hou = _make_hou()
-        geo = _FakeMaterialNode("rtGeo", node_type_name="geo",
-                                category_name="Sop")
+        geo = _FakeMaterialNode("fbRtGeo", node_type_name="geo",
+                                category_name="Object")
         geo._parent = hou.node("/obj")
         hou.node("/obj")._children.append(geo)
-        hou.add_node("/obj/rtGeo", geo)
+        hou.add_node("/obj/fbRtGeo", geo)
 
-        mat = hou.node("/mat").createNode("principledshader", "rtMat")
+        mat = hou.node("/mat").createNode("principledshader", "fbRtMat")
 
         def _explode(g, group=None):
             raise RuntimeError("hou internal failure")
 
         mat.assignToNode = _explode
 
+        result = mat_mod.assign_material(hou, "/obj/fbRtGeo",
+                                          mat.path(), group="rtgroup")
+        self.assertTrue(result["success"])
+        self.assertEqual(result.get("via"), "material_sop_child")
+
+    def test_group_material_sop_failure_falls_back_to_shop_materialpath(self):
+        """group= non-None + assignToNode absent + Material SOP creation
+        impossible (geo has no createNode AND no parent) + geo has
+        shop_materialpath parm -> must fall back to setting
+        shop_materialpath on geo directly, with a warning. Group info is
+        lost but the call succeeds.
+        """
+        hou = _make_hou()
+        geo = _FakeMaterialNode("fbShopGeo", node_type_name="geo",
+                                category_name="Object")
+        geo._parm_dict["shop_materialpath"] = _FakeParm(
+            "shop_materialpath", "")
+        geo._parent = hou.node("/obj")
+        hou.node("/obj")._children.append(geo)
+        hou.add_node("/obj/fbShopGeo", geo)
+        # Sabotage createNode so Material SOP path fails
+        geo.createNode = lambda *a, **kw: (_ for _ in ()).throw(
+            RuntimeError("createNode disabled in this test"))
+
+        mat = hou.node("/mat").createNode("principledshader", "fbShopMat")
+
+        result = mat_mod.assign_material(hou, "/obj/fbShopGeo",
+                                          mat.path(), group="lostgroup")
+        self.assertTrue(result["success"])
+        # Fall-back path marker
+        self.assertEqual(result.get("via"), "fallback_shop_materialpath")
+        self.assertIn("warning", result)
+        # shop_materialpath was set on geo (group info lost but call worked)
+        self.assertEqual(
+            geo._parm_dict["shop_materialpath"]._value, mat.path())
+
+    def test_group_material_sop_failure_no_fallback_raises_value_error(self):
+        """group= non-None + Material SOP creation fails + geo has NO
+        shop_materialpath parm -> must raise ValueError (no fallback left).
+        """
+        hou = _make_hou()
+        geo = _FakeMaterialNode("noFbGeo", node_type_name="geo",
+                                category_name="Object")
+        # intentionally NO shop_materialpath parm
+        geo._parent = hou.node("/obj")
+        hou.node("/obj")._children.append(geo)
+        hou.add_node("/obj/noFbGeo", geo)
+        geo.createNode = lambda *a, **kw: (_ for _ in ()).throw(
+            RuntimeError("createNode disabled"))
+
+        mat = hou.node("/mat").createNode("principledshader", "noFbMat")
+
         with self.assertRaises(ValueError):
-            mat_mod.assign_material(hou, "/obj/rtGeo",
-                                     mat.path(), group="pieceZ")
+            mat_mod.assign_material(hou, "/obj/noFbGeo",
+                                     mat.path(), group="deadgroup")
 
     def test_fallback_failure_no_assignToNode_raises_value_error(self):
         """group=None (default fallback path) + geo has NO shop_materialpath
