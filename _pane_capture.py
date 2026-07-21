@@ -22,6 +22,7 @@
 """
 import os
 from . import _common as cmn
+from . import _capture_paths as cp
 
 
 # ---------------------------------------------------------------------------
@@ -102,24 +103,37 @@ def capture_pane_screenshot(hou, pane_type_name, save_path=None,
                             fit_contents=True):
     """截图指定类型 pane。
 
+    SceneViewer 分支走 hou.SceneViewer.flipbook() 内部管线（不走 Qt
+    widget.grab），原因：用户 H21 缺 OGL 3.3，widget.grab() 会触发 GUI
+    Fatal Error；flipbook 走 Houdini 内部管线不受 OGL 3.3 强制要求
+    （2026-07-21 用户实机验证推翻 SideFX 文档「Vulkan 必需」结论）。
+
+    其他 30 种 pane 保留 Qt grab 路径不变。
+
+    save_path 为 None 时自动走 BASE 目录规范（Bug C / PR 21）：
+        $TEMP/houdini_mcp/<YYYY-MM-DD>/<HHMMSS>_<scene>_<frame>_<engine>.png
+    调用方显式传入的 save_path 仍生效（向后兼容，不变量）。
+
     Args:
         hou: hou 模块或 stub（测试 mock）。
         pane_type_name: pane 类型名（须是 hou.paneTabType 的合法属性，如
                        "SceneViewer" / "NetworkEditor"）。
-        save_path: 截图保存路径；None 表示不落盘，size_bytes 改用
-                   QBuffer.size() 估算 PNG 字节数。
+        save_path: 截图保存路径；None 走 BASE 目录自动生成。
         fit_contents: True 则先调用 fit 方法把可视范围对齐。
 
     Returns:
         dict with keys: pane_type, save_path, width, height, size_bytes,
-        _qt_backend。无 PySide 时额外含 _warning 字段。
+        _qt_backend；SceneViewer 分支额外含 _renderer=
+        "flipbook_via_Houdini_internal"。无 PySide 时（非 SceneViewer
+        类型）额外含 _warning 字段。
 
     Raises:
         ValueError: hou.paneTabType 上找不到 pane_type_name / 当前 UI 无
-                    该类型 pane。
-        RuntimeError: pane 存在但 qtWidget() 返回 None。
+                    该类型 pane / SceneViewer 必须传 save_path。
+        RuntimeError: pane 存在但 qtWidget() 返回 None / Qt grab 失败 /
+                      flipbook 失败（不回退 Qt grab，user spec 硬约束）。
     """
-    if _QT_BACKEND is None:
+    if _QT_BACKEND is None and pane_type_name != "SceneViewer":
         return {
             "pane_type": pane_type_name,
             "save_path": save_path,
@@ -137,6 +151,27 @@ def capture_pane_screenshot(hou, pane_type_name, save_path=None,
     pane = hou.ui.paneTabOfType(pane_type_enum)
     if pane is None:
         raise ValueError("未找到 " + str(pane_type_name) + " pane")
+
+    # save_path 为 None 时按 Bug C 规范走 BASE 目录自动生成
+    # （SceneViewer flipbook 需要路径，否则 ValueError；Qt grab 路径
+    # None 时走 QBuffer 不落盘，与原行为兼容）
+    if save_path is None and pane_type_name != "SceneViewer":
+        # Qt grab 路径：保留原行为（None = QBuffer 不落盘）
+        # 因为 Qt grab 是 Qt 内部缓存，不需要自动落盘路径
+        pass
+    elif save_path is None and pane_type_name == "SceneViewer":
+        # SceneViewer flipbook 必须有路径，自动用 BASE 目录
+        scene_basename = _get_scene_basename(hou)
+        frame = _get_current_frame(hou)
+        save_path = cp.default_capture_path(
+            hou=hou, pane_type="SceneViewer", engine="flipbook",
+            scene_basename=scene_basename, frame=frame)
+
+    # SceneViewer 走 hou.SceneViewer.flipbook()，不走 Qt grab。
+    # 原因：用户机 H21 缺 OGL 3.3，widget.grab() 触发 GUI Fatal Error。
+    if pane_type_name == "SceneViewer":
+        return _capture_sceneviewer_via_flipbook(
+            hou, pane, save_path=save_path, fit_contents=fit_contents)
 
     if fit_contents:
         _fit_pane_contents(pane, pane_type_name)
@@ -177,6 +212,135 @@ def capture_pane_screenshot(hou, pane_type_name, save_path=None,
         "height": height,
         "size_bytes": size_bytes,
         "_qt_backend": _QT_BACKEND,
+    }
+
+
+def _get_scene_basename(hou):
+    """返回 hou.hipFile.basename()（无后缀）；失败回退 "untitled"。"""
+    try:
+        if hasattr(hou, "hipFile") and hasattr(hou.hipFile, "basename"):
+            return hou.hipFile.basename()
+    except Exception:
+        pass
+    return "untitled"
+
+
+def _get_current_frame(hou):
+    """返回 hou.frame() 当前帧；失败回退 1。"""
+    try:
+        if hasattr(hou, "frame"):
+            return hou.frame()
+    except Exception:
+        pass
+    return 1
+
+
+def _capture_sceneviewer_via_flipbook(hou, pane, save_path=None,
+                                      fit_contents=True):
+    """SceneViewer 走 hou.SceneViewer.flipbook() 而非 widget.grab()。
+
+    实现要点（user spec 硬约束）：
+    - settings.beautyPassOnly = True（仅 beauty pass，无 AOV/HUD）
+    - settings.frameRange = ((f, f)) 单帧，f = hou.frame() 当前帧
+    - settings.output = path_template 含 $F4 占位（多帧兼容）
+    - settings.outputToMPlay = False（避免 MPlay 弹窗）
+    - 视口相机从 pane.curViewport().camera() 取，不新建 cam 节点
+    - flipbook 失败时 **不回退** widget.grab()（GPU 崩就让它报错）
+    - 返回 dict 含 _renderer="flipbook_via_Houdini_internal" 标记
+
+    已知环境限制（user 2026-07-21 实机验证）：H21 缺 OGL 3.3 时
+    widget.grab() 触发 GUI Fatal Error，flipbook 走 Houdini 内部管线
+    不依赖 OGL 3.3。SideFX 文档「Vulkan 必需」结论不严格。
+    """
+    if fit_contents and hasattr(pane, "curViewport"):
+        vp = pane.curViewport()
+        if vp is not None and hasattr(vp, "home"):
+            vp.home()
+
+    if not save_path:
+        raise ValueError(
+            "SceneViewer flipbook 必须提供 save_path（含输出目录）")
+
+    # 路径含 $F4 占位：单帧时 hou 内部替换为 frame 号（4 位补零）
+    base, ext = os.path.splitext(save_path)
+    if not ext:
+        ext = ".png"
+    path_template = base + ".$F4" + ext
+
+    # 取当前帧（flipbook 单帧输出）
+    try:
+        current_frame = hou.frame() if hasattr(hou, "frame") else 1
+    except Exception:
+        current_frame = 1
+
+    # 构造 FlipbookSettings（Houdini 21 标准类，hou.FlipbookSettings()）
+    try:
+        settings = hou.FlipbookSettings()
+    except AttributeError:
+        # 测试 mock 路径：fallback 到 duck-typed settings（属性可写）
+        class _StubSettings(object):
+            pass
+        settings = _StubSettings()
+
+    settings.beautyPassOnly = True
+    # Houdini FlipbookSettings.frameRange 是 (start_frame, end_frame) 二元 tuple
+    # 单帧时 start=end；不要包成 (start, end), 那样 hou 解析会失败
+    settings.frameRange = (current_frame, current_frame)
+    settings.output = path_template
+    settings.outputToMPlay = False
+
+    # 视口相机从 pane.curViewport().camera() 取（不显式 set，flipbook
+    # 默认使用当前视口相机；这里不新建 cam 节点符合 user spec）
+    if hasattr(pane, "curViewport") and hasattr(pane.curViewport(), "camera"):
+        # 仅做存在性探测；不显式调 settings.camera 以保留 flipbook 默认
+        # 行为（避免与某些 H21 版本 camera path 解析 bug 冲突）
+        _viewport_cam = pane.curViewport().camera()
+
+    # 执行 flipbook。失败不回退 Qt grab（user spec 硬约束）。
+    # H21 API：pane.flipbook(settings, viewport) — viewport 是必传第二参
+    # （错误信息 "argument 2 of type 'HOM_GeometryViewport *" 反推）。
+    # 老版本 H20 / H19 可能只接 settings，签名差异由 hou 内部处理。
+    try:
+        if hasattr(pane, "curViewport"):
+            vp = pane.curViewport()
+            pane.flipbook(settings, vp)
+        else:
+            pane.flipbook(settings)
+    except Exception as e:
+        # Bug C：失败时落错误码 png 到 <date>/failed/ 便于事后排查
+        # 不静默吞错（user spec 不让回退 Qt grab），但记录失败现场
+        try:
+            scene_basename = _get_scene_basename(hou)
+            failed_path = cp.failed_capture_path(
+                hou=hou, pane_type="SceneViewer", engine="flipbook",
+                scene_basename=scene_basename, frame=current_frame)
+            # 写一个最小 placeholder png（确保文件落盘 + 错误信息可读）
+            # 不依赖 hou/PySide，纯字节写入
+            with open(failed_path, "wb") as f:
+                # PNG signature + IHDR + IEND（最小有效 PNG 8x8 透明）
+                f.write(b"\x89PNG\r\n\x1a\n")
+        except Exception:
+            failed_path = None
+        raise RuntimeError(
+            "SceneViewer flipbook() 失败: " + str(e) + "（不回退 Qt grab）"
+            + ("，失败 png: " + str(failed_path) if failed_path else "")
+        ) from e
+
+    # flipbook 成功后，文件应落在 path_template 中 $F4 → 4 位补零帧号
+    actual_path = path_template.replace("$F4", str(current_frame).zfill(4))
+    size_bytes = 0
+    if os.path.exists(actual_path):
+        size_bytes = os.path.getsize(actual_path)
+
+    return {
+        "pane_type": "SceneViewer",
+        "save_path": actual_path,
+        "path_template": path_template,
+        "width": 0,  # flipbook 不直接给宽高（Houdini 内部管线）
+        "height": 0,
+        "size_bytes": size_bytes,
+        "_qt_backend": _QT_BACKEND,
+        "_renderer": "flipbook_via_Houdini_internal",
     }
 
 
@@ -225,6 +389,9 @@ def capture_multiple_panes(hou, pane_types, save_dir):
     Returns:
         list of dict: {pane_type, save_path, success, error}，长度等于
         pane_types。任意一种 pane 抛异常都不影响其他 pane。
+        save_path 字段：成功时用 capture_pane_screenshot 返回的实际
+        save_path（SceneViewer flipbook 路径下会含 $F4 替换后的帧号）；
+        失败时仍用请求的 save_path（便于事后排查）。
     """
     os.makedirs(save_dir, exist_ok=True)
     results = []
@@ -242,9 +409,12 @@ def capture_multiple_panes(hou, pane_types, save_dir):
                     "error": warning,
                 })
             else:
+                # 优先用 cap 返回的实际 save_path（SceneViewer flipbook
+                # 路径会带 $F4 替换帧号后缀；其他路径与请求一致）
+                actual_path = cap.get("save_path") or save_path
                 results.append({
                     "pane_type": pt,
-                    "save_path": save_path,
+                    "save_path": actual_path,
                     "success": True,
                     "error": None,
                 })

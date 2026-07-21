@@ -247,11 +247,17 @@ class _FakePaneTabType(object):
 
 
 class _FakeViewport(object):
-    def __init__(self):
+    def __init__(self, camera=None):
         self.home_calls = []
+        self._camera = camera
 
     def home(self):
         self.home_calls.append(True)
+
+    def camera(self):
+        # Bug B 新增：flipbook 路径会探测 curViewport().camera()，
+        # 默认返 None（视口无相机时不新建 cam 节点，符合 user spec）
+        return self._camera
 
 
 class _FakePaneTab(object):
@@ -265,6 +271,10 @@ class _FakePaneTab(object):
         self._cd_calls = []
         self._qt_widget = widget
         self._viewport = _FakeViewport() if has_viewport else None
+        # flipbook 录制（Bug B 新增）：SceneViewer 走 flipbook 路径
+        self.flipbook_calls = []
+        # flipbook 失败模拟（默认成功；测试可显式置 True）
+        self._flipbook_raise = False
 
     def name(self):
         return self._name
@@ -280,6 +290,25 @@ class _FakePaneTab(object):
 
     def qtWidget(self):
         return self._qt_widget
+
+    def flipbook(self, settings, viewport=None):
+        """记录调用（Bug B 新增 flipbook 路径，H21 API 接受 viewport 第二参）。"""
+        self.flipbook_calls.append(settings)
+        if self._flipbook_raise:
+            raise RuntimeError("simulated flipbook failure")
+        # 模拟 hou.SceneViewer.flipbook 真实行为：写出文件到 $F4 替换后路径
+        # 便于测试断言 size_bytes > 0
+        try:
+            output = getattr(settings, "output", None)
+            if output and "$F4" in output:
+                # 取 frameRange 第一个元素（start frame）作为 $F4 替换
+                fr = getattr(settings, "frameRange", (1, 1))
+                frame_num = fr[0] if isinstance(fr, (tuple, list)) else 1
+                actual = output.replace("$F4", str(int(frame_num)).zfill(4))
+                with open(actual, "wb") as f:
+                    f.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 50)
+        except Exception:
+            pass  # 测试不强制写文件成功
 
 
 class _FakeDesktop(object):
@@ -321,14 +350,40 @@ class _FakeNode(object):
 
 
 class _FakeHou(object):
-    def __init__(self, pane_tabs_by_type=None, desktops=None, nodes=None):
+    def __init__(self, pane_tabs_by_type=None, desktops=None, nodes=None,
+                 frame_value=1):
         self.paneTabType = _FakePaneTabType()
         self.ui = _FakeUI(pane_tabs_by_type=pane_tabs_by_type,
                           desktops=desktops)
         self._nodes = nodes or {}
+        # Bug B 新增：flipbook 路径会调 hou.frame() 取当前帧
+        self._frame_value = frame_value
+        # Bug B 新增：flipbook 路径会构造 hou.FlipbookSettings()
+        self.FlipbookSettings = _FakeFlipbookSettings
 
     def node(self, path):
         return self._nodes.get(path)
+
+    def frame(self):
+        return self._frame_value
+
+
+class _FakeFlipbookSettings(object):
+    """Mock hou.FlipbookSettings — Bug B flipbook 路径用。"""
+    def __init__(self):
+        # 用 dict 存所有属性赋值（hou.FlipbookSettings 是 BIF 类，
+        # 但本测试不需要 BIF 真实类型，duck-typing 即可）
+        self._attrs = {}
+
+    def __setattr__(self, name, value):
+        if name == "_attrs":
+            super(_FakeFlipbookSettings, self).__setattr__(name, value)
+        else:
+            self._attrs[name] = value
+
+    def __getattr__(self, name):
+        # 测试断言用
+        return self._attrs.get(name)
 
 
 def _make_hou_with_scene_viewer(widget):
@@ -552,10 +607,12 @@ class FitPaneContentsTests(unittest.TestCase):
 class CapturePaneScreenshotNoQtTests(unittest.TestCase):
 
     def test_no_qt_returns_warning(self):
+        # Bug B 改后 SceneViewer 走 flipbook 路径（不依赖 PySide），
+        # 所以 _warning 测试改用 NetworkEditor（仍走 Qt grab 路径）
         hou = _FakeHou()
-        result = pcp.capture_pane_screenshot(hou, "SceneViewer")
+        result = pcp.capture_pane_screenshot(hou, "NetworkEditor")
         self.assertIn("_warning", result)
-        self.assertEqual(result["pane_type"], "SceneViewer")
+        self.assertEqual(result["pane_type"], "NetworkEditor")
         self.assertEqual(result["width"], 0)
         self.assertEqual(result["height"], 0)
         self.assertEqual(result["_qt_backend"], None)
@@ -590,14 +647,15 @@ class CapturePaneScreenshotWithQtTests(unittest.TestCase):
         self.assertEqual(self.pcp._QT_BACKEND, "PySide6")
 
     def test_normal_capture_with_save_path(self):
+        # Bug B：SceneViewer 改走 flipbook；Qt grab 路径测试改用 NetworkEditor
         widget = _FakeQWidget(w=1024, h=768)
-        hou = _make_hou_with_scene_viewer(widget)
+        hou, ne = _make_hou_with_network_editor(widget=widget)
         tmpdir = tempfile.mkdtemp()
         try:
             save_path = os.path.join(tmpdir, "out.png")
             result = self.pcp.capture_pane_screenshot(
-                hou, "SceneViewer", save_path=save_path)
-            self.assertEqual(result["pane_type"], "SceneViewer")
+                hou, "NetworkEditor", save_path=save_path)
+            self.assertEqual(result["pane_type"], "NetworkEditor")
             self.assertEqual(result["save_path"], save_path)
             self.assertEqual(result["width"], 1024)
             self.assertEqual(result["height"], 768)
@@ -609,15 +667,17 @@ class CapturePaneScreenshotWithQtTests(unittest.TestCase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_capture_without_save_path_uses_qbuffer(self):
+        # Bug B：SceneViewer 改走 flipbook；Qt grab 路径测试改用 NetworkEditor
         widget = _FakeQWidget(w=800, h=600)
-        hou = _make_hou_with_scene_viewer(widget)
-        result = self.pcp.capture_pane_screenshot(hou, "SceneViewer")
+        hou, ne = _make_hou_with_network_editor(widget=widget)
+        result = self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
         self.assertIsNone(result["save_path"])
         self.assertEqual(result["width"], 800)
         self.assertEqual(result["height"], 600)
         self.assertGreater(result["size_bytes"], 0)
 
     def test_no_pane_raises_value_error(self):
+        # Bug B：仍保留 SceneViewer 测 ValueError（flipbook 路径同样要查 pane）
         widget = _FakeQWidget()
         # Empty by_type dict => paneTabOfType returns None
         hou = _FakeHou(pane_tabs_by_type={})
@@ -625,11 +685,12 @@ class CapturePaneScreenshotWithQtTests(unittest.TestCase):
             self.pcp.capture_pane_screenshot(hou, "SceneViewer")
 
     def test_no_widget_raises_runtime_error(self):
-        # Pane exists but qtWidget() returns None
+        # Bug B：SceneViewer 不再走 Qt grab，widget 检查无意义；
+        # 改测 NetworkEditor（仍走 Qt grab 路径，widget=None 应 RuntimeError）
         pane = _FakePaneTab(widget=None)
-        hou = _FakeHou(pane_tabs_by_type={_FakePaneTabType.SceneViewer: pane})
+        hou = _FakeHou(pane_tabs_by_type={_FakePaneTabType.NetworkEditor: pane})
         with self.assertRaises(RuntimeError):
-            self.pcp.capture_pane_screenshot(hou, "SceneViewer")
+            self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
 
     def test_fit_contents_false_skips_fit(self):
         widget = _FakeQWidget()
@@ -643,40 +704,43 @@ class CapturePaneScreenshotWithQtTests(unittest.TestCase):
 
     # ----- Important 1: grab exception handling (RED) -----
     def test_grab_returns_none_raises_runtime_error(self):
-        """widget.grab() 返回 None 必须抛 RuntimeError，不能 AttributeError."""
+        """widget.grab() 返回 None 必须抛 RuntimeError，不能 AttributeError.
+        Bug B：SceneViewer 改走 flipbook，Qt grab 测试改用 NetworkEditor."""
         class _NoneGrabWidget(_FakeQWidget):
             def grab(self):
                 return None
         widget = _NoneGrabWidget()
-        hou = _make_hou_with_scene_viewer(widget)
+        hou, ne = _make_hou_with_network_editor(widget=widget)
         with self.assertRaises(RuntimeError):
-            self.pcp.capture_pane_screenshot(hou, "SceneViewer")
+            self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
 
     def test_grab_raises_runtime_error_wraps_with_cause(self):
-        """widget.grab() 自身抛异常时必须包装为 RuntimeError 并保留 __cause__."""
+        """widget.grab() 自身抛异常时必须包装为 RuntimeError 并保留 __cause__.
+        Bug B：Qt grab 测试改用 NetworkEditor."""
         class _ExplodingGrabWidget(_FakeQWidget):
             def grab(self):
                 raise RuntimeError("explosion in grab")
         widget = _ExplodingGrabWidget()
-        hou = _make_hou_with_scene_viewer(widget)
+        hou, ne = _make_hou_with_network_editor(widget=widget)
         with self.assertRaises(RuntimeError) as cm:
-            self.pcp.capture_pane_screenshot(hou, "SceneViewer")
+            self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
         # Must preserve original cause chain
         self.assertIsNotNone(cm.exception.__cause__)
         self.assertIn("explosion in grab", str(cm.exception.__cause__))
 
     def test_pixmap_is_null_raises_runtime_error(self):
-        """widget.grab() 返回 isNull()==True pixmap 必须抛 RuntimeError."""
+        """widget.grab() 返回 isNull()==True pixmap 必须抛 RuntimeError.
+        Bug B：Qt grab 测试改用 NetworkEditor."""
         class _NullPixmapGrabWidget(_FakeQWidget):
             def grab(self):
                 return _FakeQPixmap(100, 100, null=True)
         widget = _NullPixmapGrabWidget()
-        hou = _make_hou_with_scene_viewer(widget)
+        hou, ne = _make_hou_with_network_editor(widget=widget)
         with self.assertRaises(RuntimeError):
-            self.pcp.capture_pane_screenshot(hou, "SceneViewer")
+            self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
 
     def test_to_image_returns_none_raises_runtime_error(self):
-        """pixmap.toImage() 返回 None 必须抛 RuntimeError."""
+        """pixmap.toImage() 返回 None 必须抛 RuntimeError. Bug B: NetworkEditor."""
         class _NoneImagePixmap(_FakeQPixmap):
             def toImage(self):
                 return None
@@ -684,12 +748,13 @@ class CapturePaneScreenshotWithQtTests(unittest.TestCase):
             def grab(self):
                 return _NoneImagePixmap(100, 100)
         widget = _NoneImageWidget()
-        hou = _make_hou_with_scene_viewer(widget)
+        hou, ne = _make_hou_with_network_editor(widget=widget)
         with self.assertRaises(RuntimeError):
-            self.pcp.capture_pane_screenshot(hou, "SceneViewer")
+            self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
 
     def test_to_image_raises_runtime_error_wraps_with_cause(self):
-        """pixmap.toImage() 抛异常时必须包装为 RuntimeError 并保留 __cause__."""
+        """pixmap.toImage() 抛异常时必须包装为 RuntimeError 并保留 __cause__.
+        Bug B：Qt grab 测试改用 NetworkEditor."""
         class _ExplodingToImagePixmap(_FakeQPixmap):
             def toImage(self):
                 raise RuntimeError("explosion in toImage")
@@ -697,36 +762,38 @@ class CapturePaneScreenshotWithQtTests(unittest.TestCase):
             def grab(self):
                 return _ExplodingToImagePixmap(100, 100)
         widget = _ExplodingToImageWidget()
-        hou = _make_hou_with_scene_viewer(widget)
+        hou, ne = _make_hou_with_network_editor(widget=widget)
         with self.assertRaises(RuntimeError) as cm:
-            self.pcp.capture_pane_screenshot(hou, "SceneViewer")
+            self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
         self.assertIsNotNone(cm.exception.__cause__)
         self.assertIn("explosion in toImage", str(cm.exception.__cause__))
 
     def test_image_is_null_raises_runtime_error(self):
-        """pixmap.toImage() 返回 isNull()==True image 必须抛 RuntimeError."""
+        """pixmap.toImage() 返回 isNull()==True image 必须抛 RuntimeError.
+        Bug B：Qt grab 测试改用 NetworkEditor."""
         class _NullImageWidget(_FakeQWidget):
             def grab(self):
                 p = _FakeQPixmap(100, 100, null=True)
                 # Also make toImage() return a null image
                 return p
         widget = _NullImageWidget()
-        hou = _make_hou_with_scene_viewer(widget)
+        hou, ne = _make_hou_with_network_editor(widget=widget)
         with self.assertRaises(RuntimeError):
-            self.pcp.capture_pane_screenshot(hou, "SceneViewer")
+            self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
 
     def test_grab_error_message_includes_pane_type(self):
-        """RuntimeError 消息必须包含 pane 类型名便于排错."""
+        """RuntimeError 消息必须包含 pane 类型名便于排错.
+        Bug B：Qt grab 测试改用 NetworkEditor."""
         class _NoneGrabWidget(_FakeQWidget):
             def grab(self):
                 return None
         widget = _NoneGrabWidget()
-        hou = _make_hou_with_scene_viewer(widget)
+        hou, ne = _make_hou_with_network_editor(widget=widget)
         try:
-            self.pcp.capture_pane_screenshot(hou, "SceneViewer")
+            self.pcp.capture_pane_screenshot(hou, "NetworkEditor")
             self.fail("Expected RuntimeError")
         except RuntimeError as e:
-            self.assertIn("SceneViewer", str(e))
+            self.assertIn("NetworkEditor", str(e))
 
 
 # ===========================================================================
@@ -754,9 +821,10 @@ class CapturePaneScreenshotPySide2Tests(unittest.TestCase):
         self.assertEqual(self.pcp2._QT_BACKEND, "PySide2")
 
     def test_capture_with_pyside2(self):
+        # Bug B：SceneViewer 改走 flipbook；PySide2 Qt grab 测试改用 NetworkEditor
         widget = _FakeQWidget(w=320, h=240)
-        hou = _make_hou_with_scene_viewer(widget)
-        result = self.pcp2.capture_pane_screenshot(hou, "SceneViewer")
+        hou, ne = _make_hou_with_network_editor(widget=widget)
+        result = self.pcp2.capture_pane_screenshot(hou, "NetworkEditor")
         self.assertEqual(result["_qt_backend"], "PySide2")
         self.assertEqual(result["width"], 320)
         self.assertEqual(result["height"], 240)
@@ -971,10 +1039,11 @@ class ApplyResponseCapIntegrationTests(unittest.TestCase):
     without raising and without mutating semantics (size enforcement)."""
 
     def test_capture_pane_screenshot_passes_through_cap(self):
+        # Bug B：SceneViewer 改走 flipbook；cap 测试改用 NetworkEditor
         hou = _FakeHou()
-        result = pcp.capture_pane_screenshot(hou, "SceneViewer")
+        result = pcp.capture_pane_screenshot(hou, "NetworkEditor")
         capped = cmn.apply_response_cap(result, 16384)
-        self.assertEqual(capped.get("pane_type"), "SceneViewer")
+        self.assertEqual(capped.get("pane_type"), "NetworkEditor")
 
     def test_list_visible_panes_passes_through_cap(self):
         p1 = _FakePaneTab(name="p1")
