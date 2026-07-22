@@ -303,6 +303,11 @@ class GetHoudiniHelpTests(unittest.TestCase):
 
     def setUp(self):
         self.mod = _load_help_fresh()
+        # local-help-first-fallback: 既有 ~10 个测试断言 called URL == sidefx
+        # (local-first 后首批 urlopen 指向本地)。设 LOCAL_HELP_DISABLED=True
+        # 退化为"仅在线"语义，让既有"仅在线"断言原样通过（design.md §4 方式 1）。
+        # 新行为由独立 LocalFirstHelpTests 类覆盖。
+        self.mod.LOCAL_HELP_DISABLED = True
 
     def test_mock_200_success(self):
         fake_html = (
@@ -479,6 +484,463 @@ class GetHoudiniHelpTests(unittest.TestCase):
                       if hasattr(called_req, "full_url") else called_req)
         self.assertIn("box%20SOP%20size%20param", called_url)
         self.assertNotIn(" ", called_url.rsplit("/", 1)[-1])
+
+
+# ===========================================================================
+# local-help-first-fallback: LocalFirstHelpTests
+# ===========================================================================
+class LocalFirstHelpTests(unittest.TestCase):
+    """Cover the local-first + fallback + health-cache + white-screen flow
+    (spec scenarios: local-first 顺序 / fallback 触发 / 白屏 / cooldown)。
+
+    urllib is mocked so no real network happens. Each test reloads _help
+    fresh so the module-level health cache / env-var constants reset.
+    """
+
+    def setUp(self):
+        self.mod = _load_help_fresh()
+        # Default: local-first ENABLED (LOCAL_HELP_DISABLED=False after reload)
+
+    def _local_html(self, title="Box", summary="Box geometry node.",
+                    parameters=None):
+        """Build a valid (non-white-screen) local HTML for node help_type."""
+        params_html = ""
+        if parameters:
+            for p in parameters:
+                params_html += '<div class="parameter">%s</div>' % p
+        return (
+            "<html><body>"
+            "<h1 class='title'>%s</h1>"
+            "<p class='summary'>%s</p>"
+            "%s"
+            "</body></html>" % (title, summary, params_html))
+
+    def _online_html(self, title="Grid", summary="Creates a grid."):
+        return ("<html><body>"
+                "<h1 class='title'>%s</h1>"
+                "<p class='summary'>%s</p>"
+                "</body></html>" % (title, summary))
+
+    def _make_urlopen_side_effect(self, per_url_responses):
+        """Build a side_effect that dispatches based on the request URL.
+
+        per_url_responses: list of (substring, result) where result is either
+        a Mock response (200 + bytes) or an Exception instance to raise.
+        """
+        def _side_effect(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else req
+            for substr, result in per_url_responses:
+                if substr in url:
+                    if isinstance(result, Exception):
+                        raise result
+                    return result
+            # default: raise URLError (unexpected URL)
+            raise __import__("urllib.error", fromlist=["URLError"]).URLError(
+                "unexpected url: %s" % url)
+        return _side_effect
+
+    def _mock_200(self, html_text):
+        return _make_mock_urlopen(200, html_text)
+
+    # ------------------------------------------------------------------
+    # 3.2.1 local healthy + 200 + valid content → _source=="local"
+    # ------------------------------------------------------------------
+    def test_local_success_returns_local_source(self):
+        local_html = self._local_html()
+        with mock.patch("urllib.request.urlopen") as mu:
+            mu.side_effect = self._make_urlopen_side_effect([
+                ("127.0.0.1:48626", self._mock_200(local_html)),
+            ])
+            result = self.mod.get_houdini_help("sop", "box")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["_source"], "local")
+        self.assertEqual(result["_fallback_reason"], "")
+        # called URL is the LOCAL one (127.0.0.1:48626)
+        called_url = mu.call_args[0][0]
+        url = called_url.full_url if hasattr(called_url, "full_url") else called_url
+        self.assertIn("127.0.0.1:48626", url)
+        self.assertIn("/nodes/sop/box", url)
+
+    # ------------------------------------------------------------------
+    # 3.2.2 local timeout → fallback online success → _source=="online",
+    #       _fallback_reason=="local_timeout"
+    # ------------------------------------------------------------------
+    def test_local_timeout_fallbacks_to_online(self):
+        online_html = self._online_html()
+        timeout_exc = socket.timeout("local timed out")
+        with mock.patch("urllib.request.urlopen") as mu:
+            mu.side_effect = self._make_urlopen_side_effect([
+                ("127.0.0.1:48626", timeout_exc),
+                ("sidefx.com", self._mock_200(online_html)),
+            ])
+            result = self.mod.get_houdini_help("sop", "grid")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["_source"], "online")
+        self.assertEqual(result["_fallback_reason"], "local_timeout")
+
+    # ------------------------------------------------------------------
+    # 3.2.3 local HTTP 500 → fallback online → _fallback_reason contains
+    #       "local_http_500"
+    # ------------------------------------------------------------------
+    def test_local_http_500_fallbacks_to_online(self):
+        online_html = self._online_html()
+        err_mod = __import__("urllib.error", fromlist=["HTTPError"])
+        http500 = err_mod.HTTPError(
+            url="http://127.0.0.1:48626/x", code=500,
+            msg="Internal Server Error", hdrs=None, fp=None)
+        with mock.patch("urllib.request.urlopen") as mu:
+            mu.side_effect = self._make_urlopen_side_effect([
+                ("127.0.0.1:48626", http500),
+                ("sidefx.com", self._mock_200(online_html)),
+            ])
+            result = self.mod.get_houdini_help("sop", "grid")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["_source"], "online")
+        self.assertIn("local_http_500", result["_fallback_reason"])
+
+    # ------------------------------------------------------------------
+    # 3.2.4 local 200 white-screen (title empty) → fallback online →
+    #       _fallback_reason=="local_empty_content"
+    # ------------------------------------------------------------------
+    def test_local_white_screen_fallbacks_to_online(self):
+        # white-screen: HTTP 200 but title empty (and no summary/params/...)
+        white_html = "<html><body></body></html>"
+        online_html = self._online_html()
+        with mock.patch("urllib.request.urlopen") as mu:
+            mu.side_effect = self._make_urlopen_side_effect([
+                ("127.0.0.1:48626", self._mock_200(white_html)),
+                ("sidefx.com", self._mock_200(online_html)),
+            ])
+            result = self.mod.get_houdini_help("sop", "box")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["_source"], "online")
+        self.assertEqual(result["_fallback_reason"], "local_empty_content")
+
+    # ------------------------------------------------------------------
+    # 3.2.5 local unhealthy (cooldown window) → skip local, go straight to
+    #       online, _fallback_reason=="local_unhealthy_skipped", local
+    #       urlopen NOT called
+    # ------------------------------------------------------------------
+    def test_cooldown_skips_local(self):
+        # force cooldown: mark unhealthy BEFORE the call
+        self.mod._mark_local_unhealthy()
+        self.assertFalse(self.mod._local_healthy())
+
+        online_html = self._online_html()
+        with mock.patch("urllib.request.urlopen") as mu:
+            mu.side_effect = self._make_urlopen_side_effect([
+                ("sidefx.com", self._mock_200(online_html)),
+            ])
+            result = self.mod.get_houdini_help("sop", "grid")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["_source"], "online")
+        self.assertEqual(result["_fallback_reason"], "local_unhealthy_skipped")
+        # exactly ONE urlopen call, and it MUST be the online (sidefx) URL
+        self.assertEqual(mu.call_count, 1)
+        called_url = mu.call_args[0][0]
+        url = called_url.full_url if hasattr(called_url, "full_url") else called_url
+        self.assertIn("sidefx.com", url)
+        self.assertNotIn("127.0.0.1", url)
+
+    # ------------------------------------------------------------------
+    # 3.2.6 both sides fail → status=="error", _source=="online" (last try)
+    # ------------------------------------------------------------------
+    def test_both_sides_fail_returns_error(self):
+        err_mod = __import__("urllib.error", fromlist=["HTTPError", "URLError"])
+        local_err = err_mod.URLError("local unreachable")
+        online_err = err_mod.HTTPError(
+            url="x", code=503, msg="Service Unavailable", hdrs=None, fp=None)
+        with mock.patch("urllib.request.urlopen") as mu:
+            mu.side_effect = self._make_urlopen_side_effect([
+                ("127.0.0.1:48626", local_err),
+                ("sidefx.com", online_err),
+            ])
+            result = self.mod.get_houdini_help("sop", "grid")
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["_source"], "online")
+        # _fallback_reason should reflect the local failure (network_error)
+        self.assertIn("local_network_error", result["_fallback_reason"])
+        # spec Scenario 1：两边都失败时 error 字段须含本地与在线两次失败原因
+        # （本地 reason="local_network_error" 是真实探测失败，非 cooldown 跳过，
+        # 故合并进 error）。本地 reason 串 + 在线 HTTP 503 标识都应出现。
+        self.assertIn("local_network_error", result["error"])
+        self.assertIn("503", result["error"])
+
+    # ------------------------------------------------------------------
+    # 3.2.6b cooldown 跳过本地 + 在线也失败 → error 只是在线原因，
+    #       不被 skip reason 污染（双重失败语义聚焦"本地真探测失败 +
+    #       在线也失败"；cooldown 跳过不算本地失败）。_fallback_reason
+    #       仍记录 "local_unhealthy_skipped"。
+    # ------------------------------------------------------------------
+    def test_cooldown_skip_online_fail_error_not_polluted(self):
+        err_mod = __import__("urllib.error", fromlist=["HTTPError"])
+        # force cooldown BEFORE the call → 本地被跳过，reason 变 skip
+        self.mod._mark_local_unhealthy()
+        self.assertFalse(self.mod._local_healthy())
+
+        online_err = err_mod.HTTPError(
+            url="x", code=503, msg="Service Unavailable", hdrs=None, fp=None)
+        with mock.patch("urllib.request.urlopen") as mu:
+            mu.side_effect = self._make_urlopen_side_effect([
+                ("sidefx.com", online_err),
+            ])
+            result = self.mod.get_houdini_help("sop", "grid")
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["_source"], "online")
+        # _fallback_reason 记录跳过原因（结构化字段保留）
+        self.assertEqual(result["_fallback_reason"], "local_unhealthy_skipped")
+        # error 只是在线原因，不含本地 skip reason（未被污染）
+        self.assertIn("503", result["error"])
+        self.assertNotIn("local_unhealthy_skipped", result["error"])
+        self.assertNotIn("[local:", result["error"])
+        # 本地未被调用（cooldown 生效）
+        self.assertEqual(mu.call_count, 1)
+
+    # ------------------------------------------------------------------
+    # 3.2.7 LOCAL_HELP_DISABLED=True → _source=="", called URL == sidefx
+    # ------------------------------------------------------------------
+    def test_disabled_local_first_acts_like_online_only(self):
+        self.mod.LOCAL_HELP_DISABLED = True
+        online_html = self._online_html()
+        with mock.patch("urllib.request.urlopen") as mu:
+            mu.side_effect = self._make_urlopen_side_effect([
+                ("sidefx.com", self._mock_200(online_html)),
+            ])
+            result = self.mod.get_houdini_help("sop", "grid")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["_source"], "")
+        self.assertEqual(result["_fallback_reason"], "")
+        # exactly ONE urlopen call → online sidefx
+        self.assertEqual(mu.call_count, 1)
+        called_url = mu.call_args[0][0]
+        url = called_url.full_url if hasattr(called_url, "full_url") else called_url
+        self.assertIn("sidefx.com", url)
+        self.assertNotIn("127.0.0.1", url)
+
+    # ------------------------------------------------------------------
+    # Extra: successful local probe after cooldown clears the unhealthy flag
+    # ------------------------------------------------------------------
+    def test_successful_local_probe_clears_cooldown(self):
+        # Start in cooldown, but the test sets cooldown to 0 so the FIRST
+        # call already probes local again. This mirrors spec: "cooldown
+        # 过期后下一次调用重新探测本地（探测成功则恢复 healthy）".
+        self.mod.LOCAL_HELP_COOLDOWN = 0.0
+        # Also ensure health is reset so first call probes local
+        self.mod._reset_local_health()
+
+        local_html = self._local_html()
+        with mock.patch("urllib.request.urlopen") as mu:
+            mu.side_effect = self._make_urlopen_side_effect([
+                ("127.0.0.1:48626", self._mock_200(local_html)),
+            ])
+            result = self.mod.get_houdini_help("sop", "box")
+        self.assertEqual(result["_source"], "local")
+        # health should still be "healthy" after a successful probe
+        self.assertTrue(self.mod._local_healthy())
+
+
+# ===========================================================================
+# local-help-first-fallback: LocalUrlDerivationTests
+# ===========================================================================
+class LocalUrlDerivationTests(unittest.TestCase):
+    """Cover `_local_url_for` for all 11 help_types + edge cases (task 3.3)."""
+
+    def setUp(self):
+        self.mod = _load_help_fresh()
+
+    def test_all_help_types_derive_local_url(self):
+        # Default LOCAL_HELP_BASE = http://127.0.0.1:48626/
+        for help_type, online_prefix in self.mod.HELP_TYPE_URLS.items():
+            online_url = online_prefix + "someitem"
+            local_url = self.mod._local_url_for(online_url)
+            self.assertIn("127.0.0.1:48626", local_url,
+                          "help_type %s local URL missing base: %s"
+                          % (help_type, local_url))
+            # must NOT contain the sidefx online prefix
+            self.assertNotIn("sidefx.com", local_url)
+            # must contain the suffix after /docs/houdini
+            suffix = online_url[len(self.mod._ONLINE_PREFIX):].lstrip("/")
+            self.assertTrue(local_url.endswith(suffix),
+                            "help_type %s local URL %r does not end with %r"
+                            % (help_type, local_url, suffix))
+
+    def test_strips_docs_houdini_prefix(self):
+        online = "https://www.sidefx.com/docs/houdini/nodes/sop/box.html"
+        local = self.mod._local_url_for(online)
+        self.assertEqual(local, "http://127.0.0.1:48626/nodes/sop/box.html")
+
+    def test_custom_base_used(self):
+        self.mod.LOCAL_HELP_BASE = "http://127.0.0.1:50000/"
+        online = "https://www.sidefx.com/docs/houdini/nodes/sop/box.html"
+        local = self.mod._local_url_for(online)
+        self.assertEqual(local, "http://127.0.0.1:50000/nodes/sop/box.html")
+
+    def test_custom_base_without_trailing_slash(self):
+        self.mod.LOCAL_HELP_BASE = "http://127.0.0.1:50000"
+        online = "https://www.sidefx.com/docs/houdini/nodes/sop/box.html"
+        local = self.mod._local_url_for(online)
+        # rstrip("/") + "/" should normalize correctly
+        self.assertEqual(local, "http://127.0.0.1:50000/nodes/sop/box.html")
+
+    def test_non_sidefx_url_returned_verbatim(self):
+        weird = "https://example.com/some/other/path.html"
+        self.assertEqual(self.mod._local_url_for(weird), weird)
+
+
+# ===========================================================================
+# local-help-first-fallback: LocalContentValidationTests
+# ===========================================================================
+class LocalContentValidationTests(unittest.TestCase):
+    """Cover `_validate_local_content` truth-table (task 3.4)."""
+
+    def setUp(self):
+        self.mod = _load_help_fresh()
+
+    def _result(self, title="", summary="", parameters=None,
+                inputs=None, outputs=None, methods=None):
+        return {
+            "title": title,
+            "summary": summary,
+            "parameters": parameters or [],
+            "inputs": inputs or [],
+            "outputs": outputs or [],
+            "methods": methods or [],
+        }
+
+    # --- node help_types ---
+    def test_node_valid_title_and_summary(self):
+        r = self._result(title="Box", summary="A box node.")
+        for ht in ("sop", "obj", "dop", "cop2", "chop", "vop",
+                   "lop", "top", "rop"):
+            self.assertTrue(self.mod._validate_local_content(r, ht),
+                            "help_type %s should be valid" % ht)
+
+    def test_node_valid_title_and_params_no_summary(self):
+        r = self._result(title="Box", summary="",
+                         parameters=[{"text": "Size"}])
+        self.assertTrue(self.mod._validate_local_content(r, "sop"))
+
+    def test_node_valid_title_and_inputs_only(self):
+        r = self._result(title="Box", inputs=[{"text": "geo"}])
+        self.assertTrue(self.mod._validate_local_content(r, "sop"))
+
+    def test_node_white_screen_empty_title(self):
+        r = self._result(title="", summary="A box node.")
+        self.assertFalse(self.mod._validate_local_content(r, "sop"))
+
+    def test_node_white_screen_title_but_empty_body(self):
+        # title present but no summary/params/inputs/outputs → invalid
+        r = self._result(title="Box")
+        self.assertFalse(self.mod._validate_local_content(r, "sop"))
+
+    # --- python_hou ---
+    def test_python_hou_valid_title(self):
+        r = self._result(title="hou.Node")
+        self.assertTrue(self.mod._validate_local_content(r, "python_hou"))
+
+    def test_python_hou_valid_methods_no_title(self):
+        r = self._result(title="", methods=[{"text": "setPosition"}])
+        self.assertTrue(self.mod._validate_local_content(r, "python_hou"))
+
+    def test_python_hou_invalid_empty_both(self):
+        r = self._result(title="", methods=[])
+        self.assertFalse(self.mod._validate_local_content(r, "python_hou"))
+
+    # --- vex_function ---
+    def test_vex_function_valid_title(self):
+        r = self._result(title="chi()")
+        self.assertTrue(self.mod._validate_local_content(r, "vex_function"))
+
+    def test_vex_function_invalid_empty_title(self):
+        r = self._result(title="", methods=[{"text": "x"}])
+        # vex_function requires title only; methods ignored
+        self.assertFalse(self.mod._validate_local_content(r, "vex_function"))
+
+
+# ===========================================================================
+# local-help-first-fallback: EnvOverrideTests
+# ===========================================================================
+class EnvOverrideTests(unittest.TestCase):
+    """Cover env-var reading at import time + clamp + reload (task 3.5)."""
+
+    def setUp(self):
+        # Stash + clear any relevant env vars before each reload
+        self._stash = {}
+        for k in ("HOUDINI_MCP_LOCAL_HELP_URL",
+                  "HOUDINI_MCP_LOCAL_HELP_TIMEOUT",
+                  "HOUDINI_MCP_LOCAL_HELP_COOLDOWN",
+                  "HOUDINI_MCP_LOCAL_HELP_DISABLE"):
+            self._stash[k] = os.environ.get(k)
+            if k in os.environ:
+                del os.environ[k]
+
+    def tearDown(self):
+        # restore env
+        for k, v in self._stash.items():
+            if v is None:
+                if k in os.environ:
+                    del os.environ[k]
+            else:
+                os.environ[k] = v
+
+    def test_defaults_when_env_unset(self):
+        mod = _load_help_fresh()
+        self.assertEqual(mod.LOCAL_HELP_BASE, "http://127.0.0.1:48626/")
+        self.assertAlmostEqual(mod.LOCAL_HELP_TIMEOUT, 2.5)
+        self.assertAlmostEqual(mod.LOCAL_HELP_COOLDOWN, 60.0)
+        self.assertFalse(mod.LOCAL_HELP_DISABLED)
+
+    def test_custom_url_override(self):
+        os.environ["HOUDINI_MCP_LOCAL_HELP_URL"] = "http://127.0.0.1:50000/"
+        mod = _load_help_fresh()
+        self.assertEqual(mod.LOCAL_HELP_BASE, "http://127.0.0.1:50000/")
+
+    def test_timeout_clamped_low(self):
+        os.environ["HOUDINI_MCP_LOCAL_HELP_TIMEOUT"] = "0.1"
+        mod = _load_help_fresh()
+        self.assertAlmostEqual(mod.LOCAL_HELP_TIMEOUT, 0.5)  # clamped to lo
+
+    def test_timeout_clamped_high(self):
+        os.environ["HOUDINI_MCP_LOCAL_HELP_TIMEOUT"] = "999"
+        mod = _load_help_fresh()
+        self.assertAlmostEqual(mod.LOCAL_HELP_TIMEOUT, 30.0)  # clamped to hi
+
+    def test_timeout_valid_value(self):
+        os.environ["HOUDINI_MCP_LOCAL_HELP_TIMEOUT"] = "5.0"
+        mod = _load_help_fresh()
+        self.assertAlmostEqual(mod.LOCAL_HELP_TIMEOUT, 5.0)
+
+    def test_timeout_invalid_falls_back_to_default(self):
+        os.environ["HOUDINI_MCP_LOCAL_HELP_TIMEOUT"] = "not-a-number"
+        mod = _load_help_fresh()
+        self.assertAlmostEqual(mod.LOCAL_HELP_TIMEOUT, 2.5)
+
+    def test_cooldown_clamped(self):
+        os.environ["HOUDINI_MCP_LOCAL_HELP_COOLDOWN"] = "-5"
+        mod = _load_help_fresh()
+        self.assertAlmostEqual(mod.LOCAL_HELP_COOLDOWN, 0.0)
+
+    def test_disable_true_variants(self):
+        for val in ("1", "true", "TRUE", "Yes", "on"):
+            os.environ["HOUDINI_MCP_LOCAL_HELP_DISABLE"] = val
+            mod = _load_help_fresh()
+            self.assertTrue(mod.LOCAL_HELP_DISABLED,
+                            "DISABLE=%r should be True" % val)
+
+    def test_disable_false_variants(self):
+        for val in ("0", "false", "no", "off", "", "garbage"):
+            os.environ["HOUDINI_MCP_LOCAL_HELP_DISABLE"] = val
+            mod = _load_help_fresh()
+            self.assertFalse(mod.LOCAL_HELP_DISABLED,
+                             "DISABLE=%r should be False" % val)
+
+    def test_empty_url_falls_back_to_default(self):
+        # empty string → `or "default"` kicks in
+        os.environ["HOUDINI_MCP_LOCAL_HELP_URL"] = ""
+        mod = _load_help_fresh()
+        self.assertEqual(mod.LOCAL_HELP_BASE, "http://127.0.0.1:48626/")
 
 
 # ===========================================================================

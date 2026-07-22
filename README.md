@@ -205,8 +205,8 @@ OPUS integration is optional — without a key the server still starts, only the
 | 安全代码 | `get_last_scene_diff` | 仅 mutation 模式提供前后场景快照 |
 | 截图 | `capture_pane_screenshot` / `render_node_network` / `list_visible_panes` / `capture_multiple_panes` | pane 截图，响应走 `apply_response_cap` |
 | 渲染 | `render_viewport_base64` / `render_quad_views_base64` | base64 版，karma cpu/xpu 双 renderer |
-| 文档 | `get_houdini_help` | SideFX 在线文档解析（urllib + stdlib html.parser） |
-| 文档 | `verify_hou_api` | python_hou 默认 + `_ai_hint` 合成 | AI-friendly wrapper over `get_houdini_help`（PR 18） |
+| 文档 | `get_houdini_help` | **本地 help server 优先** + 在线 SideFX 回退（urllib + stdlib html.parser）；返 `_source`/`_fallback_reason` |
+| 文档 | `verify_hou_api` | python_hou 默认 + `_ai_hint` 合成 | AI-friendly wrapper over `get_houdini_help`（PR 18），自动继承 local-first |
 | 诊断 | `check_connection` / `ping_houdini` | 不持久化连接的 ping |
 | 缓存 | `manage_cache` | stats / invalidate / warmup |
 
@@ -237,9 +237,21 @@ orchestrator 在 `execute_code` 中尝试 `obj.setInput(0, sop, 0)`， 假定 `O
   - `hou.node(item_path).help()` 对**已存在**的节点有效（拿到的是 SideFX 同步到本地的 help server 内容）；
   - `print(hou.<Class>.<method>.__doc__)` 或 `execute_code` 跑 `help(hou.<Class>.<method>)`， 把 stdout 拿到后自己解析 Python docstring。
 - **F2 联网 SideFX 文档（F1 拿不到时）**： 调 `verify_hou_api(item_name="<Class>.<method>", help_type="python_hou")`， fork 的 PR 15 `get_houdini_help` 走 stdlib `urllib.request` 抓 `https://www.sidefx.com/docs/houdini/hom/hou/<name>.html`； 不引入新 pip 依赖。
+  - **local-help-first（自动）**：`get_houdini_help` / `verify_hou_api` **优先**打 Houdini 本地 help server（GUI 启动时自带，默认 `http://127.0.0.1:48626/`，与在线同源 Sphinx build），本地不可达 / 超时 / 白屏（HTTP 200 但内容无效）时**自动回退在线**。返回 `_source` 字段（`"local"` / `"online"` / `""`）告知实际命中方，`_fallback_reason` 说明回退原因。健康缓存：本地失败后 60s cooldown 内跳过本地直查在线，避免每次都打白屏。
 - **F3 让用户开梯子（F2 返 `status="error"` 且 `reason` 含网络关键字时）**： AI agent MUST 在自己输出里**显式**写出 "⚠ SideFX 文档站不可达（verify_hou_api 返 `status="error"` reason=`<reason>`）， 请检查网络/梯子， 或在 Houdini 内用 `hou.helpServerUrl()` 查本地帮助。"
 
 跨工具说明： 底层 = `get_houdini_help`（PR 15）； AI-friendly wrapper = `verify_hou_api`（PR 18）。 建议优先用 `verify_hou_api` 调 hou API， `get_houdini_help` 用于 SOP/OBJ 节点本身或 vex_function 查询。
+
+### 帮助查询环境变量（local-help-first-fallback）
+
+进程启动时读一次（MCP server import `_help.py` 时）：
+
+| 环境变量 | 默认 | 作用 |
+|----------|------|------|
+| `HOUDINI_MCP_LOCAL_HELP_URL` | `http://127.0.0.1:48626/` | 本地 help server base URL（多 Houdini 实例 / 自定义端口时覆盖） |
+| `HOUDINI_MCP_LOCAL_HELP_TIMEOUT` | `2.5` | 本地探测短超时（秒，clamp `[0.5, 30.0]`）；白屏/卡顿时快速回退在线 |
+| `HOUDINI_MCP_LOCAL_HELP_COOLDOWN` | `60` | 本地失败后 cooldown 窗口（秒，clamp `[0.0, 600.0]`），窗口内跳过本地直查在线 |
+| `HOUDINI_MCP_LOCAL_HELP_DISABLE` | 未设 | `1`/`true`/`yes`/`on` 时完全禁用 local-first，退化到"仅在线"（`_source` 为 `""`） |
 
 ---
 
@@ -267,7 +279,7 @@ orchestrator 在 `execute_code` 中尝试 `obj.setInput(0, sop, 0)`， 假定 `O
 | AI 连不上 9876 | `netstat -an | findstr 9876` | 关防火墙，或在 shelf 重新 Start MCP |
 | License 相关 | Houdini license server 状态 | `hkey -n` 看 license，Houdini 21 试用版过期需要重新申请 |
 | 升级后工具找不到 | Houdini 还加载着旧 plugin | 在 shelf 点 Stop MCP → 重启 Houdini → 点 Start MCP |
-| `get_houdini_help` 失败 | 网络是否能访问 `www.sidefx.com` | 失败时降级为 `hou.helpServerUrl()` 提示，详见 `_help.py` |
+| `get_houdini_help` 失败 | 本地 help server（`127.0.0.1:48626`）是否可达 + 网络是否能访问 `www.sidefx.com` | 看 `_source`/`_fallback_reason`：`online`+`local_*` 说明本地挂了已自动回退在线；两边都挂设 `HOUDINI_MCP_LOCAL_HELP_DISABLE=1` 走纯在线，详见 `_help.py` |
 
 ---
 

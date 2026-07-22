@@ -1857,13 +1857,19 @@ class HoudiniMCPServer:
     # PR 15: SideFX 在线文档查询（thin wrapper to _help + apply_response_cap）
     # -------------------------------------------------------------------------
     def get_houdini_help(self, help_type, item_name, timeout=10):
-        """PR 15：从 SideFX 在线文档抓取并解析节点/函数/方法的帮助信息。
+        """PR 15：查询 Houdini 帮助文档，**本地优先 + 在线回退**。
 
         薄封装到 _help.get_houdini_help，支持 11 个 help_type（sop / obj /
         dop / cop2 / chop / vop / lop / top / rop / vex_function /
         python_hou）。HTML 解析使用 stdlib html.parser，无需 beautifulsoup4。
-        HTTP 4xx / 5xx / 网络错误 / timeout 均降级为 status=error 字典，
-        不抛异常。响应整体过 cmn.apply_response_cap 截断大 payload。
+
+        **local-help-first-fallback**：优先打本地 help server（Houdini GUI
+        启动时自带，默认 `http://127.0.0.1:48626/`），本地不可用或白屏时
+        自动回退 SideFX 在线。返回 dict 透传 `_source`（`"local"` /
+        `"online"` / `""`）与 `_fallback_reason`（回退原因短串）供 AI 判断。
+
+        HTTP 4xx / 5xx / 网络错误 / timeout / 白屏 均降级为 status=error 字典
+        或回退在线，不抛异常。响应整体过 cmn.apply_response_cap 截断大 payload。
         """
         result = hlp.get_houdini_help(
             help_type, item_name, timeout=timeout)
@@ -1881,6 +1887,11 @@ class HoudiniMCPServer:
         与 PR 15 相同：薄封装到 _help.get_houdini_help + apply_response_cap。
         不同：额外在 result 顶层加 `_ai_hint` 字段，由模块级
         `_synthesize_ai_hint(item_name, result)` 合成。
+
+        **local-help-first-fallback**：自动继承本地优先 + 在线回退行为，
+        返回 dict 透传 `_source`（`"local"` / `"online"` / `""`）与
+        `_fallback_reason`，AI 可读 `_source` 判断本次命中本地还是在线。
+        `_ai_hint` 合成逻辑不依赖这两个 advisory 字段。
 
         `_ai_hint` 规则（参考 design.md §2）：
           - status=error                       → F3 fallback 提示
