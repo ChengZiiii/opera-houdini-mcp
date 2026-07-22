@@ -292,14 +292,30 @@ def add_wood_grain_wrangle(conn: HoudiniConn,
                         ok=False, artifact=table_path,
                         detail="err: {0}".format(msg[:200]))
 
-    # 5. 校验：get_node_info 看 table_demo 的 input 0 是不是 wood_grain
-    # F-A fix（submodule commit 9fb1b89）：_node_info.py:141 把
-    # ``node.isCooking()`` 改为 ``hasattr(node, "isCooking")`` 守门，缺失
-    # 时返回 None（不再抛 AttributeError）。本步预期在 hou.ObjNode 上直接
-    # 返回 dict（is_cooking=None），正常走输入校验逻辑。若服务端再抛任何
-    # HoudiniCallError → 视为真 FAIL，不再单独 catch isCooking 分支。
-    # conn.call 返回 envelope，需要 ``info["result"]`` 拿真正字段。
+    # 5. 校验：table_demo 已接收 wood_grain 的两条实现路径，任一成立即 PASS。
+    #   (a) H21+ display-flag 路径（Task 5 / B2 修复）：connect_nodes 不再
+    #       调 dst.setInput（H21 上 SOP→OBJ setInput 会 hang），而是改走
+    #       src.setDisplayFlag(True) + setRenderFlag(True)，响应 envelope 的
+    #       result.via == "sop_display_flag"。此路径下 OBJ 容器的
+    #       input_connectors 不会被填充，必须改查 display 标志标记。
+    #   (b) 旧 setInput 路径（legacy / 跨 parent setInput）：OBJ 容器
+    #       input_connectors[0].connections[0].output_node 指向 wood_grain。
+    # 同时命中更稳。conn.call 返回完整 envelope，需 ``info["result"]`` 取字段。
+    # resp_d 由 4.5d 的 try 块赋值（同函数作用域）；4.5d 失败时可能未定义，
+    # 用 locals().get 兜底，避免 NameError。
     try:
+        # 路径 (a)：检查 4.5d 的 connect_nodes 响应 via 标记。
+        resp_d = locals().get("resp_d")
+        via = ""
+        if isinstance(resp_d, dict):
+            inner_d = resp_d.get("result", {})
+            if isinstance(inner_d, dict):
+                via = inner_d.get("via", "") or ""
+        ok_display = (via == "sop_display_flag")
+
+        # 路径 (b)：get_node_info 看 table_demo 的 input 0 是否为 wood_grain。
+        # F-A fix（_node_info.py:141 ``hasattr(node, "isCooking")`` 守门）后
+        # ObjNode 上 is_cooking=None 不再抛；任何 HoudiniCallError 才算真 FAIL。
         info = conn.call("get_node_info",
                          node_path=table_path,
                          include_input_details=True,
@@ -319,10 +335,20 @@ def add_wood_grain_wrangle(conn: HoudiniConn,
                     inputs_fallback[0].get("output_node", "")
             elif isinstance(inputs_fallback[0], str):
                 first_from = inputs_fallback[0]
-        ok = ("wood_grain" in first_from) if first_from else False
+        ok_input = ("wood_grain" in first_from) if first_from else False
+
+        ok = ok_display or ok_input
+        detail_parts = []
+        if ok_display:
+            detail_parts.append("via=sop_display_flag (display path)")
+        if ok_input:
+            detail_parts.append("input_connectors[0]={0}".format(first_from))
+        if not detail_parts:
+            detail_parts.append(
+                "via={0!r}, inputs[0].from_node={1!r}".format(via, first_from))
         assert_step(results, "4.5e verify table_demo input 0 == wood_grain",
                     ok=ok, artifact=table_path,
-                    detail="inputs[0].from_node={0}".format(first_from))
+                    detail=" | ".join(detail_parts))
     except HoudiniCallError as e:
         # 兜底：未来 fork 若回归到 isCooking AttributeError，仍算真 FAIL
         # （不再 SKIP 兜底，因为 F-A 修复后应当稳定）。
