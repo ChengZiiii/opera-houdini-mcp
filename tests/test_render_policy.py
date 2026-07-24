@@ -231,16 +231,21 @@ class ConsentTokenLifecycleTests(unittest.TestCase):
         tokens = {self.mod.create_consent_token() for _ in range(20)}
         self.assertEqual(len(tokens), 20, "uuid4 应全局唯一")
 
-    def test_consume_token_valid_file_deletes_and_returns_true(self):
-        """文件存在 + 未过期 → 删除 + True（task 6.5）。"""
+    def test_consume_token_valid_returns_true_and_keeps_sentinel(self):
+        """文件存在 + 未过期 → True 且 sentinel 保留（task 6.5）。
+
+        fork-render-policy-defense-in-depth fix 后 consume 改为幂等：
+        成功校验不删 sentinel，允许多层防御（4 层入口）都调 consume 时
+        不会把上层干掉让下层看不到文件。
+        """
         token = self.mod.create_consent_token(expires_in_seconds=300)
         sentinel = os.path.join(self.mod._consent_dir(), token)
         self.assertTrue(os.path.exists(sentinel))
         result = self.mod.consume_consent_token(token, expires_in_seconds=300)
         self.assertTrue(result)
-        self.assertFalse(
+        self.assertTrue(
             os.path.exists(sentinel),
-            "consume 成功后 sentinel 应被删除")
+            "consume 成功后 sentinel 应保留（幂等校验不删）")
 
     def test_consume_token_missing_file_returns_false(self):
         """文件不存在 → False（task 6.6）。"""
@@ -273,14 +278,47 @@ class ConsentTokenLifecycleTests(unittest.TestCase):
         finally:
             self.mod.time.time = original_time
 
-    def test_consume_token_after_consume_returns_false(self):
-        """token 已消费（删除），再次带同一 token 调 consume → False。"""
+    def test_consume_token_within_window_is_idempotent(self):
+        """5 分钟窗口内多次调 consume 同一 token 都返 True（幂等）。
+
+        这是 fork-render-policy-defense-in-depth fix 的核心契约：
+        多层防御（MCP tool + server.py handler + HoudiniMCPRender +
+        _render_b64）都调 consume 时，第一层不会把 sentinel 干掉让
+        下层误判为 token 无效。
+        """
         token = self.mod.create_consent_token(expires_in_seconds=300)
-        self.assertTrue(self.mod.consume_consent_token(token,
-                                                       expires_in_seconds=300))
-        # 文件已删，第二次返 False
-        self.assertFalse(self.mod.consume_consent_token(
-            token, expires_in_seconds=300))
+        # 模拟 4 层防御依次调 consume，全部应通过
+        for layer_idx in range(4):
+            self.assertTrue(
+                self.mod.consume_consent_token(token, expires_in_seconds=300),
+                "layer " + str(layer_idx) + " 应放行同一 token")
+        # sentinel 仍在
+        sentinel = os.path.join(self.mod._consent_dir(), token)
+        self.assertTrue(
+            os.path.exists(sentinel),
+            "多层 consume 后 sentinel 应保留")
+
+    def test_cleanup_expired_sentinels_removes_only_expired(self):
+        """_cleanup_expired_sentinels 只删过期项，保留窗口内项。"""
+        # 一个未过期
+        live_token = self.mod.create_consent_token(expires_in_seconds=300)
+        live_sentinel = os.path.join(self.mod._consent_dir(), live_token)
+        # 一个手动 backdated 过期
+        old_token = "old_expired_token_for_cleanup_test"
+        old_sentinel = os.path.join(self.mod._consent_dir(), old_token)
+        with open(old_sentinel, "w", encoding="utf-8") as f:
+            json.dump({"created_at": self.mod.time.time() - 1000,
+                       "expires_in_seconds": 300}, f)
+        try:
+            self.mod._cleanup_expired_sentinels(expires_in_seconds=300)
+            self.assertTrue(os.path.exists(live_sentinel),
+                            "窗口内 sentinel 不应被清掉")
+            self.assertFalse(os.path.exists(old_sentinel),
+                             "过期 sentinel 应被惰性清理")
+        finally:
+            # 测试间不留脏文件
+            if os.path.exists(old_sentinel):
+                os.remove(old_sentinel)
 
     def test_consume_corrupted_sentinel_returns_false(self):
         """sentinel 文件损坏 → 视为过期 + 删除 + 返 False。"""
@@ -359,13 +397,25 @@ class InterruptConsumeIntegrationTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def test_full_flow_consume_then_reuse_fails(self):
+    def test_full_flow_consume_then_reuse_within_window(self):
+        """fork-render-policy-defense-in-depth fix：5 分钟窗口内同一 token
+        多次 consume 都应通过（幂等），而不是 single-use 拒绝。
+
+        这条覆盖 agent 重放场景：拿到 interrupt dict 后重调带原 token，
+        期望放行而不是再次被 interrupt。
+        """
         _, payload = self.mod.enforce_render_policy("karma_cpu")
         token = payload["consent_token"]
-        # 第一次 consume 成功
+        # 第一次 consume 成功（模拟 Layer 1 入口校验）
         self.assertTrue(self.mod.consume_consent_token(token))
-        # 第二次带同一 token 失败（文件已删）
-        self.assertFalse(self.mod.consume_consent_token(token))
+        # 第二次仍成功（模拟 Layer 2 / 3 / 4 任一入口）—— 幂等
+        self.assertTrue(self.mod.consume_consent_token(token))
+        # 第三次仍成功（模拟 agent 同窗口内再次重放）
+        self.assertTrue(self.mod.consume_consent_token(token))
+        # sentinel 仍在，文件名 = token
+        sentinel = os.path.join(self.mod._consent_dir(), token)
+        self.assertTrue(os.path.exists(sentinel),
+                        "窗口内重放不应清掉 sentinel")
 
     def test_full_flow_expired_token_then_fresh_interrupt(self):
         """过期 token → 新 interrupt dict（新 token）。"""

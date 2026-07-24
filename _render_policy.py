@@ -186,19 +186,35 @@ def create_consent_token(expires_in_seconds=300):
 
 
 def consume_consent_token(token, expires_in_seconds=300):
-    """校验 sentinel 文件存在 + 未过期；通过则删除并返 True。
+    """校验 sentinel 文件存在 + 未过期；幂等返回 True，不删除 sentinel。
 
     Args:
         token: ``create_consent_token`` 返回的 uuid4 hex。
         expires_in_seconds: 过期窗口秒数（默认 300）。
 
     Returns:
-        bool: True = 校验通过 + 已删除 sentinel；False = 文件不存在 /
-        已过期（过期情况下会顺手删除过期 sentinel，保持 ``_consent_dir``
-        不堆积脏文件）。
+        bool: True = 校验通过（sentinel 在窗口内有效）；False = 文件不存在
+        / 已过期 / 损坏 / token 为空。过期 / 损坏情况下会顺手删除对应 sentinel，
+        保持 ``_consent_dir`` 不堆积脏文件。
+
+    关键语义（fork-render-policy-defense-in-depth fix）：
+    历史上本函数对成功校验执行 ``os.remove`` —— 这导致 4 层防御（MCP tool /
+    server.py handler / HoudiniMCPRender / _render_b64）都调 consume 时，上层
+    把 sentinel 删掉后下层看不到文件就判 False，把合法 token 误判为无效，
+    agent 重放带 token 永远拿不到 render。现在改为**幂等校验**：成功只返
+    True 不删；过期 / 损坏才删。同一 token 在 5 分钟窗口内被多层 / 多次调
+    都稳定返 True，符合 fork_karma_consent_token_lifecycle 约束
+    （"5 分钟过期 + 校验存在"），不再要求 single-use。
+
+    副作用与权衡：
+    - sentinel 文件不再被显式删除，靠下一次 ``_cleanup_expired_sentinels``
+      或 consume-miss 时的惰性扫描兜底清过期项；5 分钟窗口内合法 sentinel
+      会留到过期。
+    - 5 分钟窗口内 agent 可发起多次重放（每次都走完 4 层 + 实际 render）。
+      这是窗口授权的自然语义，比 single-use 宽松。
 
     防御性细节：
-    - 文件不存在直接返 False（无副作用）。
+    - 文件不存在直接返 False；顺手扫一遍 ``_consent_dir`` 清过期项。
     - 文件存在但 ``created_at`` 缺失 / 非数字 → 视为过期，删除 + 返 False。
     - 文件存在但读取异常（损坏 / 权限） → 静默返 False，不抛异常
       （调用方是 MCP tool 入口，抛异常会让 bridge 层返 error envelope
@@ -208,6 +224,8 @@ def consume_consent_token(token, expires_in_seconds=300):
         return False
     sentinel_path = os.path.join(_consent_dir(), token)
     if not os.path.exists(sentinel_path):
+        # token miss：顺便扫一下过期项兜底，避免 _consent_dir 长期堆积
+        _cleanup_expired_sentinels(expires_in_seconds)
         return False
     try:
         with open(sentinel_path, "r", encoding="utf-8") as f:
@@ -222,19 +240,55 @@ def consume_consent_token(token, expires_in_seconds=300):
         return False
     now = time.time()
     if now - created_at <= expires_in_seconds:
-        try:
-            os.remove(sentinel_path)
-        except OSError:
-            # 已校验通过；删除失败不阻塞（agent 5 分钟内无法重放，但
-            # 主流程不应崩）。返 True。
-            pass
+        # 在窗口内 → 幂等通过，**不删**，允许多层 / 多次重放
         return True
-    # 过期 → 删除 + 返 False
+    # 过期 → 删 + 返 False
     try:
         os.remove(sentinel_path)
     except OSError:
         pass
     return False
+
+
+def _cleanup_expired_sentinels(expires_in_seconds=300):
+    """惰性扫描 ``_consent_dir``，删除所有 ``created_at`` 超过 TTL 的 sentinel。
+
+    设计：每次 consume_consent_token 拿到 miss / 过期时顺手触发一次；正常
+    成功路径不再删 sentinel（fork-render-policy-defense-in-depth 修复后
+    改为幂等），所以需要这个兜底避免目录堆积。
+
+    Args:
+        expires_in_seconds: 与 consume_consent_token 同源的 TTL 参数。
+
+    容错：所有 OSError / JSON 解析异常都吞掉，不影响主调用；损坏文件
+    同样删除以避免反复踩坑。
+    """
+    consent_dir = _consent_dir()
+    if not os.path.isdir(consent_dir):
+        return
+    now = time.time()
+    try:
+        for name in os.listdir(consent_dir):
+            full = os.path.join(consent_dir, name)
+            if not os.path.isfile(full):
+                continue
+            try:
+                with open(full, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                created_at = float(payload.get("created_at", 0))
+            except (OSError, ValueError, TypeError):
+                try:
+                    os.remove(full)
+                except OSError:
+                    pass
+                continue
+            if now - created_at > expires_in_seconds:
+                try:
+                    os.remove(full)
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
 
 def enforce_render_policy(renderer):
