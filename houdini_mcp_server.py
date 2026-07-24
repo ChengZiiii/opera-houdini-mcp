@@ -11,8 +11,17 @@ import os
 import time
 import argparse
 
+# 内嵌 Python 受 _pth 控制，启动独立脚本时不会自动把脚本目录加进
+# sys.path。这里显式把脚本所在目录 prepend 进去，确保 sibling 模块
+# （如 _render_policy）在 standalone 启动方式下也能被平铺 import 找到。
+# 不影响走 ``-m houdinimcp.houdini_mcp_server`` 或 test_tools.py 主动
+# sys.path.insert 的场景。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
 # Get the directory where the script is located (needed for dotenv path)
-script_dir = os.path.dirname(os.path.abspath(__file__))
+script_dir = _HERE
 
 import json
 import socket
