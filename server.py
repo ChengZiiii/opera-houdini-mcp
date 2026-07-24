@@ -38,6 +38,7 @@ from . import _discovery as disc
 from . import _materials as mats
 from . import _hscript as hsc
 from . import _graph_edit as ge
+from . import _render_policy as _rp
 from . import _node_info as ni
 from . import _geo_summary as gs
 from . import _pane_capture as pcp
@@ -1698,14 +1699,28 @@ class HoudiniMCPServer:
         #         except Exception as cleanup_e:
         #             print(f"Warning: Failed to clean up temporary render file {filepath}: {cleanup_e}")
 
-    def handle_render_single_view(self, orthographic=False, rotation=(0, 90, 0), render_path=None, render_engine="opengl", karma_engine="cpu"):
-        """Handles the 'render_single_view' command."""
+    def handle_render_single_view(self, orthographic=False, rotation=(0, 90, 0), render_path=None, render_engine="opengl", karma_engine="cpu", consent_token=None):
+        """Handles the 'render_single_view' command.
+
+        fork-render-policy-redirect-and-consent: 入口先做 render policy
+        校验，opengl 走 redirect dict，karma_* 需 consent_token 才放行。
+        """
         # self._check_render_lib()
-        
+
+        # fork-render-policy: 入口拦截
+        _action, _payload = _rp.enforce_render_engine_policy(
+            render_engine, karma_engine)
+        if _action == "redirect":
+            return _payload
+        if _action == "interrupt":
+            if not (consent_token
+                    and _rp.consume_consent_token(consent_token)):
+                return _payload
+
         # Use a temporary directory for the render output
         if not render_path:
             render_path = tempfile.gettempdir()
-            
+
         try:
             # Ensure rotation is a tuple
             if isinstance(rotation, list): rotation = tuple(rotation)
@@ -1731,10 +1746,24 @@ class HoudiniMCPServer:
             traceback.print_exc()
             return {"status": "error", "message": error_message, "origin": "handle_render_single_view"}
 
-    def handle_render_quad_view(self, orthographic=True, render_path=None, render_engine="opengl", karma_engine="cpu"):
-        """Handles the 'render_quad_view' command."""
+    def handle_render_quad_view(self, orthographic=True, render_path=None, render_engine="opengl", karma_engine="cpu", consent_token=None):
+        """Handles the 'render_quad_view' command.
+
+        fork-render-policy-redirect-and-consent: 入口先做 render policy
+        校验，opengl 走 redirect dict，karma_* 需 consent_token 才放行。
+        """
         # self._check_render_lib()
-        
+
+        # fork-render-policy: 入口拦截
+        _action, _payload = _rp.enforce_render_engine_policy(
+            render_engine, karma_engine)
+        if _action == "redirect":
+            return _payload
+        if _action == "interrupt":
+            if not (consent_token
+                    and _rp.consume_consent_token(consent_token)):
+                return _payload
+
         if not render_path:
             render_path = tempfile.gettempdir()
 
@@ -1773,9 +1802,23 @@ class HoudiniMCPServer:
             traceback.print_exc()
             return {"status": "error", "message": error_message, "origin": "handle_render_quad_view"}
 
-    def handle_render_specific_camera(self, camera_path, render_path=None, render_engine="opengl", karma_engine="cpu"):
-        """Handles the 'render_specific_camera' command."""
+    def handle_render_specific_camera(self, camera_path, render_path=None, render_engine="opengl", karma_engine="cpu", consent_token=None):
+        """Handles the 'render_specific_camera' command.
+
+        fork-render-policy-redirect-and-consent: 入口先做 render policy
+        校验，opengl 走 redirect dict，karma_* 需 consent_token 才放行。
+        """
         # self._check_render_lib()
+
+        # fork-render-policy: 入口拦截
+        _action, _payload = _rp.enforce_render_engine_policy(
+            render_engine, karma_engine)
+        if _action == "redirect":
+            return _payload
+        if _action == "interrupt":
+            if not (consent_token
+                    and _rp.consume_consent_token(consent_token)):
+                return _payload
 
         if not render_path:
             render_path = tempfile.gettempdir()

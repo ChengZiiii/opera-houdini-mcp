@@ -127,6 +127,56 @@ def _load_render_b64_fresh():
     return mod, fake
 
 
+def _allow_render_policy(mod):
+    """Monkey-patch ``_rp.enforce_render_policy`` to always allow.
+
+    fork-render-policy-redirect-and-consent: ``render_viewport`` /
+    ``render_quad_views`` 入口默认会触发 opengl redirect。tests that
+    verify 渲染 pipeline（base64 / format / resolution / 4-views 等）需要
+    bypass 该 policy；保留一个开关以便 policy 类测试用 ``_reset_render_policy``
+    还原。
+
+    Usage::
+
+        def setUp(self):
+            self.mod, _ = _load_render_b64_fresh()
+            self._original_policy = self.mod._rp.enforce_render_policy
+            _allow_render_policy(self.mod)
+
+        def tearDown(self):
+            self.mod._rp.enforce_render_policy = self._original_policy
+    """
+    mod._rp.enforce_render_policy = lambda renderer: ("allow", None)
+
+
+def _reset_render_policy():
+    """从源码 reload ``_render_policy``，丢弃任何 monkey-patch。
+
+    fork-render-policy: ``_load_render_b64_fresh`` 不重新加载
+    ``houdinimcp._render_policy``，因此上游测试的 ``_allow_render_policy``
+    patch 会跨测试泄漏到下游测试。policy 类测试必须显式 reset。
+
+    注意：除了从 ``sys.modules`` 删除，还要清掉 ``houdinimcp`` package
+    上的 ``_render_policy`` 属性 — ``from . import _render_policy`` 在
+    Python 3 解析时优先使用 package 对象的属性（实测发现），sys.modules
+    reset 不够。
+    """
+    if "houdinimcp._render_policy" in sys.modules:
+        del sys.modules["houdinimcp._render_policy"]
+    pkg = sys.modules.get("houdinimcp")
+    if pkg is not None and hasattr(pkg, "_render_policy"):
+        try:
+            delattr(pkg, "_render_policy")
+        except AttributeError:
+            pass
+    spec = _ilu.spec_from_file_location(
+        "houdinimcp._render_policy",
+        os.path.join(ROOT, "_render_policy.py"))
+    mod = _ilu.module_from_spec(spec)
+    sys.modules["houdinimcp._render_policy"] = mod
+    spec.loader.exec_module(mod)
+
+
 # ---------------------------------------------------------------------------
 # hou + UI stubs
 # ---------------------------------------------------------------------------
@@ -256,6 +306,9 @@ class RenderViewportGracefulTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.mod, cls.render_helpers = _load_render_b64_fresh()
+        # fork-render-policy: 本类关注 graceful warning 路径，需 bypass
+        # opengl redirect 才能进入无 hou.hipFile 分支。
+        _allow_render_policy(cls.mod)
 
     def test_returns_warning_when_no_hipfile(self):
         hou = _FakeHou(has_hipfile=False)
@@ -371,6 +424,8 @@ class RenderViewportSuccessTests(unittest.TestCase):
 
     def setUp(self):
         self.mod, self.render_helpers = _load_render_b64_fresh()
+        # fork-render-policy: bypass opengl redirect 以验证渲染 pipeline
+        _allow_render_policy(self.mod)
         self._grabs = _install_fake_pyside_for_render(self.mod)
 
     def test_basic_render_returns_base64(self):
@@ -664,6 +719,8 @@ class RenderViewportSaveImageFallbackTests(unittest.TestCase):
 
     def setUp(self):
         self.mod, _ = _load_render_b64_fresh()
+        # fork-render-policy: bypass opengl redirect 以验证 saveImage fallback
+        _allow_render_policy(self.mod)
 
     def test_fallback_path_returns_qscreen_marker(self):
         """saveImage 缺失 + _pane_capture 成功 → 响应带 _renderer=
@@ -732,6 +789,8 @@ class RenderQuadViewsTests(unittest.TestCase):
 
     def setUp(self):
         self.mod, self.render_helpers = _load_render_b64_fresh()
+        # fork-render-policy: bypass opengl redirect 以验证 4-views pipeline
+        _allow_render_policy(self.mod)
         self._grabs = _install_fake_pyside_for_render(self.mod)
 
     def test_four_views_returned(self):
@@ -1044,6 +1103,82 @@ class ServerHandlerCapMockTests(unittest.TestCase):
 
 
 # ===========================================================================
+# Section H0: fork-render-policy-redirect-and-consent 行为
+# ===========================================================================
+class ForkRenderPolicyRedirectInterruptTests(unittest.TestCase):
+    """fork-render-policy-redirect-and-consent: ``render_viewport`` /
+    ``render_quad_views`` 入口在 opengl / karma_* renderer 下应直接返回
+    redirect / interrupt dict，不进 base64 编码路径。
+    """
+
+    def setUp(self):
+        # fork-render-policy: 上游 setUpClass 的 ``_allow_render_policy``
+        # 会 monkey-patch ``houdinimcp._render_policy.enforce_render_policy``，
+        # 这里必须 reset 才能验证真实 policy 行为。
+        _reset_render_policy()
+        self.mod, _ = _load_render_b64_fresh()
+        # 不 patch policy，让真实 ``_rp.enforce_render_policy`` 跑
+        #（且每次 reload 都拿到全新 sentinel 目录）。
+
+    def _patch_consent_dir_to_tmp(self, tmpdir):
+        """把 ``_rp._env_dir()`` 指到 tmp，避免污染 ``houdinimcp-env/.karma_consent``。"""
+        self.mod._rp._env_dir = lambda: tmpdir
+        # _consent_dir 缓存了 _DEFAULT_CONSENT_SUBDIR 子目录名；每次调用
+        # 都重算，所以 _env_dir override 即生效。
+        return tmpdir
+
+    def test_render_viewport_opengl_returns_redirect_dict(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            self._patch_consent_dir_to_tmp(tmp)
+            hou = _make_hou_with_default_camera()
+            hou.hipFile = object()
+            # 即使 PySide 模拟到位，opengl 仍应 redirect，不进 base64
+            _install_fake_pyside_for_render(self.mod)
+            result = self.mod.render_viewport(hou, renderer="opengl")
+            self.assertEqual(result.get("_redirect"), "flipbook")
+            self.assertEqual(result.get("fallback_tool"),
+                             "capture_pane_screenshot")
+            self.assertIn("pane_type_name", result.get("fallback_args", {}))
+            self.assertEqual(
+                result["fallback_args"]["pane_type_name"], "SceneViewer")
+            self.assertNotIn("image_base64", result)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_render_viewport_karma_returns_interrupt_dict(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            self._patch_consent_dir_to_tmp(tmp)
+            hou = _make_hou_with_default_camera()
+            hou.hipFile = object()
+            _install_fake_pyside_for_render(self.mod)
+            result = self.mod.render_viewport(hou, renderer="karma_cpu")
+            self.assertEqual(result.get("_interrupt"),
+                             "user_consent_required")
+            self.assertIn("consent_token", result)
+            self.assertEqual(len(result["consent_token"]), 32)  # uuid4 hex
+            self.assertEqual(result.get("expires_in_seconds"), 300)
+            self.assertIn("prompt", result)
+            self.assertNotIn("image_base64", result)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_render_quad_views_opengl_returns_redirect_dict(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            self._patch_consent_dir_to_tmp(tmp)
+            hou = _make_hou_with_default_camera()
+            hou.hipFile = object()
+            _install_fake_pyside_for_render(self.mod)
+            result = self.mod.render_quad_views(hou, renderer="opengl")
+            self.assertEqual(result.get("_redirect"), "flipbook")
+            self.assertNotIn("top", result)  # 不应进入 4 视图渲染
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ===========================================================================
 # Section H: bridge style probe (PR 14 tools)
 # ===========================================================================
 HMA_PY = os.path.join(ROOT, "houdini_mcp_server.py")
@@ -1205,7 +1340,16 @@ def _exec_pr14_bridge_tool(tool_name):
     fn_src = ast.get_source_segment(src, fn_node)
     fake_mcp = _FakeMCP()
     rec = _RecordingHoudiniCall()
-    ns = {"mcp": fake_mcp, "_houdini_call": rec}
+    # fork-render-policy: AST-exec 隔离执行每个 PR 14 工具，需要把 policy
+    # helper 注入到工具的命名空间，否则 ``_apply_render_policy_to_renderer``
+    # 会 NameError。默认 stub 返 None（allow），保证工具能正常调到
+    # ``_houdini_call``；PR 14 工具的 cmd-name / params 断言只关心
+    # 透传行为，不关心 policy 拦截本身。
+    def _policy_stub(*a, **kw):
+        return None
+    ns = {"mcp": fake_mcp, "_houdini_call": rec,
+          "_apply_render_policy_to_renderer": _policy_stub,
+          "_apply_render_policy_to_engine": _policy_stub}
     exec(compile(fn_src, "<pr14_{0}>".format(tool_name), "exec"), ns)
     return ns[tool_name], rec, fake_mcp
 

@@ -26,6 +26,7 @@ import tempfile
 
 from . import _common as cmn
 from . import HoudiniMCPRender as _render_lib
+from . import _render_policy as _rp
 
 
 # ---------------------------------------------------------------------------
@@ -295,8 +296,12 @@ def _image_size_bytes(img, fmt="PNG"):
 # ---------------------------------------------------------------------------
 def render_viewport(hou, camera_path=None, geometry_path=None,
                     renderer="opengl", resolution=(640, 480),
-                    format="PNG"):
+                    format="PNG", consent_token=None):
     """渲染单个 viewport 视角并返 base64 编码图。
+
+    fork-render-policy-redirect-and-consent: 入口在 ``_normalize_renderer``
+    之后做 render policy 校验，opengl 走 redirect dict，karma_* 需
+    ``consent_token`` 才放行（防御性第 4 层兜底，避免上层漏放）。
 
     Args:
         hou: hou 模块或 stub（测试 mock）。
@@ -305,12 +310,15 @@ def render_viewport(hou, camera_path=None, geometry_path=None,
         renderer: ``opengl`` / ``karma_cpu`` / ``karma_xpu`` 三选一。
         resolution: (width, height)。
         format: ``PNG`` / ``JPEG``。
+        consent_token: karma consent uuid4（PR 14 tool 重调用）。
 
     Returns:
         dict with keys: ``image_base64``, ``format``, ``width``, ``height``,
         ``renderer``, ``camera_path``, ``geometry_path``, ``size_bytes``,
         ``_meta``（由 ``cmn._add_response_metadata`` 注入），无 hou / PySide
-        环境额外含 ``_warning`` 字段。
+        环境额外含 ``_warning`` 字段；redirect / interrupt 时直接返
+        ``_render_policy`` 构造的结构化 dict（含 ``_redirect`` /
+        ``_interrupt`` 键，无 ``image_base64``）。
 
     Raises:
         ValueError: ``renderer`` 不在 ``VALID_RENDERERS`` 中。
@@ -320,6 +328,18 @@ def render_viewport(hou, camera_path=None, geometry_path=None,
         raise ValueError(
             "renderer 必须是 {0} 之一；收到 {1!r}".format(
                 list(VALID_RENDERERS), renderer))
+    # fork-render-policy: 防御性第 4 层校验（normalize 之后、_saveimage
+    # 探测之前）。任何上层（HoudiniMCPRender / server.py handler / MCP
+    # tool）若漏放，本层仍拦截 opengl / karma_*，避免静默触发
+    # hou.GeometryViewport.saveImage（H21 已移除）或 karma 渲染（H21 主
+    # 线程死锁）。
+    _action, _payload = _rp.enforce_render_policy(norm_renderer)
+    if _action == "redirect":
+        return _payload
+    if _action == "interrupt":
+        if not (consent_token
+                and _rp.consume_consent_token(consent_token)):
+            return _payload
     resolved_camera = _resolve_camera_path(camera_path)
     geom_str = geometry_path if geometry_path else ""
 
@@ -431,8 +451,12 @@ _QUAD_VIEWS = (
 
 
 def render_quad_views(hou, geometry_path=None, renderer="opengl",
-                      resolution=(480, 360), format="PNG"):
+                      resolution=(480, 360), format="PNG",
+                      consent_token=None):
     """渲染四视图（top / front / side / perspective）并返 4 张 base64 图。
+
+    fork-render-policy-redirect-and-consent: 入口在 ``_normalize_renderer``
+    之后做 render policy 校验（防御性第 4 层）。
 
     Args:
         hou: hou 模块。
@@ -440,17 +464,27 @@ def render_quad_views(hou, geometry_path=None, renderer="opengl",
         renderer: ``opengl`` / ``karma_cpu`` / ``karma_xpu`` 三选一。
         resolution: (width, height)，单视图分辨率。
         format: ``PNG`` / ``JPEG``。
+        consent_token: karma consent uuid4。
 
     Returns:
         dict 含 ``top`` / ``front`` / ``side`` / ``perspective`` 四键，每键
         对应 ``render_viewport`` 的返回结构；额外含 ``_meta`` 块。无场景
-        几何 / PySide 环境额外含 ``_warning`` 字段。
+        几何 / PySide 环境额外含 ``_warning`` 字段；redirect / interrupt
+        时直接返 ``_render_policy`` 构造的结构化 dict。
     """
     norm_renderer = _normalize_renderer(renderer)
     if norm_renderer is None:
         raise ValueError(
             "renderer 必须是 {0} 之一；收到 {1!r}".format(
                 list(VALID_RENDERERS), renderer))
+    # fork-render-policy: 防御性第 4 层校验
+    _action, _payload = _rp.enforce_render_policy(norm_renderer)
+    if _action == "redirect":
+        return _payload
+    if _action == "interrupt":
+        if not (consent_token
+                and _rp.consume_consent_token(consent_token)):
+            return _payload
     geom_str = geometry_path if geometry_path else ""
 
     # 1. 共享 bbox（find_displayed_geometry 只扫一次）
@@ -546,8 +580,21 @@ def _empty_quad_result(renderer, format, resolution, geometry_path):
 # Section 5: render_specific_camera_base64（薄封装，复用 render_viewport）
 # ---------------------------------------------------------------------------
 def render_specific_camera_base64(hou, camera_path, resolution=(640, 480),
-                                  format="PNG", renderer="opengl"):
-    """渲染指定相机视角并返 base64（PR 14 第三个 bridge tool 配套）。"""
+                                  format="PNG", renderer="opengl",
+                                  consent_token=None):
+    """渲染指定相机视角并返 base64（PR 14 第三个 bridge tool 配套）。
+
+    fork-render-policy-redirect-and-consent: 该函数是 ``render_viewport``
+    的薄封装，policy 校验在 ``render_viewport`` 第 4 层完成；这里也加
+    一道入口校验（防御性冗余，任何被直接调用的旧路径都拦得住）。
+    """
+    _action, _payload = _rp.enforce_render_policy(renderer)
+    if _action == "redirect":
+        return _payload
+    if _action == "interrupt":
+        if not (consent_token
+                and _rp.consume_consent_token(consent_token)):
+            return _payload
     return render_viewport(hou, camera_path=camera_path, geometry_path=None,
                            renderer=renderer, resolution=resolution,
-                           format=format)
+                           format=format, consent_token=consent_token)

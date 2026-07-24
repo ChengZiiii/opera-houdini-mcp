@@ -84,6 +84,63 @@ else:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("HoudiniMCP_StdioServer")
 
+# --- Render policy enforcement (fork-render-policy-redirect-and-consent) ---
+# 入口校验 helper：6 个 render tool 共享，opengl 走 redirect，karma_* 走
+# interrupt + consent token。其他 renderer（mantra / 未知值）原样放行。
+# 设计契约：返回 ``{"_redirect": ...}`` / ``{"_interrupt": ...}`` 结构化
+# dict，bridge 层透传到任何 AI 客户端 SDK，由 agent 框架识别处理。
+#
+# 注意：相对 import 会被 ``test_tools.py`` 的 flat ``import houdini_mcp_server``
+# 模式破坏（无 parent package）。这里先尝试相对 import；fallback 到 flat
+# import（hython / test_tools.py 把 fork 根目录加进 sys.path 的场景）。
+try:
+    from . import _render_policy as _rp
+except ImportError:
+    import _render_policy as _rp  # type: ignore
+
+
+def _apply_render_policy_to_engine(render_engine, karma_engine=None,
+                                   consent_token=None):
+    """应用 fork-render-policy-redirect-and-consent 入口校验。
+
+    Args:
+        render_engine: ``render_engine`` 参数（``opengl`` / ``karma`` /
+            ``mantra``）。
+        karma_engine: ``karma_engine`` 参数（``cpu`` / ``gpu``），仅
+            ``render_engine == "karma"`` 时有意义。
+        consent_token: agent 重调时携带的 token（karma 路径需要）。
+
+    Returns:
+        dict_or_None: 命中 redirect / interrupt 时返回对应结构化 dict；
+        ``None`` 时表示放行，调用方继续原逻辑。
+    """
+    action, payload = _rp.enforce_render_engine_policy(
+        render_engine, karma_engine)
+    if action == "allow":
+        return None
+    if action == "redirect":
+        return payload
+    # interrupt 路径
+    if action == "interrupt":
+        if consent_token and _rp.consume_consent_token(consent_token):
+            return None  # consent 校验通过 → 放行
+        return payload  # 未带 token / token 过期 / token 无效 → 返回 interrupt
+    return None  # 防御性兜底
+
+
+def _apply_render_policy_to_renderer(renderer, consent_token=None):
+    """renderer 直接版本（PR 14 render_*_base64 工具用）。"""
+    action, payload = _rp.enforce_render_policy(renderer)
+    if action == "allow":
+        return None
+    if action == "redirect":
+        return payload
+    if action == "interrupt":
+        if consent_token and _rp.consume_consent_token(consent_token):
+            return None
+        return payload
+    return None
+
 # --- Minimal api.utils.fix_rgb replication ---
 # Assume it takes a list/tuple and returns [r, g, b] if valid, else None
 def fix_rgb(color_val):
@@ -1094,8 +1151,16 @@ def render_single_view(ctx: Context,
                        rotation: List[float] = [0, 90, 0],
                        render_path: str = "C:/temp/",
                        render_engine: str = "opengl",
-                       karma_engine: str = "cpu") -> dict:
+                       karma_engine: str = "cpu",
+                       consent_token: str = None) -> dict:
     """
+    IMPORTANT (fork-render-policy-redirect-and-consent):
+        在用户机 H21 缺 OGL 3.3 环境下，本工具的 opengl renderer 已被 fork
+        强制 redirect 到 ``capture_pane_screenshot(SceneViewer)``（不再
+        触发 opengl output node 链路，避免 Houdini 主线程死锁）；karma_cpu /
+        karma_xpu renderer 需带 ``consent_token`` 重调，token 在首次调用返
+        回的 ``_interrupt`` 字段中获得。详见 ``_render_policy.py``。
+
     Render a single view inside Houdini and return a structured result dict.
 
     Returns a dict (carrying renderer / image_path / size_bytes / etc.)
@@ -1106,6 +1171,10 @@ def render_single_view(ctx: Context,
     Server-side always returns a dict; we forward it verbatim and only
     fall back to an error envelope on exception.
     """
+    policy_resp = _apply_render_policy_to_engine(
+        render_engine, karma_engine, consent_token=consent_token)
+    if policy_resp is not None:
+        return policy_resp
     try:
         conn = get_houdini_connection()
         response = conn.send_command("render_single_view", {
@@ -1134,8 +1203,14 @@ def render_single_view(ctx: Context,
 def render_quad_views(ctx: Context,
                       render_path: str = "C:/temp/",
                       render_engine: str = "opengl",
-                      karma_engine: str = "cpu") -> dict:
+                      karma_engine: str = "cpu",
+                      consent_token: str = None) -> dict:
     """
+    IMPORTANT (fork-render-policy-redirect-and-consent):
+        在用户机 H21 缺 OGL 3.3 环境下，本工具的 opengl renderer 已被 fork
+        强制 redirect 到 ``capture_pane_screenshot(SceneViewer)``；karma_cpu
+        / karma_xpu 需带 ``consent_token`` 重调。详见 ``_render_policy.py``。
+
     Render 4 canonical views from Houdini and return a structured result dict.
 
     Returns a dict (4 views × {image_path, size_bytes, ...}) instead of a
@@ -1144,6 +1219,10 @@ def render_quad_views(ctx: Context,
     (singular) — kept for backward compatibility with the server-side
     handler dictionary in opera-houdini-mcp/server.py.
     """
+    policy_resp = _apply_render_policy_to_engine(
+        render_engine, karma_engine, consent_token=consent_token)
+    if policy_resp is not None:
+        return policy_resp
     try:
         conn = get_houdini_connection()
         response = conn.send_command("render_quad_view", {
@@ -1171,14 +1250,24 @@ def render_specific_camera(ctx: Context,
                            camera_path: str,
                            render_path: str = "C:/temp/",
                            render_engine: str = "opengl",
-                           karma_engine: str = "cpu") -> dict:
+                           karma_engine: str = "cpu",
+                           consent_token: str = None) -> dict:
     """
+    IMPORTANT (fork-render-policy-redirect-and-consent):
+        在用户机 H21 缺 OGL 3.3 环境下，本工具的 opengl renderer 已被 fork
+        强制 redirect 到 ``capture_pane_screenshot(SceneViewer)``；karma_cpu
+        / karma_xpu 需带 ``consent_token`` 重调。详见 ``_render_policy.py``。
+
     Render from a specific camera path in the Houdini scene.
 
     Returns a structured dict (renderer / image_path / size_bytes) instead
     of a string. See render_single_view docstring for the dict-vs-str
     Pydantic background.
     """
+    policy_resp = _apply_render_policy_to_engine(
+        render_engine, karma_engine, consent_token=consent_token)
+    if policy_resp is not None:
+        return policy_resp
     try:
         conn = get_houdini_connection()
         response = conn.send_command("render_specific_camera", {
@@ -1608,14 +1697,25 @@ def render_node_network(ctx, node_path, fit_contents=True,
 @mcp.tool(name="render_viewport_base64")
 def render_viewport_base64(ctx, camera_path=None, geometry_path=None,
                            renderer="opengl", resolution=(640, 480),
-                           format="PNG"):
+                           format="PNG", consent_token=None):
     """渲染单个 viewport 视角并以 base64 形式返回图像（PR 14）。
+
+    IMPORTANT (fork-render-policy-redirect-and-consent):
+        在用户机 H21 缺 OGL 3.3 环境下，本工具的 ``renderer="opengl"`` 已被
+        fork 强制 redirect 到 ``capture_pane_screenshot(SceneViewer)``（返
+        回 ``_redirect`` dict，不进实际 render 引擎调用链路）；``karma_cpu``
+        / ``karma_xpu`` 需带 ``consent_token`` 重调，token 在首次调用返回
+        的 ``_interrupt`` 字段中获得。详见 ``_render_policy.py``。
 
     renderer 支持 opengl / karma_cpu / karma_xpu 三选一；resolution 为
     (width, height) 元组；format 支持 PNG / JPEG。响应含 image_base64 字段
     与 size_bytes，响应整体过 apply_response_cap 截断大 payload。无 hou /
     PySide 环境返回 _warning dict。
     """
+    policy_resp = _apply_render_policy_to_renderer(
+        renderer, consent_token=consent_token)
+    if policy_resp is not None:
+        return policy_resp
     return _houdini_call("render_viewport_base64", {
         "camera_path": camera_path,
         "geometry_path": geometry_path,
@@ -1628,14 +1728,24 @@ def render_viewport_base64(ctx, camera_path=None, geometry_path=None,
 
 @mcp.tool(name="render_quad_views_base64")
 def render_quad_views_base64(ctx, geometry_path=None, renderer="opengl",
-                              resolution=(480, 360), format="PNG"):
+                              resolution=(480, 360), format="PNG",
+                              consent_token=None):
     """渲染四视图（top / front / side / perspective）并以 base64 形式返回
     4 张图（PR 14）。
+
+    IMPORTANT (fork-render-policy-redirect-and-consent):
+        opengl 已 redirect 到 ``capture_pane_screenshot(SceneViewer)``；
+        karma_cpu / karma_xpu 需带 ``consent_token`` 重调。详见
+        ``_render_policy.py``。
 
     共享 bbox + camera rig，每个视图旋转 null 节点切换视角。响应以
     top/front/side/perspective 四键分别承载 base64 字符串，整体过
     apply_response_cap。无 hou 环境返回 _warning dict。
     """
+    policy_resp = _apply_render_policy_to_renderer(
+        renderer, consent_token=consent_token)
+    if policy_resp is not None:
+        return policy_resp
     return _houdini_call("render_quad_views_base64", {
         "geometry_path": geometry_path,
         "renderer": renderer,
@@ -1647,13 +1757,23 @@ def render_quad_views_base64(ctx, geometry_path=None, renderer="opengl",
 
 @mcp.tool(name="render_specific_camera_base64")
 def render_specific_camera_base64(ctx, camera_path, resolution=(640, 480),
-                                   format="PNG", renderer="opengl"):
+                                   format="PNG", renderer="opengl",
+                                   consent_token=None):
     """渲染指定相机视角并以 base64 形式返回图像（PR 14）。
+
+    IMPORTANT (fork-render-policy-redirect-and-consent):
+        opengl 已 redirect 到 ``capture_pane_screenshot(SceneViewer)``；
+        karma_cpu / karma_xpu 需带 ``consent_token`` 重调。详见
+        ``_render_policy.py``。
 
     camera_path 必须指向 /obj 下已存在的相机节点；renderer 支持
     opengl / karma_cpu / karma_xpu 三选一。响应整体过 apply_response_cap
     截断大 payload。
     """
+    policy_resp = _apply_render_policy_to_renderer(
+        renderer, consent_token=consent_token)
+    if policy_resp is not None:
+        return policy_resp
     return _houdini_call("render_specific_camera_base64", {
         "camera_path": camera_path,
         "resolution": list(resolution) if isinstance(resolution, tuple)

@@ -2,6 +2,7 @@ import numpy as np
 import math
 import os
 import hou
+from . import _render_policy as _rp
 
 def find_displayed_geometry():
     """Find all displayed geometry nodes in the scene."""
@@ -488,20 +489,36 @@ def setup_render_node(render_engine="opengl", karma_engine="cpu", render_path=No
 
 # ======== RENDERING FUNCTIONS ========
 
-def render_single_view(orthographic=False, rotation=(0, 90, 0), render_path=None, render_engine="opengl", karma_engine="cpu"):
+def render_single_view(orthographic=False, rotation=(0, 90, 0), render_path=None, render_engine="opengl", karma_engine="cpu", consent_token=None):
     """
     Set up camera rig and render a single view with specified rotation.
-    
+
+    fork-render-policy-redirect-and-consent: 入口先做 render policy 校验，
+    opengl 走 redirect dict，karma_* 需 consent_token 才放行。
+
     Args:
         orthographic: If True, create an orthographic camera
         rotation: Tuple of (rx, ry, rz) rotation angles in degrees to apply to the camera center
         render_path: Path to save the render (default is C:\\temp\\)
         render_engine: The render engine to use ("opengl", "karma", or "mantra")
         karma_engine: For Karma, which engine to use ("cpu" or "gpu")
-        
+        consent_token: 用户对 karma 渲染的 consent uuid4（首次调用 karma
+            路径时会得到 interrupt dict + 新 token；用户回复 yes 后带该
+            token 重调）。opengl / mantra 路径忽略。
+
     Returns:
-        Path to the rendered file
+        Path to the rendered file。redirect 时返 dict（与 HoudiniMCPRender
+        原约定 ``None`` 失败信号不同，但调用方应已先判 type）。
     """
+    _action, _payload = _rp.enforce_render_engine_policy(
+        render_engine, karma_engine)
+    if _action == "redirect":
+        return _payload
+    if _action == "interrupt":
+        if not (consent_token
+                and _rp.consume_consent_token(consent_token)):
+            return _payload
+
     # Find all displayed geometry
     displayed_geo = find_displayed_geometry()
     
@@ -560,23 +577,36 @@ def render_single_view(orthographic=False, rotation=(0, 90, 0), render_path=None
     print(f"Rendered frame to: {filepath}")
     return filepath
 
-def render_quad_view(orthographic=True, render_path=None, render_engine="opengl", karma_engine="cpu"):
+def render_quad_view(orthographic=True, render_path=None, render_engine="opengl", karma_engine="cpu", consent_token=None):
     """
     Create four standard views and render them:
     - Front view (0,0,0)
     - Left view (0,-90,0)
     - Top view (-90,0,0)
     - Perspective view (-45,-45,0)
-    
+
+    fork-render-policy-redirect-and-consent: 入口先做 render policy 校验，
+    opengl 走 redirect dict，karma_* 需 consent_token 才放行。
+
     Args:
         orthographic: If True, use orthographic projection for ALL views including perspective
         render_path: Path to save the renders (default is C:/temp/)
         render_engine: The render engine to use ("opengl", "karma", or "mantra")
         karma_engine: For Karma, which engine to use ("cpu" or "gpu")
-    
+        consent_token: karma consent uuid4。
+
     Returns:
-        A list of paths to the rendered files
+        A list of paths to the rendered files。redirect / interrupt 时返 dict。
     """
+    _action, _payload = _rp.enforce_render_engine_policy(
+        render_engine, karma_engine)
+    if _action == "redirect":
+        return _payload
+    if _action == "interrupt":
+        if not (consent_token
+                and _rp.consume_consent_token(consent_token)):
+            return _payload
+
     rendered_files = []
     
     # Define the four standard views
@@ -659,19 +689,31 @@ def render_quad_view(orthographic=True, render_path=None, render_engine="opengl"
     
     return rendered_files
 
-def render_specific_camera(camera_path, render_path=None, render_engine="opengl", karma_engine="cpu"):
+def render_specific_camera(camera_path, render_path=None, render_engine="opengl", karma_engine="cpu", consent_token=None):
     """
     Render using a specific camera that already exists in the scene.
-    
+
+    fork-render-policy-redirect-and-consent: 入口先做 render policy 校验，
+    opengl 走 redirect dict，karma_* 需 consent_token 才放行。
+
     Args:
         camera_path: Path to the camera node (e.g., "/obj/mycamera")
         render_path: Path to save the render (default is C:\\temp\\)
         render_engine: The render engine to use ("opengl", "karma", or "mantra")
         karma_engine: For Karma, which engine to use ("cpu" or "gpu")
-        
+        consent_token: karma consent uuid4。
+
     Returns:
-        Path to the rendered file
+        Path to the rendered file。redirect / interrupt 时返 dict。
     """
+    _action, _payload = _rp.enforce_render_engine_policy(
+        render_engine, karma_engine)
+    if _action == "redirect":
+        return _payload
+    if _action == "interrupt":
+        if not (consent_token
+                and _rp.consume_consent_token(consent_token)):
+            return _payload
     try:
         # Check if the camera exists
         camera = hou.node(camera_path)

@@ -1,4 +1,5 @@
 import hou
+from . import _render_policy
 from .server import HoudiniMCPServer
 
 def start_server(host='127.0.0.1', port=9876):
