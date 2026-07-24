@@ -1192,6 +1192,7 @@ def render_single_view(ctx: Context,
             "render_path": render_path,
             "render_engine": render_engine,
             "karma_engine": karma_engine,
+            "consent_token": consent_token,
         })
 
         if response.get("status") == "error":
@@ -1238,6 +1239,7 @@ def render_quad_views(ctx: Context,
             "render_path": render_path,
             "render_engine": render_engine,
             "karma_engine": karma_engine,
+            "consent_token": consent_token,
         })
 
         if response.get("status") == "error":
@@ -1284,6 +1286,7 @@ def render_specific_camera(ctx: Context,
             "render_path": render_path,
             "render_engine": render_engine,
             "karma_engine": karma_engine,
+            "consent_token": consent_token,
         })
 
         if response.get("status") == "error":
@@ -1732,6 +1735,7 @@ def render_viewport_base64(ctx, camera_path=None, geometry_path=None,
         "resolution": list(resolution) if isinstance(resolution, tuple)
         else resolution,
         "format": format,
+        "consent_token": consent_token,
     })
 
 
@@ -1761,6 +1765,7 @@ def render_quad_views_base64(ctx, geometry_path=None, renderer="opengl",
         "resolution": list(resolution) if isinstance(resolution, tuple)
         else resolution,
         "format": format,
+        "consent_token": consent_token,
     })
 
 
@@ -1789,6 +1794,7 @@ def render_specific_camera_base64(ctx, camera_path, resolution=(640, 480),
         else resolution,
         "format": format,
         "renderer": renderer,
+        "consent_token": consent_token,
     })
 
 

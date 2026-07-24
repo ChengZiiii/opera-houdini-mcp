@@ -1731,7 +1731,8 @@ class HoudiniMCPServer:
                 rotation=rotation,
                 render_path=render_path,
                 render_engine=render_engine,
-                karma_engine=karma_engine
+                karma_engine=karma_engine,
+                consent_token=consent_token
             )
             print(f"render_single_view returned filepath: {filepath}")
 
@@ -1773,7 +1774,8 @@ class HoudiniMCPServer:
                 orthographic=orthographic,
                 render_path=render_path,
                 render_engine=render_engine,
-                karma_engine=karma_engine
+                karma_engine=karma_engine,
+                consent_token=consent_token
             )
             print(f"render_quad_view returned filepaths: {filepaths}")
 
@@ -1832,7 +1834,8 @@ class HoudiniMCPServer:
                 camera_path=camera_path,
                 render_path=render_path,
                 render_engine=render_engine,
-                karma_engine=karma_engine
+                karma_engine=karma_engine,
+                consent_token=consent_token
             )
             print(f"render_specific_camera returned filepath: {filepath}")
 
@@ -1850,47 +1853,61 @@ class HoudiniMCPServer:
     # -------------------------------------------------------------------------
     def render_viewport_base64(self, camera_path=None, geometry_path=None,
                                renderer="opengl", resolution=(640, 480),
-                               format="PNG"):
+                               format="PNG", consent_token=None):
         """PR 14：渲染单个 viewport 并以 base64 形式返回图像。
 
         薄封装到 _render_b64.render_viewport，支持 opengl / karma_cpu /
         karma_xpu 三种 renderer。无 hou 环境返回 _warning dict。响应过
         cmn.apply_response_cap 截断大 base64 payload。
+
+        fork-render-policy-defense-in-depth：bridge 透传的 consent_token
+        必须继续下发给 _render_b64.render_viewport（Layer 4 兜底校验），
+        否则 karma 路径会在 Layer 4 永远 interrupt。
         """
         result = rb64.render_viewport(
             hou, camera_path=camera_path, geometry_path=geometry_path,
             renderer=renderer, resolution=tuple(resolution)
             if isinstance(resolution, (list, tuple)) else resolution,
-            format=format)
+            format=format, consent_token=consent_token)
         return cmn.apply_response_cap(result)
 
     def render_quad_views_base64(self, geometry_path=None, renderer="opengl",
-                                 resolution=(480, 360), format="PNG"):
+                                 resolution=(480, 360), format="PNG",
+                                 consent_token=None):
         """PR 14：渲染四视图（top / front / side / perspective）并以 base64
         形式返回 4 张图。
 
         薄封装到 _render_b64.render_quad_views，共享 bbox + camera rig；
         响应过 apply_response_cap。无 hou 环境返回 _warning dict。
+
+        fork-render-policy-defense-in-depth：bridge 透传的 consent_token
+        必须继续下发给 _render_b64.render_quad_views（Layer 4 兜底校验）。
         """
         result = rb64.render_quad_views(
             hou, geometry_path=geometry_path, renderer=renderer,
             resolution=tuple(resolution)
             if isinstance(resolution, (list, tuple)) else resolution,
-            format=format)
+            format=format, consent_token=consent_token)
         return cmn.apply_response_cap(result)
 
     def render_specific_camera_base64(self, camera_path, resolution=(640, 480),
-                                      format="PNG", renderer="opengl"):
+                                      format="PNG", renderer="opengl",
+                                      consent_token=None):
         """PR 14：渲染指定相机视角并以 base64 形式返回。
 
         薄封装到 _render_b64.render_specific_camera_base64，响应过
         apply_response_cap。camera_path 必须存在。
+
+        fork-render-policy-defense-in-depth：bridge 透传的 consent_token
+        必须继续下发给 _render_b64.render_specific_camera_base64（Layer 4
+        兜底校验）。
         """
         result = rb64.render_specific_camera_base64(
             hou, camera_path=camera_path,
             resolution=tuple(resolution)
             if isinstance(resolution, (list, tuple)) else resolution,
-            format=format, renderer=renderer)
+            format=format, renderer=renderer,
+            consent_token=consent_token)
         return cmn.apply_response_cap(result)
 
     # -------------------------------------------------------------------------
