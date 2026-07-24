@@ -350,6 +350,7 @@ class HoudiniMCPServer:
             "get_geo_summary": self.get_geo_summary,
             # PR 13: pane 截图（list_visible_panes 只读；其它写文件/UI 状态）
             "capture_pane_screenshot": self.capture_pane_screenshot,
+            "capture_sceneviewer_flipbook_views": self.capture_sceneviewer_flipbook_views,
             "list_visible_panes": self.list_visible_panes,
             "capture_multiple_panes": self.capture_multiple_panes,
             "render_node_network": self.render_node_network,
@@ -1163,6 +1164,16 @@ class HoudiniMCPServer:
         """
         result = pcp.capture_pane_screenshot(
             hou, pane_type_name, save_path=save_path,
+            fit_contents=fit_contents)
+        return cmn.apply_response_cap(result)
+
+    def capture_sceneviewer_flipbook_views(self, views=None, save_dir=None,
+                                           desktop_name=None, pane_name=None,
+                                           fit_contents=True):
+        """采集确定 SceneViewer 的多视图 Houdini 内部 flipbook PNG。"""
+        result = pcp.capture_sceneviewer_flipbook_views(
+            hou, views=views, save_dir=save_dir,
+            desktop_name=desktop_name, pane_name=pane_name,
             fit_contents=fit_contents)
         return cmn.apply_response_cap(result)
 

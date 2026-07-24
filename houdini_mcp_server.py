@@ -1702,6 +1702,28 @@ def render_node_network(ctx, node_path, fit_contents=True,
 
 
 # -------------------------------------------------------------------
+# PR 22 SceneViewer Flipbook Views Tools
+# -------------------------------------------------------------------
+@mcp.tool()
+def capture_sceneviewer_flipbook_views(ctx, views=None, save_dir=None,
+                                       desktop_name=None, pane_name=None,
+                                       fit_contents=True):
+    """采集 SceneViewer 的 Top / Front / Right flipbook，可显式请求 Perspective。
+
+    views=None 时严格按 top、front、right 顺序采集；传入 views 时保留调用方
+    顺序且不允许重复或未知视图。每张图由 Houdini 内部 flipbook 生成并校验
+    PNG IHDR，返回结构化的逐视图结果与 state_restored 状态。
+    """
+    return _houdini_call("capture_sceneviewer_flipbook_views", {
+        "views": views,
+        "save_dir": save_dir,
+        "desktop_name": desktop_name,
+        "pane_name": pane_name,
+        "fit_contents": fit_contents,
+    })
+
+
+# -------------------------------------------------------------------
 # PR 14 Render Base64 Tools (placed before PR 7 so existing test_bridge_style
 # PR 7 section probe does not pick them up — the probe scans all
 # @mcp.tool() after the PR 7 header without an explicit upper bound)

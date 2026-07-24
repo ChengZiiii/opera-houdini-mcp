@@ -38,6 +38,7 @@ import os
 import re
 import shutil
 import sys
+import struct
 import tempfile
 import types
 import unittest
@@ -342,7 +343,13 @@ class _FakePaneTab(object):
                 frame_num = fr[0] if isinstance(fr, (tuple, list)) else 1
                 actual = output.replace("$F4", str(int(frame_num)).zfill(4))
                 with open(actual, "wb") as f:
-                    f.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 50)
+                    f.write(
+                        b"\x89PNG\r\n\x1a\n"
+                        + struct.pack(">I", 13)
+                        + b"IHDR"
+                        + struct.pack(">II", 320, 180)
+                        + b"\x08\x02\x00\x00\x00"
+                        + b"\x00\x00\x00\x00")
         except Exception:
             pass  # 测试不强制写文件成功
 
@@ -1039,7 +1046,7 @@ class CaptureMultiplePanesTests(unittest.TestCase):
         def body(pcp_qt):
             self.assertEqual(pcp_qt._QT_BACKEND, "PySide6")
             widget = _FakeQWidget()
-            sv = _FakePaneTab(widget=widget)
+            sv = _FakePaneTab(widget=widget, has_viewport=True)
             ne = _FakePaneTab(widget=widget)
             co = _FakePaneTab(widget=widget)
             hou = _FakeHou(pane_tabs_by_type={
@@ -1084,7 +1091,7 @@ class CaptureMultiplePanesTests(unittest.TestCase):
             try:
                 # Build hou with all three pane types so they would normally succeed
                 widget = _FakeQWidget()
-                sv = _FakePaneTab(widget=widget)
+                sv = _FakePaneTab(widget=widget, has_viewport=True)
                 ne = _FakePaneTab(widget=widget)
                 co = _FakePaneTab(widget=widget)
                 hou = _FakeHou(pane_tabs_by_type={

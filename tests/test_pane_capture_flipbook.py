@@ -20,6 +20,7 @@
 import importlib.util as _ilu
 import os
 import sys
+import struct
 import tempfile
 import types
 import unittest
@@ -141,9 +142,13 @@ class _FakeQRect(object):
 
 class _FakeSceneViewerPane(object):
     """Mock SceneViewer pane，flipbook / curViewport / qtWidget 全部可探测。"""
-    def __init__(self, camera=None, raise_on_flipbook=False):
+    def __init__(self, camera=None, raise_on_flipbook=False,
+                 output_mode="valid", output_width=320, output_height=180):
         self.flipbook_calls = []
         self.raise_on_flipbook = raise_on_flipbook
+        self.output_mode = output_mode
+        self.output_width = output_width
+        self.output_height = output_height
         self._camera = camera or _FakeCamera("viewport_cam")
         self._viewport = _FakeViewport(self._camera)
         # 关键：qtWidget 必须存在（说明 Houdini 端有 GUI），但调用 grab
@@ -188,7 +193,34 @@ class _FakeSceneViewerPane(object):
             self.flipbook_calls.append(settings_arg)
         if self.raise_on_flipbook:
             raise RuntimeError("simulated flipbook failure")
-        return None
+        if settings_arg is None:
+            return None
+        output = getattr(settings_arg, "output", None)
+        frame_range = getattr(settings_arg, "frameRange", (1, 1))
+        if not output or "$F4" not in output:
+            return None
+        frame = frame_range[0] if isinstance(frame_range, (tuple, list)) else 1
+        actual_path = output.replace("$F4", str(int(frame)).zfill(4))
+        if self.output_mode == "missing":
+            return None
+        if self.output_mode == "zero_bytes":
+            with open(actual_path, "wb"):
+                pass
+            return None
+        if self.output_mode == "zero_ihdr":
+            width, height = 0, 0
+        elif self.output_mode == "invalid_png":
+            with open(actual_path, "wb") as handle:
+                handle.write(b"not-a-png")
+            return None
+        else:
+            width, height = self.output_width, self.output_height
+        payload = struct.pack(">II", width, height)
+        payload += b"\x08\x02\x00\x00\x00"
+        png = (b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13)
+               + b"IHDR" + payload + b"\x00\x00\x00\x00")
+        with open(actual_path, "wb") as handle:
+            handle.write(png)
 
 
 class _FakeWidget(object):
@@ -336,6 +368,18 @@ class SceneViewerFlipbookTest(unittest.TestCase):
         self.assertFalse(getattr(settings, "outputToMPlay", None),
             "settings.outputToMPlay 必须为 False")
 
+    def test_sceneviewer_flipbook_uses_zero_frame_increment(self):
+        """settings.frameIncrement 必须为 0。"""
+        sv = _FakeSceneViewerPane()
+        hou_fake = _FakeHou(scene_viewer=sv, qt_backend=None)
+
+        self.pcp.capture_pane_screenshot(
+            hou_fake, "SceneViewer",
+            save_path=os.path.join(tempfile.gettempdir(), "x.png"))
+
+        settings = sv.flipbook_calls[0]
+        self.assertEqual(getattr(settings, "frameIncrement", None), 0)
+
     def test_sceneviewer_flipbook_uses_template_with_placeholder(self):
         """settings.output 必须用 $F4 占位（支持多帧）。"""
         sv = _FakeSceneViewerPane()
@@ -369,6 +413,40 @@ class SceneViewerFlipbookTest(unittest.TestCase):
             "返回 dict 必须含 _renderer='flipbook_via_Houdini_internal'")
         self.assertEqual(result.get("pane_type"), "SceneViewer")
 
+    def test_sceneviewer_returns_actual_png_metadata(self):
+        """成功响应必须来自实际 PNG 的 IHDR 与文件大小。"""
+        sv = _FakeSceneViewerPane(output_width=321, output_height=123)
+        hou_fake = _FakeHou(scene_viewer=sv, qt_backend=None)
+        tmpdir = tempfile.mkdtemp()
+        try:
+            result = self.pcp.capture_pane_screenshot(
+                hou_fake, "SceneViewer",
+                save_path=os.path.join(tmpdir, "actual.png"))
+            self.assertEqual(result["width"], 321)
+            self.assertEqual(result["height"], 123)
+            self.assertGreater(result["size_bytes"], 0)
+            self.assertEqual(result["size_bytes"],
+                             os.path.getsize(result["save_path"]))
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_sceneviewer_rejects_missing_zero_and_zero_ihdr_outputs(self):
+        """缺失、零字节、零 IHDR 均不得伪成功。"""
+        for mode in ("missing", "zero_bytes", "zero_ihdr", "invalid_png"):
+            sv = _FakeSceneViewerPane(output_mode=mode)
+            hou_fake = _FakeHou(scene_viewer=sv, qt_backend=None)
+            tmpdir = tempfile.mkdtemp()
+            try:
+                with self.assertRaises(RuntimeError):
+                    self.pcp.capture_pane_screenshot(
+                        hou_fake, "SceneViewer",
+                        save_path=os.path.join(tmpdir, mode + ".png"))
+                self.assertEqual(sv._widget.grab_calls, 0)
+            finally:
+                import shutil
+                shutil.rmtree(tmpdir, ignore_errors=True)
+
     def test_sceneviewer_uses_viewport_camera_no_new_cam_node(self):
         """相机必须从 curViewport().camera() 取，不新建 cam 节点。"""
         cam = _FakeCamera("my_viewport_cam")
@@ -401,10 +479,7 @@ class SceneViewerFlipbookTest(unittest.TestCase):
     def test_networkeditor_does_not_use_flipbook(self):
         """NetworkEditor 仍走 Qt grab 路径（不能因 Bug B 修复被误改）。"""
         # 注入 fake PySide6 让 Qt 后端可用
-        from tests.test_pane_capture import _FakeQBuffer, _FakeQIODevice
         fake_qtcore = types.ModuleType("PySide6.QtCore")
-        fake_qtcore.QBuffer = _FakeQBuffer
-        fake_qtcore.QIODevice = _FakeQIODevice
         fake_pkg = types.ModuleType("PySide6")
         fake_pkg.QtCore = fake_qtcore
         sys.modules["PySide6"] = fake_pkg
@@ -420,8 +495,24 @@ class SceneViewerFlipbookTest(unittest.TestCase):
                     self.grab_calls = 0
                 def grab(self):
                     self.grab_calls += 1
-                    from tests.test_pane_capture import _FakeQPixmap
-                    return _FakeQPixmap(100, 100)
+                    return _LocalPixmap()
+
+            class _LocalImage(object):
+                def isNull(self):
+                    return False
+                def width(self):
+                    return 100
+                def height(self):
+                    return 100
+                def save(self, path):
+                    with open(path, "wb") as handle:
+                        handle.write(b"non-sceneviewer-test")
+
+            class _LocalPixmap(object):
+                def isNull(self):
+                    return False
+                def toImage(self):
+                    return _LocalImage()
 
             class _NetworkEditorPane(object):
                 def __init__(self):

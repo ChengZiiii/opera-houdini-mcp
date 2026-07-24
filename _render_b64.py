@@ -543,7 +543,8 @@ def render_quad_views(hou, geometry_path=None, renderer="opengl",
         # 3. 每个 view 内部走 render_viewport 路径，但 camera_path 固定
         view_result = render_viewport(
             hou, camera_path=cam_path, geometry_path=geometry_path,
-            renderer=norm_renderer, resolution=resolution, format=format)
+            renderer=norm_renderer, resolution=resolution, format=format,
+            consent_token=consent_token)
         # 保留 image_base64 / size_bytes / format 等字段，加 view_name 标记
         out[view["name"]] = view_result
 

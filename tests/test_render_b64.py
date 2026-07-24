@@ -117,6 +117,10 @@ def _load_render_b64_fresh():
     """Reload _render_b64 module fresh from source, returns module."""
     # Always install a fresh render helpers stub so per-test state is clean.
     fake = _install_fake_render_module()
+    pkg = sys.modules.get(_PKG_KEY)
+    if pkg is not None:
+        pkg.__dict__.pop("_render_b64", None)
+        pkg.__dict__.pop("HoudiniMCPRender", None)
     if _RB64_KEY in sys.modules:
         del sys.modules[_RB64_KEY]
     spec = _ilu.spec_from_file_location(
@@ -829,6 +833,27 @@ class RenderQuadViewsTests(unittest.TestCase):
         result = self.mod.render_quad_views(hou, renderer="karma_xpu")
         for view in ("top", "front", "side", "perspective"):
             self.assertEqual(result[view].get("renderer"), "karma_xpu")
+
+    def test_consent_token_propagates_to_all_nested_viewports(self):
+        """有效 Karma token 必须原样传给四次 nested render_viewport。"""
+        hou = _make_hou_with_default_camera()
+        hou.hipFile = object()
+        captured = []
+        original = self.mod.render_viewport
+
+        def fake_render_viewport(*args, **kwargs):
+            captured.append(kwargs.get("consent_token"))
+            return {"renderer": kwargs.get("renderer"), "image_base64": "ok"}
+
+        self.mod.render_viewport = fake_render_viewport
+        try:
+            result = self.mod.render_quad_views(
+                hou, renderer="karma_cpu", consent_token="same-token")
+        finally:
+            self.mod.render_viewport = original
+        self.assertEqual(len(captured), 4)
+        self.assertEqual(captured, ["same-token"] * 4)
+        self.assertNotIn("_interrupt", result)
 
     def test_meta_block_present(self):
         hou = _make_hou_with_default_camera()
