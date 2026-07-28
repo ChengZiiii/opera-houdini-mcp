@@ -45,6 +45,11 @@ from . import _pane_capture as pcp
 from . import _capture_paths as cap
 from . import _render_b64 as rb64
 from . import _help as hlp
+from . import _events as evs
+
+RENDER_POLICY_COMMANDS = getattr(_rp, "RENDER_POLICY_COMMANDS", {})
+register_render_policy_command = getattr(
+    _rp, "register_render_policy_command", None)
 
 # PR 4 scene-diff cache：execute_code(capture_diff=True) 时填充；get_last_scene_diff 读取。
 _before_scene = None
@@ -136,7 +141,65 @@ EXTENSION_NAME = "Houdini MCP"
 EXTENSION_VERSION = (0, 1)
 EXTENSION_DESCRIPTION = "Connect Houdini to Claude via MCP"
 
+
+def _safe_server_print(message):
+    try:
+        print(message)
+    except Exception:
+        pass
+
+
+_BATCH_DEFAULT_MAX_OPERATIONS = 50
+_BATCH_MIN_OPERATIONS = 1
+_BATCH_MAX_OPERATIONS = 200
+
+
+def _evaluate_render_policy_command(command, params):
+    """通过共享 registry 执行 server-side Layer 2 policy preflight。"""
+    evaluator = getattr(_rp, "evaluate_render_policy_command", None)
+    if evaluator is None:
+        return None
+    return evaluator(command, params)
+
+
 class HoudiniMCPServer:
+    MUTATING_COMMANDS = frozenset({
+        "create_node", "modify_node", "delete_node", "set_material",
+        "connect_nodes", "disconnect_input", "set_parameters",
+        "set_node_flags", "layout_children", "reorder_inputs",
+        "set_node_position", "set_node_color", "create_network_box",
+        "create_wrangle", "set_wrangle_code", "create_material",
+        "assign_material",
+        # R10: capture_pane_screenshot, capture_multiple_panes and
+        # render_node_network are intentionally classified in NO_UNDO_COMMANDS.
+    })
+
+    READ_ONLY_COMMANDS = frozenset({
+        "get_scene_info", "serialize_scene", "get_node_info",
+        "get_last_scene_diff", "get_asset_lib_status",
+        "get_parameter_schema", "find_error_nodes", "get_geo_summary",
+        "list_visible_panes", "get_geometry_info", "get_geometry_data",
+        "list_node_types", "list_children", "find_nodes", "ping",
+        "get_material_info", "get_houdini_help", "verify_hou_api",
+        "check_connection", "ping_houdini", "get_asset_categories",
+        "search_assets",
+    })
+
+    NO_UNDO_COMMANDS = frozenset({
+        "save_scene", "load_scene", "new_scene", "execute_code",
+        "execute_hscript", "import_opus_url", "import_asset", "cook_node",
+        "manage_cache", "capture_pane_screenshot", "capture_multiple_panes",
+        "capture_sceneviewer_flipbook_views", "render_node_network",
+        "render_single_view", "render_quad_view", "render_specific_camera",
+        "render_viewport_base64", "render_quad_views_base64",
+        "render_specific_camera_base64",
+        "get_pending_events", "subscribe_events", "unsubscribe_events",
+    })
+
+    OPTIONAL_ASSET_COMMANDS = frozenset({
+        "get_asset_categories", "search_assets", "import_asset",
+    })
+
     def __init__(self, host='127.0.0.1', port=9876):
         self.host = host
         self.port = port
@@ -145,6 +208,10 @@ class HoudiniMCPServer:
         self.client = None
         self.buffer = b''
         self.timer = None
+        self._client_connected_at = None
+        self._last_activity = time.monotonic()
+        self._batch_active = False
+        self._validate_handler_classification(self._get_command_handlers())
 
     def start(self):
         """Begin listening on the given port; sets up a QTimer to poll for data."""
@@ -169,6 +236,12 @@ class HoudiniMCPServer:
             self.timer.start(100)
 
             self.running = True
+            self._last_activity = time.monotonic()
+            try:
+                evs.attach_callbacks(hou)
+            except Exception as callback_error:
+                print("HoudiniMCP 事件 callback attach 失败（不影响服务）: "
+                      + str(callback_error))
             print(f"HoudiniMCP server started on {self.host}:{self.port}")
 
             # Bug C（PR 21）：启动时清理 > 7 天的过期截图 / 渲染目录。
@@ -191,6 +264,11 @@ class HoudiniMCPServer:
     def stop(self):
         """Stop listening; close sockets and timers."""
         self.running = False
+        try:
+            evs.detach_callbacks()
+        except Exception as callback_error:
+            print("HoudiniMCP 事件 callback detach 失败（继续清理）: "
+                  + str(callback_error))
         self._cleanup_timer()
         self._cleanup_client()
         self._cleanup_socket()
@@ -211,6 +289,7 @@ class HoudiniMCPServer:
             except Exception:
                 pass
             self.client = None
+        self._client_connected_at = None
         self.buffer = b''
 
     def _cleanup_socket(self):
@@ -243,19 +322,24 @@ class HoudiniMCPServer:
                     except BlockingIOError:
                         break
                     except Exception as e:
-                        print(f"Error accepting connection: {str(e)}")
+                        _safe_server_print(
+                            "Error accepting connection: " + str(e))
                         break
                     if self.client is not None:
-                        print(f"New connection from {address}; replacing existing client")
+                        _safe_server_print(
+                            "New connection from {0}; replacing existing client".format(address))
                         self._cleanup_client()
                     new_client.setblocking(False)
                     self.client = new_client
-                    print(f"Connected to client: {address}")
+                    self._client_connected_at = time.monotonic()
+                    self._last_activity = self._client_connected_at
+                    _safe_server_print("Connected to client: " + str(address))
             
             if self.client:
                 try:
                     data = self.client.recv(8192)
                     if data:
+                        self._last_activity = time.monotonic()
                         self.buffer += data
                         while True:
                             if len(self.buffer) < 4:
@@ -263,7 +347,8 @@ class HoudiniMCPServer:
                             msg_len = struct.unpack('>I', self.buffer[:4])[0]
                             MAX_MSG_LEN = 50 * 1024 * 1024
                             if msg_len > MAX_MSG_LEN:
-                                print(f"Message too large ({msg_len} bytes), disconnecting client")
+                                _safe_server_print(
+                                    "Message too large ({0} bytes), disconnecting client".format(msg_len))
                                 self._cleanup_client()
                                 break
                             if len(self.buffer) < 4 + msg_len:
@@ -277,23 +362,25 @@ class HoudiniMCPServer:
                                 response_frame = struct.pack('>I', len(response_bytes)) + response_bytes
                                 try:
                                     self.client.sendall(response_frame)
+                                    self._last_activity = time.monotonic()
                                 except (BrokenPipeError, ConnectionResetError, OSError) as send_err:
-                                    print(f"Failed to send response (client likely disconnected): {send_err}")
                                     self._cleanup_client()
+                                    _safe_server_print(
+                                        "Failed to send response (client likely disconnected): " + str(send_err))
                                     break
                             except json.JSONDecodeError as e:
                                 print(f"Invalid JSON in message: {e}")
                     else:
-                        print("Client disconnected (empty recv)")
                         self._cleanup_client()
+                        _safe_server_print("Client disconnected (empty recv)")
                 except BlockingIOError:
                     pass
                 except (ConnectionResetError, BrokenPipeError, OSError) as e:
-                    print(f"Client connection lost: {str(e)}")
                     self._cleanup_client()
+                    _safe_server_print("Client connection lost: " + str(e))
 
         except Exception as e:
-            print(f"Server error: {str(e)}")
+            _safe_server_print("Server error: " + str(e))
 
     # -------------------------------------------------------------------------
     # Command Handling
@@ -313,10 +400,28 @@ class HoudiniMCPServer:
         Internal dispatcher that looks up 'cmd_type' from the JSON,
         calls the relevant function, and returns a JSON-friendly dict.
         """
+        if not isinstance(command, dict):
+            return {"status": "error", "message": "Command must be an object"}
         cmd_type = command.get("type")
         params = command.get("params", {})
+        handlers = self._get_command_handlers()
+        handler = handlers.get(cmd_type)
+        if not handler:
+            return {"status": "error", "message": f"Unknown command type: {cmd_type}"}
 
-        # Always-available handlers
+        if not isinstance(params, dict):
+            return {"status": "error", "message": "Command params must be an object"}
+
+        print(f"Executing handler for {cmd_type}")
+        with self._undo_group(cmd_type):
+            result = handler(**params)
+        if cmd_type == "batch":
+            result = cmn.apply_response_cap(result)
+        print(f"Handler execution complete for {cmd_type}")
+        return {"status": "success", "result": result}
+
+    def _get_command_handlers(self):
+        """返回当前 Houdini 进程唯一的 command handler registry。"""
         handlers = {
             "get_scene_info": self.get_scene_info,
             "save_scene": self.save_scene,
@@ -332,103 +437,85 @@ class HoudiniMCPServer:
             "set_material": self.set_material,
             "get_asset_lib_status": self.get_asset_lib_status,
             "import_opus_url": self.handle_import_opus_url,
-            # Graph editing & introspection
             "connect_nodes": self.connect_nodes,
             "disconnect_input": self.disconnect_input,
             "set_parameters": self.set_parameters,
             "get_parameter_schema": self.get_parameter_schema,
             "set_node_flags": self.set_node_flags,
             "layout_children": self.layout_children,
-            # PR 9: 图编辑增强（重写 reorder_inputs + layout_children + 3 新 handler）
             "reorder_inputs": self.reorder_inputs,
             "set_node_position": self.set_node_position,
             "set_node_color": self.set_node_color,
             "create_network_box": self.create_network_box,
             "find_error_nodes": self.find_error_nodes,
             "cook_node": self.cook_node,
-            # PR 12: 轻量级几何概要 + 大几何降级
             "get_geo_summary": self.get_geo_summary,
-            # PR 13: pane 截图（list_visible_panes 只读；其它写文件/UI 状态）
             "capture_pane_screenshot": self.capture_pane_screenshot,
             "capture_sceneviewer_flipbook_views": self.capture_sceneviewer_flipbook_views,
             "list_visible_panes": self.list_visible_panes,
             "capture_multiple_panes": self.capture_multiple_panes,
             "render_node_network": self.render_node_network,
-            # VEX wrangles
             "create_wrangle": self.create_wrangle,
             "set_wrangle_code": self.set_wrangle_code,
-            # Geometry introspection
             "get_geometry_info": self.get_geometry_info,
             "get_geometry_data": self.get_geometry_data,
-            # Add new render handlers
             "render_single_view": self.handle_render_single_view,
             "render_quad_view": self.handle_render_quad_view,
             "render_specific_camera": self.handle_render_specific_camera,
-            # PR 14: base64 渲染（与既有 render_*_view handler 共存；旧 handler 仍返文件路径）
             "render_viewport_base64": self.render_viewport_base64,
             "render_quad_views_base64": self.render_quad_views_base64,
             "render_specific_camera_base64": self.render_specific_camera_base64,
-            # PR 6: node discovery + cache management (NodeTypeCache)
             "list_node_types": self.list_node_types,
             "list_children": self.list_children,
             "find_nodes": self.find_nodes,
             "manage_cache": self.manage_cache,
             "ping": self._handle_ping,
-            # PR 7: 材质 CRUD + 参数白名单 + texture 识别
             "create_material": self.create_material,
             "assign_material": self.assign_material,
             "get_material_info": self.get_material_info,
-            # PR 8: HScript 执行包装（薄封装到 _hscript.execute_hscript）
             "execute_hscript": self.execute_hscript,
-            # PR 15: SideFX 在线文档查询（薄封装到 _help.get_houdini_help）
             "get_houdini_help": self.get_houdini_help,
-            # PR 18: AI-friendly wrapper over get_houdini_help（合 _ai_hint）
             "verify_hou_api": self.verify_hou_api,
-            # PR 16: 连接诊断（Houdini 端 check_connection / ping_houdini）
             "check_connection": self.check_connection,
             "ping_houdini": self.ping_houdini,
+            "get_pending_events": self.get_pending_events,
+            "subscribe_events": self.subscribe_events,
+            "unsubscribe_events": self.unsubscribe_events,
+            "batch": self.batch,
         }
-        
-        # If user has toggled asset library usage
-        if getattr(hou.session, "houdinimcp_use_assetlib", False):
-            asset_handlers = {
+
+        if getattr(getattr(hou, "session", None),
+                   "houdinimcp_use_assetlib", False):
+            handlers.update({
                 "get_asset_categories": self.get_asset_categories,
                 "search_assets": self.search_assets,
                 "import_asset": self.import_asset,
-            }
-            handlers.update(asset_handlers)
+            })
+        self._validate_handler_classification(handlers)
+        return handlers
 
-        handler = handlers.get(cmd_type)
-        if not handler:
-            return {"status": "error", "message": f"Unknown command type: {cmd_type}"}
-
-        print(f"Executing handler for {cmd_type}")
-        with self._undo_group(cmd_type):
-            result = handler(**params)
-        print(f"Handler execution complete for {cmd_type}")
-        return {"status": "success", "result": result}
-
-    # Commands that mutate the scene get wrapped in a single undo group so the
-    # artist can Ctrl+Z any agent action as one step.
-    MUTATING_COMMANDS = frozenset({
-        "create_node", "modify_node", "delete_node", "set_material",
-        "import_opus_url", "import_asset", "connect_nodes", "disconnect_input",
-        "set_parameters", "set_node_flags", "layout_children",
-        "create_wrangle", "set_wrangle_code",
-        # PR 7: 材质 CRUD 命令也属于场景变更
-        "create_material", "assign_material",
-        # PR 9: 图编辑增强命令均修改场景
-        "reorder_inputs", "set_node_position", "set_node_color",
-        "create_network_box",
-        # PR 13: pane 截图本应在此处，但 H21 实测 hou.undos.group() 上下文
-        # 会让 hou.SceneViewer.flipbook() SWIG 立即抛
-        # "argument 2 of type HOM_GeometryViewport*"（type check 在 undo
-        # 上下文中行为异常）。截图不改场景数据，移出 undo group 是正确
-        # 语义且修复 H21 兼容。render_node_network 改 NetworkEditor 当前
-        # 路径（UI 状态，非场景数据），同理移出。
-        # "capture_pane_screenshot", "capture_multiple_panes",
-        # "render_node_network",
-    })
+    @classmethod
+    def _validate_handler_classification(cls, handlers):
+        """断言 registry key 恰好属于一个 undo 分类。"""
+        command_sets = (
+            cls.MUTATING_COMMANDS,
+            cls.READ_ONLY_COMMANDS,
+            cls.NO_UNDO_COMMANDS,
+        )
+        if any(len(set(items)) != len(items) for items in command_sets):
+            raise AssertionError("command classification contains duplicates")
+        for left_index, left in enumerate(command_sets):
+            for right in command_sets[left_index + 1:]:
+                if left & right:
+                    raise AssertionError("command classification overlaps")
+        registered = set(handlers) - {"batch"}
+        classified = set().union(*command_sets)
+        missing = registered - classified
+        extra = classified - registered - cls.OPTIONAL_ASSET_COMMANDS
+        if missing or extra:
+            raise AssertionError(
+                "command classification mismatch: missing={0}, extra={1}".format(
+                    sorted(missing), sorted(extra)))
 
     @contextmanager
     def _undo_group(self, cmd_type):
@@ -438,12 +525,255 @@ class HoudiniMCPServer:
         else:
             yield
 
+    @staticmethod
+    def _batch_operation_limit():
+        raw_value = os.environ.get(
+            "HOUDINI_MCP_BATCH_MAX_OPERATIONS",
+            str(_BATCH_DEFAULT_MAX_OPERATIONS))
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            value = _BATCH_DEFAULT_MAX_OPERATIONS
+        return max(_BATCH_MIN_OPERATIONS, min(_BATCH_MAX_OPERATIONS, value))
+
+    @staticmethod
+    def _batch_error(message, requested=0):
+        return cmn.apply_response_cap({
+            "status": "error",
+            "requested": requested,
+            "executed": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "results": [],
+            "error": message,
+        })
+
+    @staticmethod
+    def _classify_handler_result(result):
+        """把 handler 原始返回值分类为 success/error/control。"""
+        if not isinstance(result, dict):
+            return "success"
+        if "_redirect" in result:
+            return "redirect"
+        if "_interrupt" in result:
+            return "interrupt"
+        if str(result.get("status", "")).lower() == "error":
+            return "error"
+        if result.get("error"):
+            return "error"
+        return "success"
+
+    @classmethod
+    def _batch_control_response(cls, policy_result, index, command_type,
+                                requested):
+        control = dict(policy_result)
+        control.setdefault("status", "error")
+        control["requested"] = requested
+        control["executed"] = 0
+        control["succeeded"] = 0
+        control["failed"] = 0
+        control["results"] = []
+        control["operation_index"] = index
+        control["operation_type"] = command_type
+        return cmn.apply_response_cap(control)
+
+    def _batch_preflight(self, operations):
+        if not isinstance(operations, list):
+            return self._batch_error("operations must be a list"), None
+        requested = len(operations)
+        limit = self._batch_operation_limit()
+        if requested > limit:
+            return self._batch_error(
+                "operations exceeds batch limit {0}".format(limit), requested), None
+
+        handlers = self._get_command_handlers()
+        for index, operation in enumerate(operations):
+            if not isinstance(operation, dict):
+                return self._batch_error(
+                    "operation {0} must be an object".format(index), requested), None
+            command_type = operation.get("type")
+            if not isinstance(command_type, str) or not command_type.strip():
+                return self._batch_error(
+                    "operation {0} type must be a non-empty string".format(index),
+                    requested), None
+            if command_type == "batch":
+                return self._batch_error(
+                    "nested batch operations are not allowed", requested), None
+            if "params" in operation and not isinstance(operation["params"], dict):
+                return self._batch_error(
+                    "operation {0} params must be an object".format(index),
+                    requested), None
+            if command_type not in handlers:
+                return self._batch_error(
+                    "Unknown command type: {0}".format(command_type), requested), None
+
+        render_policy_commands = getattr(_rp, "RENDER_POLICY_COMMANDS", {})
+        for index, operation in enumerate(operations):
+            command_type = operation["type"]
+            if command_type not in render_policy_commands:
+                continue
+            policy_result = _evaluate_render_policy_command(
+                command_type, operation.get("params", {}))
+            if policy_result is not None:
+                return self._batch_control_response(
+                    policy_result, index, command_type, requested), None
+        return None, handlers
+
+    @staticmethod
+    def _open_batch_undo_segment():
+        if not hasattr(hou, "undos"):
+            return None
+        segment = hou.undos.group("MCP: batch")
+        segment.__enter__()
+        return segment
+
+    @staticmethod
+    def _close_batch_undo_segment(segment):
+        if segment is None:
+            return None
+        try:
+            segment.__exit__(None, None, None)
+        except Exception as error:
+            print("Failed to close MCP batch undo segment: {0}".format(error))
+        return None
+
+    def batch(self, operations, continue_on_error=True):
+        """顺序执行 operations，按 mutating segment 合并 undo 且不回滚。"""
+        if self._batch_active:
+            return self._batch_error("nested batch execution is not allowed")
+        if not isinstance(continue_on_error, bool):
+            requested = len(operations) if isinstance(operations, list) else 0
+            return self._batch_error(
+                "continue_on_error must be a boolean", requested)
+
+        self._batch_active = True
+        try:
+            preflight_error, handlers = self._batch_preflight(operations)
+            if preflight_error is not None:
+                return preflight_error
+
+            requested = len(operations)
+            results = []
+            succeeded = 0
+            failed = 0
+            stopped_by_control = False
+            stopped_on_error = False
+            segment = None
+            try:
+                for index, operation in enumerate(operations):
+                    command_type = operation["type"]
+                    params = operation.get("params", {})
+                    raw_result = None
+                    outcome = "error"
+                    try:
+                        if command_type in self.MUTATING_COMMANDS:
+                            if segment is None:
+                                segment = self._open_batch_undo_segment()
+                        else:
+                            segment = self._close_batch_undo_segment(segment)
+                        raw_result = handlers[command_type](**params)
+                        outcome = self._classify_handler_result(raw_result)
+                    except Exception as error:
+                        raw_result = {
+                            "status": "error",
+                            "message": str(error),
+                            "origin": "batch",
+                            "exception": error.__class__.__name__,
+                        }
+                        outcome = "error"
+
+                    if outcome == "success":
+                        succeeded += 1
+                        results.append({
+                            "operation_index": index,
+                            "operation_type": command_type,
+                            "status": "success",
+                            "result": raw_result,
+                        })
+                        continue
+
+                    failed += 1
+                    if isinstance(raw_result, dict):
+                        result_entry = dict(raw_result)
+                    else:
+                        result_entry = {"error": str(raw_result)}
+                    if "status" not in result_entry:
+                        result_entry["status"] = "error"
+                    result_entry["operation_index"] = index
+                    result_entry["operation_type"] = command_type
+                    result_entry["response"] = raw_result
+                    results.append(result_entry)
+
+                    if outcome in ("redirect", "interrupt"):
+                        stopped_by_control = True
+                        break
+                    if not continue_on_error:
+                        stopped_on_error = True
+                        break
+            finally:
+                self._close_batch_undo_segment(segment)
+
+            if failed == 0:
+                status = "success"
+            elif stopped_by_control or stopped_on_error:
+                status = "error"
+            else:
+                status = "partial"
+            return cmn.apply_response_cap({
+                "status": status,
+                "requested": requested,
+                "executed": len(results),
+                "succeeded": succeeded,
+                "failed": failed,
+                "results": results,
+            })
+        finally:
+            self._batch_active = False
+
     def _handle_ping(self):
         return {"pong": True, "protocol": 1}
+
+    def client_presence(self):
+        """只读返回当前是否存在 active TCP client。"""
+        return self.client is not None
+
+    def has_client(self):
+        """client_presence 的兼容别名，供 headless host 观测。"""
+        return self.client_presence()
+
+    def get_client_presence(self):
+        """返回 client presence，不改变 newest-client-wins 语义。"""
+        return self.client_presence()
+
+    def last_activity(self):
+        """只读返回 monotonic activity timestamp。"""
+        return self._last_activity
+
+    def get_last_activity(self):
+        """last_activity 的兼容别名，供 headless host 观测。"""
+        return self.last_activity()
 
     # -------------------------------------------------------------------------
     # Basic Info & Node Operations
     # -------------------------------------------------------------------------
+
+    def get_pending_events(self, limit=100, cursor=None):
+        """分页 drain 进程级事件；响应 cap 不会丢弃未实际返回的事件。"""
+        return evs.PROCESS_EVENT_STATE.drain(
+            limit=limit,
+            cursor=cursor,
+            response_cap=cmn.apply_response_cap,
+        )
+
+    def subscribe_events(self, types=None):
+        """设置进程级 newest-client-wins 事件订阅，不创建 scene undo。"""
+        return cmn.apply_response_cap(
+            evs.PROCESS_EVENT_STATE.subscribe(types))
+
+    def unsubscribe_events(self, types=None):
+        """移除事件订阅或清空订阅，操作保持幂等且不创建 scene undo。"""
+        return cmn.apply_response_cap(
+            evs.PROCESS_EVENT_STATE.unsubscribe(types))
 
     def get_asset_lib_status(self):
         """Checks if the user toggled asset library usage in hou.session."""
@@ -1192,8 +1522,10 @@ class HoudiniMCPServer:
         薄封装到 _pane_capture.capture_multiple_panes，响应过
         apply_response_cap。每种 pane 独立报告 success/error。
         """
-        result = {"results": pcp.capture_multiple_panes(
-            hou, pane_types, save_dir)}
+        result = pcp.capture_multiple_panes(hou, pane_types, save_dir)
+        if not (isinstance(result, dict)
+                and result.get("status") == "warning"):
+            result = {"results": result}
         return cmn.apply_response_cap(result)
 
     def render_node_network(self, node_path, fit_contents=True,
@@ -1718,15 +2050,14 @@ class HoudiniMCPServer:
         """
         # self._check_render_lib()
 
-        # fork-render-policy: 入口拦截
-        _action, _payload = _rp.enforce_render_engine_policy(
-            render_engine, karma_engine)
-        if _action == "redirect":
-            return _payload
-        if _action == "interrupt":
-            if not (consent_token
-                    and _rp.consume_consent_token(consent_token)):
-                return _payload
+        policy_result = _evaluate_render_policy_command(
+            "render_single_view", {
+                "render_engine": render_engine,
+                "karma_engine": karma_engine,
+                "consent_token": consent_token,
+            })
+        if policy_result is not None:
+            return policy_result
 
         # Use a temporary directory for the render output
         if not render_path:
@@ -1766,15 +2097,14 @@ class HoudiniMCPServer:
         """
         # self._check_render_lib()
 
-        # fork-render-policy: 入口拦截
-        _action, _payload = _rp.enforce_render_engine_policy(
-            render_engine, karma_engine)
-        if _action == "redirect":
-            return _payload
-        if _action == "interrupt":
-            if not (consent_token
-                    and _rp.consume_consent_token(consent_token)):
-                return _payload
+        policy_result = _evaluate_render_policy_command(
+            "render_quad_view", {
+                "render_engine": render_engine,
+                "karma_engine": karma_engine,
+                "consent_token": consent_token,
+            })
+        if policy_result is not None:
+            return policy_result
 
         if not render_path:
             render_path = tempfile.gettempdir()
@@ -1823,15 +2153,14 @@ class HoudiniMCPServer:
         """
         # self._check_render_lib()
 
-        # fork-render-policy: 入口拦截
-        _action, _payload = _rp.enforce_render_engine_policy(
-            render_engine, karma_engine)
-        if _action == "redirect":
-            return _payload
-        if _action == "interrupt":
-            if not (consent_token
-                    and _rp.consume_consent_token(consent_token)):
-                return _payload
+        policy_result = _evaluate_render_policy_command(
+            "render_specific_camera", {
+                "render_engine": render_engine,
+                "karma_engine": karma_engine,
+                "consent_token": consent_token,
+            })
+        if policy_result is not None:
+            return policy_result
 
         if not render_path:
             render_path = tempfile.gettempdir()
@@ -1875,6 +2204,14 @@ class HoudiniMCPServer:
         必须继续下发给 _render_b64.render_viewport（Layer 4 兜底校验），
         否则 karma 路径会在 Layer 4 永远 interrupt。
         """
+        policy_evaluator = globals().get("_evaluate_render_policy_command")
+        policy_result = (policy_evaluator(
+            "render_viewport_base64", {
+                "renderer": renderer,
+                "consent_token": consent_token,
+            }) if policy_evaluator is not None else None)
+        if policy_result is not None:
+            return cmn.apply_response_cap(policy_result)
         result = rb64.render_viewport(
             hou, camera_path=camera_path, geometry_path=geometry_path,
             renderer=renderer, resolution=tuple(resolution)
@@ -1894,6 +2231,14 @@ class HoudiniMCPServer:
         fork-render-policy-defense-in-depth：bridge 透传的 consent_token
         必须继续下发给 _render_b64.render_quad_views（Layer 4 兜底校验）。
         """
+        policy_evaluator = globals().get("_evaluate_render_policy_command")
+        policy_result = (policy_evaluator(
+            "render_quad_views_base64", {
+                "renderer": renderer,
+                "consent_token": consent_token,
+            }) if policy_evaluator is not None else None)
+        if policy_result is not None:
+            return cmn.apply_response_cap(policy_result)
         result = rb64.render_quad_views(
             hou, geometry_path=geometry_path, renderer=renderer,
             resolution=tuple(resolution)
@@ -1913,6 +2258,14 @@ class HoudiniMCPServer:
         必须继续下发给 _render_b64.render_specific_camera_base64（Layer 4
         兜底校验）。
         """
+        policy_evaluator = globals().get("_evaluate_render_policy_command")
+        policy_result = (policy_evaluator(
+            "render_specific_camera_base64", {
+                "renderer": renderer,
+                "consent_token": consent_token,
+            }) if policy_evaluator is not None else None)
+        if policy_result is not None:
+            return cmn.apply_response_cap(policy_result)
         result = rb64.render_specific_camera_base64(
             hou, camera_path=camera_path,
             resolution=tuple(resolution)

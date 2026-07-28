@@ -92,6 +92,42 @@ _PANETYPE_ALIASES = {
 }
 
 
+def _ui_unavailable_warning():
+    """返回所有 headless capture 入口共用的 warning envelope。"""
+    return {
+        "status": "warning",
+        "_warning": {
+            "code": "ui_unavailable",
+            "message": "no desktop or pane available in headless Houdini",
+            "headless": True,
+        },
+    }
+
+
+def _explicit_headless_warning(hou, require_desktop=False):
+    """在任何 Qt/desktop/pane 操作前检查 Houdini UI 能力。"""
+    checker = getattr(hou, "isUIAvailable", None)
+    if callable(checker):
+        try:
+            if not checker():
+                return _ui_unavailable_warning()
+        except Exception:
+            return _ui_unavailable_warning()
+        if require_desktop:
+            current = _current_desktop(hou)
+            ui = getattr(hou, "ui", None)
+            desktops = []
+            getter = getattr(ui, "desktops", None) if ui is not None else None
+            if callable(getter):
+                try:
+                    desktops = list(getter() or [])
+                except Exception:
+                    desktops = []
+            if current is None and not desktops:
+                return _ui_unavailable_warning()
+    return None
+
+
 def _fit_pane_contents(pane, pane_type_name):
     """按 pane 类型调用对应的 fit 方法。
 
@@ -159,6 +195,10 @@ def capture_pane_screenshot(hou, pane_type_name, save_path=None,
         RuntimeError: pane 存在但 qtWidget() 返回 None / Qt grab 失败 /
                       flipbook 失败（不回退 Qt grab，user spec 硬约束）。
     """
+    warning = _explicit_headless_warning(hou, require_desktop=True)
+    if warning is not None:
+        return warning
+
     if _QT_BACKEND is None and pane_type_name != "SceneViewer":
         return {
             "pane_type": pane_type_name,
@@ -179,6 +219,8 @@ def capture_pane_screenshot(hou, pane_type_name, save_path=None,
         pane = hou.ui.paneTabOfType(pane_type_enum)
         if pane is None:
             # 真实名在 hou.paneTabType 上，但当前 UI 无该类型 pane
+            if callable(getattr(hou, "isUIAvailable", None)):
+                return _ui_unavailable_warning()
             raise ValueError("未找到 " + str(pane_type_name) + " pane")
     else:
         # 用户传了 hou.paneTabType 上没有的属性名 → 试 _PANETYPE_ALIASES
@@ -195,6 +237,8 @@ def capture_pane_screenshot(hou, pane_type_name, save_path=None,
             if pane is not None:
                 break  # 第一个可见实例即胜出
         if pane is None:
+            if callable(getattr(hou, "isUIAvailable", None)):
+                return _ui_unavailable_warning()
             raise ValueError(
                 "未找到 pane 类型: " + str(pane_type_name)
                 + "（已尝试别名: " + str(attempted) + "）")
@@ -875,9 +919,17 @@ def capture_sceneviewer_flipbook_views(hou, views=None, save_dir=None,
                                        desktop_name=None, pane_name=None,
                                        fit_contents=True):
     """采集确定 SceneViewer 的 Top/Front/Right（可显式加 Perspective）。"""
+    warning = _explicit_headless_warning(hou, require_desktop=True)
+    if warning is not None:
+        return warning
     requested = _normalize_sceneviewer_views(views)
-    desktop, pane, original_desktop = _resolve_sceneviewer(
-        hou, desktop_name=desktop_name, pane_name=pane_name)
+    try:
+        desktop, pane, original_desktop = _resolve_sceneviewer(
+            hou, desktop_name=desktop_name, pane_name=pane_name)
+    except ValueError:
+        if callable(getattr(hou, "isUIAvailable", None)):
+            return _ui_unavailable_warning()
+        raise
     switched_desktop = _activate_desktop(desktop, original_desktop)
     if save_dir is None:
         default_path = cp.default_capture_path(
@@ -1025,6 +1077,9 @@ def capture_multiple_panes(hou, pane_types, save_dir):
         save_path（SceneViewer flipbook 路径下会含 $F4 替换后的帧号）；
         失败时仍用请求的 save_path（便于事后排查）。
     """
+    warning = _explicit_headless_warning(hou, require_desktop=True)
+    if warning is not None:
+        return warning
     os.makedirs(save_dir, exist_ok=True)
     results = []
     for pt in pane_types:
@@ -1075,12 +1130,18 @@ def render_node_network(hou, node_path, fit_contents=True, save_path=None):
     Raises:
         ValueError: 节点不存在 / 找不到 NetworkEditor pane。
     """
+    warning = _explicit_headless_warning(hou, require_desktop=True)
+    if warning is not None:
+        return warning
+
     node = hou.node(node_path)
     if not node:
         raise ValueError("节点不存在: " + str(node_path))
 
     pane = hou.ui.paneTabOfType(hou.paneTabType.NetworkEditor)
     if pane is None:
+        if callable(getattr(hou, "isUIAvailable", None)):
+            return _ui_unavailable_warning()
         raise ValueError("未找到 NetworkEditor pane")
 
     pane.cd(node.path())

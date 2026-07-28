@@ -36,6 +36,11 @@ API：
     _consent_dir() -> str:
         返回 ``<fork_root>/../houdinimcp-env/.karma_consent/`` 绝对路径，
         ``os.makedirs(exist_ok=True)`` 确保存在。
+    register_render_policy_command(command, adapter) -> callable:
+        注册公开 render command 的 Layer 1 adapter；重复同值注册幂等，
+        冲突注册拒绝。
+    evaluate_render_policy_command(command, params) -> dict_or_None:
+        通过唯一 registry 执行 command 的 Layer 1 policy preflight。
 """
 import json
 import os
@@ -51,6 +56,35 @@ _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 _FORK_PARENT = os.path.dirname(_MODULE_DIR)
 _DEFAULT_ENV_DIR = os.path.join(_FORK_PARENT, "houdinimcp-env")
 _DEFAULT_CONSENT_SUBDIR = ".karma_consent"
+_DEFAULT_RENDER_ENGINE = "opengl"
+_DEFAULT_KARMA_ENGINE = "cpu"
+_DEFAULT_RENDERER = "opengl"
+
+
+# bridge 与 Houdini-side batch 共同读取的 Layer 1 policy registry。注册表
+# 只包含当前 fork 已存在的 render command；新增入口必须显式注册，避免
+# batch 通过复制命令清单而绕过公开单 tool 的 policy 参数映射。
+RENDER_POLICY_COMMANDS = {}
+
+
+def register_render_policy_command(command, adapter):
+    """注册 render command 的 Layer 1 adapter。
+
+    空命令、非 callable adapter 和冲突 adapter 都拒绝；同一 command 使用
+    同一个 adapter 重复注册时保持幂等，便于 server / bridge 初始化重入。
+    """
+    if not isinstance(command, str) or not command.strip():
+        raise ValueError("render policy command must be a non-empty string")
+    if not callable(adapter):
+        raise TypeError("render policy adapter must be callable")
+    if command in RENDER_POLICY_COMMANDS:
+        existing = RENDER_POLICY_COMMANDS[command]
+        if existing is adapter:
+            return existing
+        raise ValueError(
+            "render policy command already registered: {0}".format(command))
+    RENDER_POLICY_COMMANDS[command] = adapter
+    return adapter
 
 
 def _env_dir():
@@ -355,3 +389,77 @@ def enforce_render_engine_policy(render_engine, karma_engine=None):
     """
     return enforce_render_policy(
         render_engine_to_renderer(render_engine, karma_engine))
+
+
+def _engine_policy_adapter(params):
+    """执行 engine render command 的 Layer 1 policy 校验。"""
+    params = params if isinstance(params, dict) else {}
+    render_engine = (params["render_engine"]
+                     if "render_engine" in params
+                     else _DEFAULT_RENDER_ENGINE)
+    karma_engine = (params["karma_engine"]
+                    if "karma_engine" in params
+                    else _DEFAULT_KARMA_ENGINE)
+    action, payload = enforce_render_engine_policy(
+        render_engine, karma_engine)
+    if action == "allow":
+        return None
+    if action == "redirect":
+        return payload
+    if action == "interrupt":
+        token = params.get("consent_token")
+        if token and consume_consent_token(token):
+            return None
+        return payload
+    return {"status": "error", "message": "unknown render policy action"}
+
+
+def _renderer_policy_adapter(params):
+    """执行 renderer base64 command 的 Layer 1 policy 校验。"""
+    params = params if isinstance(params, dict) else {}
+    renderer = (params["renderer"]
+                if "renderer" in params
+                else _DEFAULT_RENDERER)
+    action, payload = enforce_render_policy(renderer)
+    if action == "allow":
+        return None
+    if action == "redirect":
+        return payload
+    if action == "interrupt":
+        token = params.get("consent_token")
+        if token and consume_consent_token(token):
+            return None
+        return payload
+    return {"status": "error", "message": "unknown render policy action"}
+
+
+def evaluate_render_policy_command(command, params=None):
+    """通过唯一 registry 执行一个 render command 的 Layer 1 preflight。"""
+    adapter = RENDER_POLICY_COMMANDS.get(command)
+    if adapter is None:
+        return None
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        return {"status": "error", "message": "render policy params must be a dict"}
+    try:
+        result = adapter(params)
+    except Exception as error:
+        return {"status": "error", "message": str(error),
+                "origin": "render_policy"}
+    if result is None or isinstance(result, dict):
+        return result
+    return {"status": "error",
+            "message": "render policy adapter must return dict or None",
+            "origin": "render_policy"}
+
+
+for _command in (
+        "render_single_view", "render_quad_view",
+        "render_specific_camera"):
+    register_render_policy_command(_command, _engine_policy_adapter)
+
+for _command in (
+        "render_viewport_base64", "render_quad_views_base64",
+        "render_specific_camera_base64"):
+    register_render_policy_command(_command, _renderer_policy_adapter)

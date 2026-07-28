@@ -10,6 +10,11 @@ import sys
 import os
 import time
 import argparse
+import shutil
+import signal
+import subprocess
+import threading
+import uuid
 
 # 内嵌 Python 受 _pth 控制，启动独立脚本时不会自动把脚本目录加进
 # sys.path。这里显式把脚本所在目录 prepend 进去，确保 sibling 模块
@@ -107,9 +112,22 @@ try:
 except ImportError:
     import _render_policy as _rp  # type: ignore
 
+try:
+    from . import _common as cmn
+except ImportError:
+    import _common as cmn  # type: ignore
+
+try:
+    from . import _best_practices as _bp
+except ImportError:
+    import _best_practices as _bp  # type: ignore
+
+RENDER_POLICY_COMMANDS = _rp.RENDER_POLICY_COMMANDS
+register_render_policy_command = _rp.register_render_policy_command
+
 
 def _apply_render_policy_to_engine(render_engine, karma_engine=None,
-                                   consent_token=None):
+                                   consent_token=None, command=None):
     """应用 fork-render-policy-redirect-and-consent 入口校验。
 
     Args:
@@ -123,32 +141,21 @@ def _apply_render_policy_to_engine(render_engine, karma_engine=None,
         dict_or_None: 命中 redirect / interrupt 时返回对应结构化 dict；
         ``None`` 时表示放行，调用方继续原逻辑。
     """
-    action, payload = _rp.enforce_render_engine_policy(
-        render_engine, karma_engine)
-    if action == "allow":
-        return None
-    if action == "redirect":
-        return payload
-    # interrupt 路径
-    if action == "interrupt":
-        if consent_token and _rp.consume_consent_token(consent_token):
-            return None  # consent 校验通过 → 放行
-        return payload  # 未带 token / token 过期 / token 无效 → 返回 interrupt
-    return None  # 防御性兜底
+    params = {
+        "render_engine": render_engine,
+        "karma_engine": karma_engine,
+        "consent_token": consent_token,
+    }
+    return _rp.evaluate_render_policy_command(
+        command or "render_single_view", params)
 
 
-def _apply_render_policy_to_renderer(renderer, consent_token=None):
+def _apply_render_policy_to_renderer(renderer, consent_token=None,
+                                     command=None):
     """renderer 直接版本（PR 14 render_*_base64 工具用）。"""
-    action, payload = _rp.enforce_render_policy(renderer)
-    if action == "allow":
-        return None
-    if action == "redirect":
-        return payload
-    if action == "interrupt":
-        if consent_token and _rp.consume_consent_token(consent_token):
-            return None
-        return payload
-    return None
+    params = {"renderer": renderer, "consent_token": consent_token}
+    return _rp.evaluate_render_policy_command(
+        command or "render_viewport_base64", params)
 
 # --- Minimal api.utils.fix_rgb replication ---
 # Assume it takes a list/tuple and returns [r, g, b] if valid, else None
@@ -610,6 +617,529 @@ class HoudiniConnection:
             return {"status": "error", "message": error_msg, "origin": "mcp_server_send_command"}
 
 
+_HEADLESS_LOCK_SUFFIX = ".lock"
+_HEADLESS_RUNTIME_SUFFIX = ".runtime.json"
+_HEADLESS_DIR_NAME = ".headless"
+_HEADLESS_LOG_MAX_BYTES = 1024 * 1024
+_HEADLESS_LOG_BACKUPS = 2
+_HEADLESS_MAX_MESSAGE = 50 * 1024 * 1024
+_HEADLESS_PROCESSES = {}
+_HEADLESS_DRAIN_THREADS = {}
+
+
+def _env_truthy(name):
+    return str(os.environ.get(name, "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _env_dir():
+    """返回 embedded env 根目录；不创建依赖目录。"""
+    return os.path.join(os.path.dirname(_HERE), "houdinimcp-env")
+
+
+def _headless_dir():
+    directory = os.path.join(_env_dir(), _HEADLESS_DIR_NAME)
+    os.makedirs(directory, exist_ok=True)
+    return directory
+
+
+def _headless_safe_host(host):
+    value = str(host or "127.0.0.1")
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_"
+                   for ch in value)
+
+
+def _headless_key(host, port):
+    return "{0}-{1}".format(_headless_safe_host(host), int(port))
+
+
+def _headless_path(host, port, suffix):
+    return os.path.join(
+        _headless_dir(), _headless_key(host, port) + suffix)
+
+
+def _headless_log_path(host, port):
+    log_dir = os.path.join(_headless_dir(), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, _headless_key(host, port) + ".log")
+
+
+def _headless_read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _headless_write_lock(host, port, token):
+    path = _headless_path(host, port, _HEADLESS_LOCK_SUFFIX)
+    metadata = {
+        "pid": os.getpid(),
+        "owner_token": str(token),
+        "host": str(host),
+        "port": int(port),
+        "created_at": time.time(),
+    }
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError:
+        return False
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, ensure_ascii=False, sort_keys=True)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+    except Exception:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+    return True
+
+
+def _headless_metadata_matches(value, host, port, token, pid=None):
+    if not isinstance(value, dict):
+        return False
+    if str(value.get("owner_token", "")) != str(token):
+        return False
+    if str(value.get("host", "")) != str(host):
+        return False
+    try:
+        if int(value.get("port")) != int(port):
+            return False
+    except (TypeError, ValueError):
+        return False
+    if pid is not None:
+        try:
+            if int(value.get("pid")) != int(pid):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def _headless_release_lock(host, port, token):
+    path = _headless_path(host, port, _HEADLESS_LOCK_SUFFIX)
+    value = _headless_read_json(path)
+    if not _headless_metadata_matches(value, host, port, token):
+        return False
+    try:
+        os.remove(path)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+def _headless_pid_alive(pid):
+    try:
+        value = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if value <= 0:
+        return False
+    if value == os.getpid():
+        return True
+    try:
+        os.kill(value, 0)
+        return True
+    except (ProcessLookupError, FileNotFoundError):
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _headless_stale_lock_seconds():
+    try:
+        value = float(os.environ.get(
+            "HOUDINI_MCP_HEADLESS_STALE_LOCK_SECONDS", "30"))
+    except (TypeError, ValueError):
+        value = 30.0
+    return max(5.0, min(600.0, value))
+
+
+def _headless_lock_is_stale(host, port, now=None):
+    path = _headless_path(host, port, _HEADLESS_LOCK_SUFFIX)
+    value = _headless_read_json(path)
+    if not isinstance(value, dict):
+        return False
+    if str(value.get("host", "")) != str(host):
+        return False
+    try:
+        if int(value.get("port")) != int(port):
+            return False
+        created_at = float(value.get("created_at"))
+    except (TypeError, ValueError):
+        return False
+    token = str(value.get("owner_token", ""))
+    if not token:
+        return False
+    current = time.time() if now is None else float(now)
+    if current - created_at < _headless_stale_lock_seconds():
+        return False
+    return not _headless_pid_alive(value.get("pid"))
+
+
+def _headless_recover_stale_lock(host, port):
+    path = _headless_path(host, port, _HEADLESS_LOCK_SUFFIX)
+    if not _headless_lock_is_stale(host, port):
+        return False
+    first = _headless_read_json(path)
+    if not isinstance(first, dict):
+        return False
+    second = _headless_read_json(path)
+    if not isinstance(second, dict):
+        return False
+    if first.get("owner_token") != second.get("owner_token"):
+        return False
+    try:
+        os.remove(path)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+def _headless_runtime_owned(host, port, token):
+    value = _headless_read_json(
+        _headless_path(host, port, _HEADLESS_RUNTIME_SUFFIX))
+    return _headless_metadata_matches(value, host, port, token)
+
+
+def _headless_clear_token_state(host, port, token):
+    removed = False
+    for suffix in (_HEADLESS_RUNTIME_SUFFIX, _HEADLESS_LOCK_SUFFIX):
+        path = _headless_path(host, port, suffix)
+        value = _headless_read_json(path)
+        if not _headless_metadata_matches(value, host, port, token):
+            continue
+        try:
+            os.remove(path)
+            removed = True
+        except FileNotFoundError:
+            removed = True
+        except OSError:
+            pass
+    return removed
+
+
+def _find_hython():
+    """按显式配置、HFS 和 PATH 顺序找到真实 hython 可执行文件。"""
+    candidates = []
+    configured = os.environ.get("HOUDINI_MCP_HYTHON")
+    if configured:
+        candidates.append(configured)
+    hfs = os.environ.get("HFS")
+    if hfs:
+        candidates.extend([
+            os.path.join(hfs, "bin", "hython.exe"),
+            os.path.join(hfs, "bin", "hython"),
+        ])
+    candidates.extend(["hython.exe", "hython"])
+    for candidate in candidates:
+        resolved = candidate
+        if not os.path.isabs(candidate):
+            resolved = shutil.which(candidate) or candidate
+        if os.path.isfile(resolved) and os.access(resolved, os.X_OK):
+            return os.path.abspath(resolved)
+        if shutil.which(candidate):
+            return shutil.which(candidate)
+    raise FileNotFoundError(
+        "未找到 hython；设置 HOUDINI_MCP_HYTHON 或 HFS 后重试")
+
+
+def _headless_recv_exact(sock, size):
+    chunks = []
+    remaining = int(size)
+    while remaining:
+        chunk = sock.recv(min(remaining, 65536))
+        if not chunk:
+            raise ConnectionAbortedError("headless server 在 framed response 前断开")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _headless_protocol_ping(host, port, timeout=0.5):
+    """对已监听端口执行真实 4-byte framed ping。"""
+    sock = None
+    try:
+        sock = socket.create_connection((host, int(port)), timeout=timeout)
+        sock.settimeout(timeout)
+        payload = json.dumps({"type": "ping", "params": {}}).encode("utf-8")
+        sock.sendall(struct.pack(">I", len(payload)) + payload)
+        header = _headless_recv_exact(sock, 4)
+        size = struct.unpack(">I", header)[0]
+        if size > _HEADLESS_MAX_MESSAGE:
+            return False
+        response = json.loads(_headless_recv_exact(sock, size).decode("utf-8"))
+        return bool((response.get("result") or {}).get("pong"))
+    except (OSError, ValueError, TypeError, ConnectionError,
+            json.JSONDecodeError):
+        return False
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def _headless_port_listening(host, port, timeout=0.25):
+    sock = None
+    try:
+        sock = socket.create_connection((host, int(port)), timeout=timeout)
+        return True
+    except OSError:
+        return False
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def _headless_readiness_timeout():
+    try:
+        value = float(os.environ.get(
+            "HOUDINI_MCP_HEADLESS_START_TIMEOUT", "30"))
+    except (TypeError, ValueError):
+        value = 30.0
+    return max(5.0, min(120.0, value))
+
+
+def _wait_for_headless_ready(host, port, timeout=None, process=None):
+    """先观察 listen，再以 framed ping 作为唯一 readiness。"""
+    wait_seconds = (_headless_readiness_timeout()
+                    if timeout is None else max(5.0, min(120.0, float(timeout))))
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            return False
+        if _headless_port_listening(host, port):
+            if _headless_protocol_ping(host, port, timeout=0.5):
+                return True
+        time.sleep(0.1)
+    return False
+
+
+class _HeadlessRotatingLog(object):
+    """无依赖、有界的 1MB/3 份 headless 输出日志。"""
+
+    def __init__(self, path):
+        self.path = path
+        self._lock = threading.Lock()
+
+    def _rotate(self):
+        oldest = self.path + ".{0}".format(_HEADLESS_LOG_BACKUPS)
+        try:
+            if os.path.exists(oldest):
+                os.remove(oldest)
+        except OSError:
+            pass
+        for index in range(_HEADLESS_LOG_BACKUPS - 1, 0, -1):
+            source = self.path + ".{0}".format(index)
+            target = self.path + ".{0}".format(index + 1)
+            try:
+                if os.path.exists(source):
+                    os.replace(source, target)
+            except OSError:
+                pass
+        try:
+            if os.path.exists(self.path):
+                os.replace(self.path, self.path + ".1")
+        except OSError:
+            pass
+
+    def write(self, data):
+        if not data:
+            return
+        if isinstance(data, str):
+            data = data.encode("utf-8", errors="replace")
+        if len(data) > _HEADLESS_LOG_MAX_BYTES:
+            data = data[-_HEADLESS_LOG_MAX_BYTES:]
+        with self._lock:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            try:
+                current_size = os.path.getsize(self.path)
+            except OSError:
+                current_size = 0
+            if current_size and current_size + len(data) > _HEADLESS_LOG_MAX_BYTES:
+                self._rotate()
+            with open(self.path, "ab") as handle:
+                handle.write(data)
+                handle.flush()
+
+
+def _drain_headless_output(process, writer):
+    stream = getattr(process, "stdout", None)
+    if stream is None:
+        return
+    read_chunk = getattr(stream, "read1", None)
+    try:
+        while True:
+            chunk = (read_chunk(4096) if callable(read_chunk)
+                     else stream.read(4096))
+            if not chunk:
+                break
+            writer.write(chunk)
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _start_headless_process(host, port, token):
+    hython = _find_hython()
+    command = [
+        hython,
+        os.path.join(_HERE, "headless_host.py"),
+        "--host", str(host),
+        "--port", str(int(port)),
+        "--owner-token", str(token),
+        "--idle-seconds", str(_headless_idle_seconds()),
+    ]
+    process = subprocess.Popen(
+        command,
+        cwd=_HERE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+    )
+    writer = _HeadlessRotatingLog(_headless_log_path(host, port))
+    thread = threading.Thread(
+        target=_drain_headless_output, args=(process, writer),
+        name="houdini-mcp-headless-log-drain", daemon=True)
+    thread.start()
+    _HEADLESS_PROCESSES[token] = process
+    _HEADLESS_DRAIN_THREADS[token] = thread
+    return process
+
+
+def _headless_log_tail(host, port, max_chars=2000):
+    path = _headless_log_path(host, port)
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(-min(handle.tell(), 8192), os.SEEK_END)
+            data = handle.read()
+        text = data.decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    return text[-int(max_chars):]
+
+
+def _headless_idle_seconds():
+    try:
+        value = float(os.environ.get(
+            "HOUDINI_MCP_HEADLESS_IDLE_SECONDS", "300"))
+    except (TypeError, ValueError):
+        value = 300.0
+    return max(30.0, min(86400.0, value))
+
+
+def _headless_start_failure(host, port, token, reason):
+    drain = _HEADLESS_DRAIN_THREADS.get(token)
+    if drain is not None and drain is not threading.current_thread():
+        drain.join(timeout=1.0)
+    tail = _headless_log_tail(host, port, max_chars=2000)
+    _headless_clear_token_state(host, port, token)
+    message = "无法启动 headless Houdini daemon {0}:{1}: {2}".format(
+        host, port, reason)
+    if tail:
+        message += "\nheadless log tail:\n" + tail
+    return ConnectionError(message)
+
+
+def _ensure_headless_daemon(host="127.0.0.1", port=9876):
+    """串行化并等待共享 headless daemon，不拥有其退出生命周期。"""
+    if _env_truthy("HOUDINIMCP_NO_HEADLESS"):
+        raise ConnectionError(
+            "headless Houdini 已由 HOUDINIMCP_NO_HEADLESS 禁用")
+    timeout = _headless_readiness_timeout()
+    deadline = time.monotonic() + timeout
+    token = uuid.uuid4().hex
+    process = None
+    while time.monotonic() < deadline:
+        if _headless_protocol_ping(host, port, timeout=0.5):
+            return True
+        lock_acquired = _headless_write_lock(host, port, token)
+        if lock_acquired:
+            try:
+                # 获锁后必须二次探测，避免竞争窗口重复 Popen。
+                if _headless_protocol_ping(host, port, timeout=0.5):
+                    return True
+                if _headless_port_listening(host, port):
+                    remaining = max(5.0, deadline - time.monotonic())
+                    if _wait_for_headless_ready(
+                            host, port, timeout=remaining):
+                        return True
+                    raise RuntimeError("已有进程占用端口但 framed ping 未就绪")
+                process = _start_headless_process(host, port, token)
+                remaining = max(5.0, deadline - time.monotonic())
+                if _wait_for_headless_ready(
+                        host, port, timeout=remaining, process=process):
+                    return True
+                if process.poll() is not None:
+                    raise RuntimeError(
+                        "hython 提前退出，returncode={0}".format(
+                            process.returncode))
+                raise RuntimeError("等待 framed ping readiness 超时")
+            except Exception as error:
+                raise _headless_start_failure(
+                    host, port, token, str(error))
+            finally:
+                # host 成功时已经释放；失败时仅释放自己的 token lock。
+                _headless_release_lock(host, port, token)
+        else:
+            if _headless_protocol_ping(host, port, timeout=0.5):
+                return True
+            if not _headless_port_listening(host, port):
+                _headless_recover_stale_lock(host, port)
+        time.sleep(0.1)
+    raise _headless_start_failure(
+        host, port, token, "启动/等待超时")
+
+
+def _shutdown_headless_daemon(host, port, owner_token, pid=None):
+    """按 runtime metadata 的 PID+token 显式停止 daemon。"""
+    if pid is None:
+        return False
+    value = _headless_read_json(
+        _headless_path(host, port, _HEADLESS_RUNTIME_SUFFIX))
+    if not _headless_metadata_matches(value, host, port, owner_token,
+                                      pid=pid):
+        return False
+    target_pid = value.get("pid")
+    if not _headless_pid_alive(target_pid):
+        return False
+    try:
+        os.kill(int(target_pid), signal.SIGTERM)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def shutdown_headless_daemon(host, port, owner_token, pid=None):
+    """显式运维入口；拒绝旧 token 或旧 PID。"""
+    return _shutdown_headless_daemon(host, port, owner_token, pid=pid)
+
+
 # A global Houdini connection object
 _houdini_connection: HoudiniConnection = None
 _houdini_port: int = 9876  # Default port; override with --port
@@ -623,11 +1153,18 @@ def get_houdini_connection() -> HoudiniConnection:
 
     # Always try to connect, returns True if already connected or successful now
     if not _houdini_connection.connect():
-         # Connection failed, reset _houdini_connection to allow retry next time?
          host, port = _houdini_connection.host, _houdini_connection.port
          _houdini_connection = None
-         raise ConnectionError(f"Could not connect to Houdini on {host}:{port}. Is the plugin running?")
-         
+         if not _env_truthy("HOUDINIMCP_NO_HEADLESS"):
+             _ensure_headless_daemon(host, port)
+             connection = HoudiniConnection(host=host, port=port)
+             if connection.connect():
+                 _houdini_connection = connection
+                 return _houdini_connection
+         raise ConnectionError(
+             f"Could not connect to Houdini on {host}:{port}. "
+              "Is the plugin running or is headless startup disabled?")
+
     return _houdini_connection
 
 
@@ -657,6 +1194,61 @@ async def server_lifespan(app: FastMCP):
     logger.info("Connection to Houdini closed.")
 
 mcp.lifespan = server_lifespan
+
+
+# -------------------------------------------------------------------
+# Houdini Event Tools（bridge-only names；server registry 使用 pending 命令）
+# -------------------------------------------------------------------
+@mcp.tool()
+def get_houdini_events(ctx, limit=100, cursor=None):
+    """分页拉取 Houdini 进程级事件；cursor 由上一页响应返回。"""
+    return _houdini_call("get_pending_events", {
+        "limit": limit,
+        "cursor": cursor,
+    })
+
+
+@mcp.tool()
+def subscribe_houdini_events(ctx, types=None):
+    """订阅事件类型；省略 types 时订阅当前支持的全部事件。"""
+    return _houdini_call("subscribe_events", {"types": types})
+
+
+@mcp.tool()
+def unsubscribe_houdini_events(ctx, types=None):
+    """取消指定事件订阅；省略 types 时清空全部订阅。"""
+    return _houdini_call("unsubscribe_events", {"types": types})
+
+
+# -------------------------------------------------------------------
+# Best Practices Knowledge Base Tool（bridge-local；不建立 Houdini 连接）
+# 放在 event tools 与 Original Houdini Tools 之间的无 # PR 探针区，
+# 避免被任何 "# PR N" bounded AST 探针扫到。
+# -------------------------------------------------------------------
+@mcp.tool()
+def get_best_practices(ctx, query=None, category=None, id=None):
+    """查询 fork 人工审查的 BEST_PRACTICES advisory recipes（bridge-local）。
+
+    本工具 **不建立 Houdini TCP 连接**，直接在 bridge 进程内加载并查询
+    BEST_PRACTICES.md。recipe 是 advisory，不替代 verify_hou_api /
+    get_houdini_help，也不替代目标 Houdini 版本的 live verification。
+
+    参数说明：
+    - query: 可选，对 problem/symptom/fix/category/source 做 casefold
+      子串匹配。
+    - category: 可选，精确匹配 category 字段。
+    - id: 可选，精确匹配 recipe id（如 "BP-001"）。
+    多个参数组合为 AND。
+
+    返回统一 envelope：status（success/error）、practices（实际返回列表）、
+    total_indexed（过滤前索引数）、matched_count（过滤命中数）、
+    returned_count（cap 后实际返回数，恒等于 len(practices)）、truncated
+    （matched > returned 时为 true）。error 时 error={code,message,details}，
+    且 practices 为空、三个 count 为 0。响应整体过 apply_response_cap。
+    """
+    return _bp.get_best_practices(
+        query=query, category=category, bp_id=id,
+        response_cap_fn=getattr(cmn, "apply_response_cap", None))
 
 
 # -------------------------------------------------------------------
@@ -959,6 +1551,142 @@ def _houdini_call(cmd_type: str, params: Dict[str, Any] = None) -> dict:
     return {"status": "success", "result": response.get("result", {})}
 
 
+_BATCH_DEFAULT_MAX_OPERATIONS = 50
+_BATCH_MIN_OPERATIONS = 1
+_BATCH_MAX_OPERATIONS = 200
+
+
+def _batch_operation_limit():
+    """读取 batch 上限并限制在协议允许范围内。"""
+    raw_value = os.environ.get(
+        "HOUDINI_MCP_BATCH_MAX_OPERATIONS",
+        str(_BATCH_DEFAULT_MAX_OPERATIONS))
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = _BATCH_DEFAULT_MAX_OPERATIONS
+    return max(_BATCH_MIN_OPERATIONS, min(_BATCH_MAX_OPERATIONS, value))
+
+
+def _batch_validation_error(message, requested=0):
+    """构造不执行任何 operation 的 batch 错误并应用 response cap。"""
+    return cmn.apply_response_cap({
+        "status": "error",
+        "requested": requested,
+        "executed": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "results": [],
+        "error": message,
+    })
+
+
+def _validate_batch_operations(operations):
+    """只校验 batch 结构；不复制 dispatcher handler registry。"""
+    if not isinstance(operations, list):
+        return _batch_validation_error("operations must be a list")
+    requested = len(operations)
+    limit = _batch_operation_limit()
+    if requested > limit:
+        return _batch_validation_error(
+            "operations exceeds batch limit {0}".format(limit), requested)
+    for index, operation in enumerate(operations):
+        if not isinstance(operation, dict):
+            return _batch_validation_error(
+                "operation {0} must be an object".format(index), requested)
+        command_type = operation.get("type")
+        if not isinstance(command_type, str) or not command_type.strip():
+            return _batch_validation_error(
+                "operation {0} type must be a non-empty string".format(index),
+                requested)
+        if command_type == "batch":
+            return _batch_validation_error(
+                "nested batch operations are not allowed", requested)
+        if "params" in operation and not isinstance(operation["params"], dict):
+            return _batch_validation_error(
+                "operation {0} params must be an object".format(index),
+                requested)
+    return None
+
+
+def _batch_policy_control(policy_result, index, command_type, requested):
+    """保留 policy payload 并补齐 capped batch control envelope。"""
+    control = dict(policy_result)
+    control.setdefault("status", "error")
+    control["requested"] = requested
+    control["executed"] = 0
+    control["succeeded"] = 0
+    control["failed"] = 0
+    control["results"] = []
+    control["operation_index"] = index
+    control["operation_type"] = command_type
+    return cmn.apply_response_cap(control)
+
+
+def _preflight_batch_render_policy(operations):
+    """在任何 TCP relay 前完整扫描 registry 命中的 render operations。"""
+    for index, operation in enumerate(operations):
+        command_type = operation["type"]
+        if command_type not in RENDER_POLICY_COMMANDS:
+            continue
+        policy_result = _rp.evaluate_render_policy_command(
+            command_type, operation.get("params", {}))
+        if policy_result is not None:
+            return _batch_policy_control(
+                policy_result, index, command_type, len(operations))
+    return None
+
+
+@mcp.tool()
+def batch(ctx: Context, operations: List[Dict[str, Any]],
+          continue_on_error: bool = True) -> dict:
+    """按顺序执行一批既有 Houdini command。
+
+    batch 只做一次 TCP relay；bridge 先完整预检 render policy，任何
+    redirect / interrupt / blocked response 都不会触发连接或前序 mutation。
+    Houdini 端按 mutating segment 合并 undo；batch 不提供事务回滚，结果逐项
+    报告。默认最多 50 项，上限可由环境变量调整并 clamp 到 1..200。
+    """
+    validation_error = _validate_batch_operations(operations)
+    if validation_error is not None:
+        return validation_error
+    if not isinstance(continue_on_error, bool):
+        return _batch_validation_error(
+            "continue_on_error must be a boolean", len(operations))
+
+    policy_control = _preflight_batch_render_policy(operations)
+    if policy_control is not None:
+        return policy_control
+
+    try:
+        connection = get_houdini_connection()
+        response = connection.send_command("batch", {
+            "operations": operations,
+            "continue_on_error": continue_on_error,
+        })
+    except ConnectionError as error:
+        return _batch_validation_error(str(error), len(operations))
+    except Exception as error:
+        logger.error("Unexpected error relaying batch: %s", error,
+                     exc_info=True)
+        return _batch_validation_error(str(error), len(operations))
+
+    if not isinstance(response, dict):
+        return cmn.apply_response_cap({
+            "status": "error",
+            "requested": len(operations),
+            "executed": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "results": [],
+            "error": "Houdini returned a non-object batch response",
+        })
+    if response.get("status") == "error":
+        return cmn.apply_response_cap(response)
+    result = response.get("result", response)
+    return cmn.apply_response_cap(result)
+
+
 @mcp.tool()
 def connect_nodes(ctx: Context, from_path: str, to_path: str,
                   input_index: int = 0, output_index: int = 0) -> dict:
@@ -1181,7 +1909,8 @@ def render_single_view(ctx: Context,
     fall back to an error envelope on exception.
     """
     policy_resp = _apply_render_policy_to_engine(
-        render_engine, karma_engine, consent_token=consent_token)
+        render_engine, karma_engine, consent_token=consent_token,
+        command="render_single_view")
     if policy_resp is not None:
         return policy_resp
     try:
@@ -1230,7 +1959,8 @@ def render_quad_views(ctx: Context,
     handler dictionary in opera-houdini-mcp/server.py.
     """
     policy_resp = _apply_render_policy_to_engine(
-        render_engine, karma_engine, consent_token=consent_token)
+        render_engine, karma_engine, consent_token=consent_token,
+        command="render_quad_view")
     if policy_resp is not None:
         return policy_resp
     try:
@@ -1276,7 +2006,8 @@ def render_specific_camera(ctx: Context,
     Pydantic background.
     """
     policy_resp = _apply_render_policy_to_engine(
-        render_engine, karma_engine, consent_token=consent_token)
+        render_engine, karma_engine, consent_token=consent_token,
+        command="render_specific_camera")
     if policy_resp is not None:
         return policy_resp
     try:
@@ -1747,7 +2478,8 @@ def render_viewport_base64(ctx, camera_path=None, geometry_path=None,
     PySide 环境返回 _warning dict。
     """
     policy_resp = _apply_render_policy_to_renderer(
-        renderer, consent_token=consent_token)
+        renderer, consent_token=consent_token,
+        command="render_viewport_base64")
     if policy_resp is not None:
         return policy_resp
     return _houdini_call("render_viewport_base64", {
@@ -1778,7 +2510,8 @@ def render_quad_views_base64(ctx, geometry_path=None, renderer="opengl",
     apply_response_cap。无 hou 环境返回 _warning dict。
     """
     policy_resp = _apply_render_policy_to_renderer(
-        renderer, consent_token=consent_token)
+        renderer, consent_token=consent_token,
+        command="render_quad_views_base64")
     if policy_resp is not None:
         return policy_resp
     return _houdini_call("render_quad_views_base64", {
@@ -1807,7 +2540,8 @@ def render_specific_camera_base64(ctx, camera_path, resolution=(640, 480),
     截断大 payload。
     """
     policy_resp = _apply_render_policy_to_renderer(
-        renderer, consent_token=consent_token)
+        renderer, consent_token=consent_token,
+        command="render_specific_camera_base64")
     if policy_resp is not None:
         return policy_resp
     return _houdini_call("render_specific_camera_base64", {
