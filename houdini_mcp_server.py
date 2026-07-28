@@ -3331,6 +3331,109 @@ def create_material_network(ctx, parent_path, name="mat"):
 
 
 # -------------------------------------------------------------------
+# add-viewport-control-tools: 8 个 viewport 控制 bridge tool
+# -------------------------------------------------------------------
+# 全部透传到 server 端同名命令；**不**引入隐藏 override / 授权参数。
+# 全部归 server NO_UNDO_COMMANDS（UI/view 状态，不可由 HIP undo
+# 恢复；batch dispatcher 会在执行前关闭 undo segment）。
+# **不**新增截图管线 / 不修改 _pane_capture.py；SceneViewer 截图
+# 仍走既有 capture_pane_screenshot + flipbook。
+# 放在 PR 16 / PR 15 / PR 18 / PR 7 section header 之前以避免被
+# test_bridge_style (PR 7) / test_help (PR 15) / test_verify_hou_api
+# (PR 18) / test_connection (PR 16) 四套 AST 探针误识别
+# （与 add-hda-management-tools / add-geometry-export-and-measure
+# / add-node-parameter-vex-tools / add-scene-context-selection-materials
+# 的放置策略保持一致）。
+# -------------------------------------------------------------------
+@mcp.tool()
+def get_viewport_info(ctx):
+    """返回当前 SceneViewer viewport schema（add-viewport-control-tools，NO_UNDO）。
+
+    字段：camera / viewport_type / display_set / shaded_mode /
+    hydra_renderer。无 GUI / 无 pane 返 ``viewport_unavailable``
+    warning。响应过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("get_viewport_info", {})
+
+
+@mcp.tool()
+def set_viewport_camera(ctx, camera_path):
+    """设置 SceneViewer viewport camera（add-viewport-control-tools，NO_UNDO）。
+
+    ``camera_path`` 必须是已存在节点；无效返 ``camera_not_found``。
+    仅 UI/view 写，**不**进 undo group。响应过 server 端
+    ``apply_response_cap``。
+    """
+    return _houdini_call("set_viewport_camera", {"camera_path": camera_path})
+
+
+@mcp.tool()
+def set_viewport_display(ctx, display_set, shaded_mode):
+    """设置 viewport display set + shaded mode（add-viewport-control-tools，NO_UNDO）。
+
+    两个值均为 design.md D2 白名单 token；不接受反射式 setter
+    或不存在枚举。仅 UI/view 写，**不**进 undo group。响应过
+    server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("set_viewport_display", {
+        "display_set": display_set,
+        "shaded_mode": shaded_mode,
+    })
+
+
+@mcp.tool()
+def set_viewport_renderer(ctx, renderer):
+    """LOP SceneViewer Hydra renderer 切换（add-viewport-control-tools，NO_UNDO）。
+
+    仅 LOP context 可用；非 LOP 返 ``viewport_unavailable`` warning。
+    ``renderer`` 必须是 ``sceneViewer.hydraRenderers()`` 中存在的
+    identifier；不可用返 ``renderer_unavailable``。响应过 server
+    端 ``apply_response_cap``。
+    """
+    return _houdini_call("set_viewport_renderer", {"renderer": renderer})
+
+
+@mcp.tool()
+def frame_selection(ctx):
+    """viewport.frameSelected()（add-viewport-control-tools，NO_UNDO）。
+
+    仅调整视图，**不**截图。响应过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("frame_selection", {})
+
+
+@mcp.tool()
+def frame_all(ctx):
+    """viewport.frameAll()（add-viewport-control-tools，NO_UNDO）。
+
+    仅调整视图，**不**截图。响应过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("frame_all", {})
+
+
+@mcp.tool()
+def set_viewport_direction(ctx, direction):
+    """将白名单方向映射到 ``geometryViewportType`` 并调 changeType
+    （add-viewport-control-tools，NO_UNDO）。
+
+    七方向 token：front/back/left/right/top/bottom/perspective。
+    不接受反射式 setter。响应过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("set_viewport_direction", {"direction": direction})
+
+
+@mcp.tool()
+def set_current_network(ctx, path):
+    """NetworkEditor.cd(path)（add-viewport-control-tools，NO_UNDO）。
+
+    节点不存在返 ``node_not_found``；无 NetworkEditor pane 返
+    ``viewport_unavailable`` warning。响应过 server 端
+    ``apply_response_cap``。
+    """
+    return _houdini_call("set_current_network", {"path": path})
+
+
+# -------------------------------------------------------------------
 # PR 16 Connection Diagnostic Tools (placed before PR 15 / PR 7 sections
 # so existing test_bridge_style (PR 7) and test_help PR 15 probes — which
 # scan @mcp.tool() strictly after their own header lines — do not pick it

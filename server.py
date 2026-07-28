@@ -53,6 +53,7 @@ from . import _hda as _hda
 from . import _geo_measure as gme
 from . import _parameters as parm
 from . import _selection as sel
+from . import _viewport as vp
 
 RENDER_POLICY_COMMANDS = getattr(_rp, "RENDER_POLICY_COMMANDS", {})
 register_render_policy_command = getattr(
@@ -290,6 +291,15 @@ class HoudiniMCPServer:
         # 且节点选择是 UI 级副作用，**不**进 MUTATING。get_selection
         # 仍属只读，归 READ_ONLY_COMMANDS。
         "set_selection",
+        # add-viewport-control-tools: 8 个 viewport 设置 / 导航 /
+        # framing / direction / LOP renderer / network navigation，
+        # 全部 UI/view 状态，**不**可由 HIP undo 恢复，必须 no-undo
+        # 且**不**进 MUTATING_COMMANDS。唯一穷尽互斥断言见
+        # _validate_handler_classification。统一走 _viewport 模块
+        # （hou 注入）+ apply_response_cap。不修改 _pane_capture.py。
+        "get_viewport_info", "set_viewport_camera", "set_viewport_display",
+        "set_viewport_renderer", "frame_selection", "frame_all",
+        "set_viewport_direction", "set_current_network",
     })
 
     OPTIONAL_ASSET_COMMANDS = frozenset({
@@ -672,7 +682,19 @@ class HoudiniMCPServer:
         "list_materials": self.handle_list_materials,
         "list_material_types": self.handle_list_material_types,
         "create_material_network": self.handle_create_material_network,
-    }
+            # add-viewport-control-tools: 8 个 viewport 控制 handler。
+            # 全部归 NO_UNDO_COMMANDS；统一走 _viewport（hou 注入）+
+            # apply_response_cap。**不**进 undo group；**不**修改
+            # _pane_capture.py；**不**新增截图管线。
+            "get_viewport_info": self.handle_get_viewport_info,
+            "set_viewport_camera": self.handle_set_viewport_camera,
+            "set_viewport_display": self.handle_set_viewport_display,
+            "set_viewport_renderer": self.handle_set_viewport_renderer,
+            "frame_selection": self.handle_frame_selection,
+            "frame_all": self.handle_frame_all,
+            "set_viewport_direction": self.handle_set_viewport_direction,
+            "set_current_network": self.handle_set_current_network,
+        }
 
         if getattr(getattr(hou, "session", None),
                    "houdinimcp_use_assetlib", False):
@@ -3220,3 +3242,78 @@ class HoudiniMCPServer:
         """
         return cmn.apply_response_cap(
             mats.create_material_network(hou, parent_path, name=name))
+
+    # -----------------------------------------------------------------
+    # add-viewport-control-tools: 8 个 viewport 控制 handler
+    # -----------------------------------------------------------------
+    def handle_get_viewport_info(self):
+        """add-viewport-control-tools：返回当前 viewport schema。
+
+        走 ``_viewport.get_viewport_info``；无 GUI / 无 pane 返
+        ``viewport_unavailable`` warning。响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(vp.get_viewport_info(hou))
+
+    def handle_set_viewport_camera(self, camera_path):
+        """add-viewport-control-tools：设置 viewport camera。
+
+        节点不存在报 ``camera_not_found``；异常报 ``set_camera_failed``。
+        响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            vp.set_viewport_camera(hou, camera_path=camera_path))
+
+    def handle_set_viewport_display(self, display_set, shaded_mode):
+        """add-viewport-control-tools：白名单 → 真实 HOM enum。
+
+        ``display_set / shaded_mode`` 必须是 design.md D2 列出的
+        白名单 token；不在则报 ``unsupported_display_set /
+        unsupported_shaded_mode``。响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            vp.set_viewport_display(
+                hou, display_set=display_set, shaded_mode=shaded_mode))
+
+    def handle_set_viewport_renderer(self, renderer):
+        """add-viewport-control-tools：LOP Hydra renderer 切换。
+
+        非 LOP 返 ``viewport_unavailable`` warning；renderer identifier
+        不在 ``hydraRenderers()`` 报 ``renderer_unavailable``。响应过
+        ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            vp.set_viewport_renderer(hou, renderer=renderer))
+
+    def handle_frame_selection(self):
+        """add-viewport-control-tools：调 ``viewport.frameSelected()``。
+
+        仅 UI/view 写，**不**进 undo group。响应过
+        ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(vp.frame_selection(hou))
+
+    def handle_frame_all(self):
+        """add-viewport-control-tools：调 ``viewport.frameAll()``。
+
+        仅 UI/view 写，**不**进 undo group。响应过
+        ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(vp.frame_all(hou))
+
+    def handle_set_viewport_direction(self, direction):
+        """add-viewport-control-tools：白名单 → ``geometryViewportType``。
+
+        七方向 token → ``changeType()``；不接受反射式 setter。响应过
+        ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            vp.set_viewport_direction(hou, direction=direction))
+
+    def handle_set_current_network(self, path):
+        """add-viewport-control-tools：NetworkEditor.cd(path)。
+
+        节点不存在报 ``node_not_found``；无 NetworkEditor pane 返
+        ``viewport_unavailable`` warning。响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            vp.set_current_network(hou, path=path))
