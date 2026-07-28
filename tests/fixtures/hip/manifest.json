@@ -1,0 +1,131 @@
+{
+  "fixtures": [
+    {
+      "edition": "hip",
+      "expected": {
+        "connections": [
+          {
+            "from": "obj/geo1/box1",
+            "input_index": 0,
+            "source_output": 0,
+            "to": "obj/geo1/xform1"
+          }
+        ],
+        "netboxes": [
+          {
+            "context": "obj",
+            "label": "mynetbox",
+            "name": "nb1"
+          }
+        ],
+        "node_paths": [
+          "obj/geo1",
+          "obj/geo1/box1",
+          "obj/geo1/xform1"
+        ],
+        "node_types": {
+          "obj/geo1": "geo",
+          "obj/geo1/box1": "box",
+          "obj/geo1/xform1": "xform"
+        },
+        "postits": [
+          {
+            "context": "obj",
+            "name": "note1",
+            "text": "hello postit"
+          }
+        ]
+      },
+      "houdini_version": "21.0.596",
+      "path": "h21/minimal.hip",
+      "sha256": "48b87ebdece7511a32f5571d341ef343885755ab1544c89846c390cff1ff6ad6",
+      "size_bytes": 42549,
+      "version": "h21"
+    },
+    {
+      "edition": "hiplc",
+      "expected": {
+        "connections": [
+          {
+            "from": "obj/geo1/box1",
+            "input_index": 0,
+            "source_output": 0,
+            "to": "obj/geo1/xform1"
+          }
+        ],
+        "netboxes": [
+          {
+            "context": "obj",
+            "label": "mynetbox",
+            "name": "nb1"
+          }
+        ],
+        "node_paths": [
+          "obj/geo1",
+          "obj/geo1/box1",
+          "obj/geo1/xform1"
+        ],
+        "node_types": {
+          "obj/geo1": "geo",
+          "obj/geo1/box1": "box",
+          "obj/geo1/xform1": "xform"
+        },
+        "postits": [
+          {
+            "context": "obj",
+            "name": "note1",
+            "text": "hello postit"
+          }
+        ]
+      },
+      "houdini_version": "21.0.596",
+      "path": "h21/minimal.hiplc",
+      "sha256": "7333800d470564f918ddb0c3b894cf4b34165ace7221ba9da2a7b4f20a8b107c",
+      "size_bytes": 42551,
+      "version": "h21"
+    },
+    {
+      "edition": "hipnc",
+      "expected": {
+        "connections": [
+          {
+            "from": "obj/geo1/box1",
+            "input_index": 0,
+            "source_output": 0,
+            "to": "obj/geo1/xform1"
+          }
+        ],
+        "netboxes": [
+          {
+            "context": "obj",
+            "label": "mynetbox",
+            "name": "nb1"
+          }
+        ],
+        "node_paths": [
+          "obj/geo1",
+          "obj/geo1/box1",
+          "obj/geo1/xform1"
+        ],
+        "node_types": {
+          "obj/geo1": "geo",
+          "obj/geo1/box1": "box",
+          "obj/geo1/xform1": "xform"
+        },
+        "postits": [
+          {
+            "context": "obj",
+            "name": "note1",
+            "text": "hello postit"
+          }
+        ]
+      },
+      "houdini_version": "21.0.596",
+      "path": "h21/minimal.hipnc",
+      "sha256": "cfcabd085f2354a9d6b4b8fea47b9506c1275c809d4e5cd408fd4f1a10ac7727",
+      "size_bytes": 42551,
+      "version": "h21"
+    }
+  ],
+  "schema": "hip-golden-fixtures/v1"
+}

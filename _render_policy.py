@@ -60,6 +60,15 @@ _DEFAULT_RENDER_ENGINE = "opengl"
 _DEFAULT_KARMA_ENGINE = "cpu"
 _DEFAULT_RENDERER = "opengl"
 
+# consume 周期清理（G1 sentinel housekeeping / refactor-opus-optional-and-debt-cleanup）：
+# 进程级 counter，每次 consume 递增，达到 interval 时显式调用
+# ``_cleanup_expired_sentinels``。interval 默认 10、clamp ``[1,100]``，非法环境
+# 值回退默认。有效且未过期 sentinel 永远不会被周期清理删除，仅清过期 / 损坏项。
+_CONSUME_COUNTER = 0
+_DEFAULT_CLEANUP_INTERVAL = 10
+_CLEANUP_INTERVAL_MIN = 1
+_CLEANUP_INTERVAL_MAX = 100
+
 
 # bridge 与 Houdini-side batch 共同读取的 Layer 1 policy registry。注册表
 # 只包含当前 fork 已存在的 render command；新增入口必须显式注册，避免
@@ -219,6 +228,39 @@ def create_consent_token(expires_in_seconds=300):
     return token
 
 
+def _cleanup_interval():
+    """读取并 clamp 周期清理 interval（默认 10、clamp ``[1,100]``、非法回退默认）。
+
+    环境变量 ``HOUDINI_MCP_SENTINEL_CLEANUP_INTERVAL`` 控制每多少次 consume
+    触发一次显式过期 sentinel 清理。非整数 / 缺失回退默认值 10，再 clamp 到
+    ``[1,100]`` 避免极端值（0 会关掉周期清理，过大则失去 housekeeping 意义）。
+    """
+    raw = os.environ.get("HOUDINI_MCP_SENTINEL_CLEANUP_INTERVAL")
+    if raw is None:
+        return _DEFAULT_CLEANUP_INTERVAL
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_CLEANUP_INTERVAL
+    return max(_CLEANUP_INTERVAL_MIN, min(_CLEANUP_INTERVAL_MAX, value))
+
+
+def _maybe_periodic_cleanup(expires_in_seconds=300):
+    """递增进程级 consume counter，达到 interval 时显式清一次过期 sentinel。
+
+    best-effort：清理异常被吞掉，绝不影响本次 consume 校验或已运行的 server。
+    有效 sentinel 不会被删（``_cleanup_expired_sentinels`` 仅删过期 / 损坏项）。
+    """
+    global _CONSUME_COUNTER
+    _CONSUME_COUNTER += 1
+    if _CONSUME_COUNTER >= _cleanup_interval():
+        _CONSUME_COUNTER = 0
+        try:
+            _cleanup_expired_sentinels(expires_in_seconds)
+        except Exception:
+            pass
+
+
 def consume_consent_token(token, expires_in_seconds=300):
     """校验 sentinel 文件存在 + 未过期；幂等返回 True，不删除 sentinel。
 
@@ -254,6 +296,9 @@ def consume_consent_token(token, expires_in_seconds=300):
       （调用方是 MCP tool 入口，抛异常会让 bridge 层返 error envelope
       而不是 interrupt dict，破坏设计契约）。
     """
+    # 周期 housekeeping：每 N 次 consume 显式清一次过期 sentinel。有效
+    # sentinel 不会被删；异常隔离不影响本次校验。
+    _maybe_periodic_cleanup(expires_in_seconds)
     if not token:
         return False
     sentinel_path = os.path.join(_consent_dir(), token)

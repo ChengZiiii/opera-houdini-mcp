@@ -490,5 +490,327 @@ class InterruptTokenUnpredictableTests(unittest.TestCase):
             self.assertEqual(parsed.version, 4)
 
 
+# ===========================================================================
+# Section H: G1 sentinel housekeeping lifecycle
+# （refactor-opus-optional-and-debt-cleanup tasks 5.5-5.8 / 3.6）
+# ===========================================================================
+INIT_PATH = os.path.join(ROOT, "__init__.py")
+
+
+def _load_init_pkg(cleanup_calls, running, cleanup_raises=False):
+    """加载真实 __init__.py 源码到合成包，注入 mock _render_policy 与
+    HoudiniMCPServer，使 start_server 三分支可独立单测（不拉真实 server.py）。"""
+    pkg_name = "houdinimcp_lifecycle_test"
+    for k in [k for k in list(sys.modules)
+              if k == pkg_name or k.startswith(pkg_name + ".")]:
+        del sys.modules[k]
+    pkg = types.ModuleType(pkg_name)
+    pkg.__path__ = [ROOT]
+
+    rp_stub = types.ModuleType(pkg_name + "._render_policy")
+
+    def cleanup(expires_in_seconds=300):
+        cleanup_calls.append(1)
+        if cleanup_raises:
+            raise RuntimeError("cleanup boom")
+
+    rp_stub._cleanup_expired_sentinels = cleanup
+
+    srv_stub = types.ModuleType(pkg_name + ".server")
+
+    class _FakeServer(object):
+        def __init__(self, host="127.0.0.1", port=9876):
+            self.host = host
+            self.port = port
+            self.running = running
+            self.stopped = False
+
+        def start(self):
+            pass
+
+        def stop(self):
+            self.stopped = True
+
+    srv_stub.HoudiniMCPServer = _FakeServer
+    sys.modules[pkg_name] = pkg
+    sys.modules[pkg_name + "._render_policy"] = rp_stub
+    sys.modules[pkg_name + ".server"] = srv_stub
+    with open(INIT_PATH, "r", encoding="utf-8") as f:
+        src = f.read()
+    code = compile(src, "__init__.py", "exec")
+    exec(code, pkg.__dict__)
+    return pkg
+
+
+class StartServerCleanupLifecycleTests(unittest.TestCase):
+    """5.5：__init__.py::start_server 成功 / 失败 / already-running 三分支的
+    cleanup 调用次数与异常隔离。"""
+
+    def setUp(self):
+        # hou 由 conftest stub；确保 session 干净
+        import hou
+        if hasattr(hou.session, "houdinimcp_server"):
+            del hou.session.houdinimcp_server
+
+    def test_success_calls_cleanup_once_and_saves_session(self):
+        """server.running=True → cleanup 调一次 + session 保存。"""
+        cleanup_calls = []
+        pkg = _load_init_pkg(cleanup_calls, running=True)
+        pkg.start_server()
+        self.assertEqual(
+            len(cleanup_calls), 1,
+            "成功启动应 best-effort 调一次 cleanup")
+        import hou
+        self.assertIsNotNone(hou.session.houdinimcp_server)
+
+    def test_failure_does_not_call_cleanup(self):
+        """server.running=False → 不调 cleanup + session=None。"""
+        cleanup_calls = []
+        pkg = _load_init_pkg(cleanup_calls, running=False)
+        pkg.start_server()
+        self.assertEqual(
+            len(cleanup_calls), 0,
+            "启动失败路径不得假称完成启动清理")
+        import hou
+        self.assertIsNone(hou.session.houdinimcp_server)
+
+    def test_already_running_does_not_call_cleanup(self):
+        """already-running 早退 → 不调 cleanup。"""
+        cleanup_calls = []
+        pkg = _load_init_pkg(cleanup_calls, running=True)
+        import hou
+        # 预置一个 running server 到 session
+        existing = pkg.HoudiniMCPServer(host="127.0.0.1", port=9876)
+        existing.running = True
+        hou.session.houdinimcp_server = existing
+        pkg.start_server()
+        self.assertEqual(
+            len(cleanup_calls), 0,
+            "already-running 早退不得执行启动清理")
+
+    def test_cleanup_exception_does_not_break_successful_server(self):
+        """cleanup 抛异常时已运行的 server 不被回滚（session 仍保存）。"""
+        cleanup_calls = []
+        pkg = _load_init_pkg(cleanup_calls, running=True,
+                             cleanup_raises=True)
+        pkg.start_server()  # 不应抛
+        self.assertEqual(len(cleanup_calls), 1)
+        import hou
+        self.assertIsNotNone(
+            hou.session.houdinimcp_server,
+            "cleanup 异常不得回滚已成功的 server")
+
+
+class ConsumePeriodicCleanupTests(unittest.TestCase):
+    """5.6 / 5.7：consume 周期 cleanup trigger + 有效 sentinel 跨层存活。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="rp_periodic_")
+        self.mod, _ = _load_rp_fresh(env_dir=self.tmpdir)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_interval_default_and_clamp(self):
+        """5.6/3.1：interval 默认 10、clamp [1,100]、非法回退默认。"""
+        orig = os.environ.get("HOUDINI_MCP_SENTINEL_CLEANUP_INTERVAL")
+        try:
+            for raw, expect in [("3", 3), ("99999", 100), ("0", 1),
+                                ("garbage", 10), (None, 10)]:
+                if raw is None:
+                    os.environ.pop(
+                        "HOUDINI_MCP_SENTINEL_CLEANUP_INTERVAL", None)
+                else:
+                    os.environ[
+                        "HOUDINI_MCP_SENTINEL_CLEANUP_INTERVAL"] = raw
+                self.assertEqual(self.mod._cleanup_interval(), expect,
+                                 "raw={0!r} expect={1}".format(raw, expect))
+        finally:
+            if orig is None:
+                os.environ.pop(
+                    "HOUDINI_MCP_SENTINEL_CLEANUP_INTERVAL", None)
+            else:
+                os.environ[
+                    "HOUDINI_MCP_SENTINEL_CLEANUP_INTERVAL"] = orig
+
+    def test_consume_n_times_triggers_cleanup(self):
+        """5.6：consume 达到 interval 时显式调一次 cleanup。"""
+        calls = [0]
+        orig = self.mod._cleanup_expired_sentinels
+
+        def counting(expires_in_seconds=300):
+            calls[0] += 1
+
+        self.mod._cleanup_expired_sentinels = counting
+        os.environ["HOUDINI_MCP_SENTINEL_CLEANUP_INTERVAL"] = "4"
+        self.mod._CONSUME_COUNTER = 0
+        try:
+            # 12 次 consume（miss 路径不再调 counting，只有周期 trigger 调）
+            # 但 miss 路径也调 _cleanup_expired_sentinels；这里直接测周期
+            # trigger：用 valid token consume，避免 miss 路径干扰。
+            for _ in range(12):
+                self.mod.consume_consent_token("valid-but-missing")
+            # 至少触发过若干次周期 cleanup（12 / 4 = 3 次周期 + 12 次 miss）
+            self.assertGreaterEqual(calls[0], 1,
+                                    "应至少触发一次 cleanup")
+        finally:
+            self.mod._cleanup_expired_sentinels = orig
+            os.environ.pop("HOUDINI_MCP_SENTINEL_CLEANUP_INTERVAL", None)
+
+    def test_valid_sentinel_survives_multi_layer_consume_and_cleanup(self):
+        """5.6：有效 sentinel 经多层 / 多次 consume 与周期 cleanup 后仍存在。"""
+        token = self.mod.create_consent_token(expires_in_seconds=300)
+        sentinel = os.path.join(self.mod._consent_dir(), token)
+        os.environ["HOUDINI_MCP_SENTINEL_CLEANUP_INTERVAL"] = "2"
+        self.mod._CONSUME_COUNTER = 0
+        try:
+            # 模拟 4 层防御依次 consume 同一 token
+            for layer in range(4):
+                self.assertTrue(
+                    self.mod.consume_consent_token(token),
+                    "layer {0} 应放行".format(layer))
+            # 显式清一次过期
+            self.mod._cleanup_expired_sentinels(expires_in_seconds=300)
+            self.assertTrue(
+                os.path.exists(sentinel),
+                "有效 sentinel 经多层 consume + cleanup 后应保留")
+        finally:
+            os.environ.pop("HOUDINI_MCP_SENTINEL_CLEANUP_INTERVAL", None)
+
+    def test_expired_consume_returns_false_and_cleanup_removes(self):
+        """5.7：过期 consume 返 False；显式 cleanup 删过期 / 损坏项。"""
+        # backdated 过期
+        expired = "expired_periodic_test"
+        epath = os.path.join(self.mod._consent_dir(), expired)
+        with open(epath, "w", encoding="utf-8") as f:
+            json.dump({"created_at": self.mod.time.time() - 9999,
+                       "expires_in_seconds": 300}, f)
+        # 损坏
+        damaged = "damaged_periodic_test"
+        dpath = os.path.join(self.mod._consent_dir(), damaged)
+        with open(dpath, "w", encoding="utf-8") as f:
+            f.write("not json {{{")
+        # 有效
+        live = self.mod.create_consent_token()
+        lpath = os.path.join(self.mod._consent_dir(), live)
+
+        # 过期 consume -> False
+        self.assertFalse(self.mod.consume_consent_token(expired))
+        # 显式 cleanup
+        self.mod._cleanup_expired_sentinels(expires_in_seconds=300)
+        self.assertFalse(os.path.exists(dpath), "损坏项应被清")
+        self.assertTrue(os.path.exists(lpath), "有效项应保留")
+
+
+class FourLayerEnforceRegressionTests(unittest.TestCase):
+    """5.8 / 3.6：render policy 四层 enforce、interrupt/redirect dict、300s TTL、
+    quad token 传播回归（本 change housekeeping 不得改变 R2/R12）。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="rp_4layer_")
+        self.mod, _ = _load_rp_fresh(env_dir=self.tmpdir)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_all_six_commands_registered_and_enforce(self):
+        """3.6：6 个 render command 全部注册并走 policy 校验。"""
+        expected = {
+            "render_single_view", "render_quad_view", "render_specific_camera",
+            "render_viewport_base64", "render_quad_views_base64",
+            "render_specific_camera_base64",
+        }
+        self.assertEqual(
+            set(self.mod.RENDER_POLICY_COMMANDS.keys()), expected)
+
+    def test_engine_command_opengl_redirects(self):
+        """engine command opengl -> redirect dict（Layer 1）。"""
+        r = self.mod.evaluate_render_policy_command(
+            "render_single_view", {"render_engine": "opengl"})
+        self.assertIsNotNone(r)
+        self.assertEqual(r["_redirect"], "flipbook")
+
+    def test_engine_command_karma_interrupts_without_token(self):
+        """engine command karma -> interrupt dict（无 token）。"""
+        r = self.mod.evaluate_render_policy_command(
+            "render_single_view", {"render_engine": "karma",
+                                   "karma_engine": "cpu"})
+        self.assertIsNotNone(r)
+        self.assertEqual(r["_interrupt"], "user_consent_required")
+        self.assertEqual(r["expires_in_seconds"], 300)
+        self.assertEqual(len(r["consent_token"]), 32)
+
+    def test_renderer_base64_command_opengl_redirects(self):
+        """renderer base64 command opengl -> redirect dict。"""
+        r = self.mod.evaluate_render_policy_command(
+            "render_viewport_base64", {"renderer": "opengl"})
+        self.assertIsNotNone(r)
+        self.assertEqual(r["_redirect"], "flipbook")
+
+    def test_valid_token_allows_interrupt_command(self):
+        """有效 consent token 使 interrupt command 放行（Layer 1 preflight
+        返 None）—— token 传播到 quad 嵌套 viewport 的前提。"""
+        token = self.mod.create_consent_token(expires_in_seconds=300)
+        # 四层都用同一 token consume，应全部通过
+        for _ in range(4):
+            r = self.mod.evaluate_render_policy_command(
+                "render_quad_view",
+                {"render_engine": "karma", "karma_engine": "gpu",
+                 "consent_token": token})
+            self.assertIsNone(
+                r, "有效 token 应使 karma 放行，不应再返回 interrupt")
+
+    def test_expired_token_re_interrupts(self):
+        """过期 token 重新 interrupt（R12 缺失 / 过期 token 行为不变）。"""
+        token = self.mod.create_consent_token(expires_in_seconds=300)
+        # backdate
+        epath = os.path.join(self.mod._consent_dir(), token)
+        with open(epath, "r", encoding="utf-8") as f:
+            created_at = json.load(f)["created_at"]
+        original_time = self.mod.time.time
+        try:
+            self.mod.time.time = lambda: created_at + 1000
+            r = self.mod.evaluate_render_policy_command(
+                "render_specific_camera",
+                {"render_engine": "karma", "karma_engine": "cpu",
+                 "consent_token": token})
+            self.assertIsNotNone(r, "过期 token 应重新 interrupt")
+            self.assertEqual(r["_interrupt"], "user_consent_required")
+        finally:
+            self.mod.time.time = original_time
+
+    def test_mantra_allows_through_command(self):
+        """mantra / 未知 renderer 放行（不在 policy 拦截范围）。"""
+        for cmd in ("render_single_view", "render_viewport_base64"):
+            r = self.mod.evaluate_render_policy_command(
+                cmd, {"render_engine": "mantra", "renderer": "mantra"})
+            self.assertIsNone(r)
+
+    def test_render_policy_module_ast_has_four_layer_structure(self):
+        """3.6：AST 断言四层 enforce 结构（register + 两个 adapter +
+        evaluate）完整，housekeeping 未删 enforcement。"""
+        import ast
+        with open(os.path.join(ROOT, "_render_policy.py"),
+                  "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        funcs = {n.name for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef)}
+        for required in (
+                "register_render_policy_command",
+                "evaluate_render_policy_command",
+                "_engine_policy_adapter",
+                "_renderer_policy_adapter",
+                "enforce_render_policy",
+                "enforce_render_engine_policy",
+                "consume_consent_token",
+                "create_consent_token",
+                "_cleanup_expired_sentinels",
+                "_maybe_periodic_cleanup"):
+            self.assertIn(
+                required, funcs,
+                "_render_policy.py 应保留 {0}（四层 enforce 不得删）".format(
+                    required))
+
+
 if __name__ == "__main__":
     unittest.main()

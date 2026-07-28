@@ -38,61 +38,14 @@ from contextlib import asynccontextmanager
 from mcp.server.fastmcp import FastMCP, Context
 import asyncio
 
-# --- OPUS Imports and Setup ---
-import requests
-from dotenv import load_dotenv
-from urllib.parse import urljoin # To construct RapidAPI URLs
-try:
-    from langchain_classic.output_parsers import ResponseSchema, StructuredOutputParser
-    LANGCHAIN_AVAILABLE = True
-except ImportError:
-    try:
-        from langchain.output_parsers import ResponseSchema, StructuredOutputParser
-        LANGCHAIN_AVAILABLE = True
-    except ImportError:
-        LANGCHAIN_AVAILABLE = False
-        print("Warning: Langchain not found. opus_get_model_params_schema tool will be limited.", file=sys.stderr)
-
-# Load environment variables from urls.env located in the script's directory
-dotenv_path = os.path.join(script_dir, 'urls.env')
-if os.path.exists(dotenv_path):
-    load_dotenv(dotenv_path=dotenv_path)
-    print(f"Loaded environment variables from {dotenv_path}", file=sys.stderr)
-else:
-    print(f"Warning: urls.env not found at {dotenv_path}", file=sys.stderr)
-
-# --- Use RapidAPI variables --- 
-RAPIDAPI_HOST_URL = os.getenv("RAPIDAPI_HOST_URL") # e.g., https://opus5.p.rapidapi.com/
-RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST") # e.g., opus5.p.rapidapi.com
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
-
-# Set paths for OPUS API endpoints relative to the RapidAPI host URL
-GET_ATTRIBUTES_PATH = "/get_attributes_with_name" 
-CREATE_BATCH_PATH = "/create_opus_batch_component" # Use batch endpoint
-CREATE_COMPONENT_PATH = "/create_opus_component" # Keep old path if needed elsewhere, or remove
-VARIATE_PATH = "/variate_opus_result"
-GET_JOB_RESULT_PATH = "/get_opus_job_result"
-
-TIMEOUT = 15 # seconds for RapidAPI
-HOUDINI_CONNECTION_TIMEOUT = 300 # 5 minutes for Houdini operations (rendering can be slow)
-
-if not RAPIDAPI_HOST_URL or not RAPIDAPI_HOST or not RAPIDAPI_KEY:
-    print("Warning: RAPIDAPI_HOST_URL, RAPIDAPI_HOST, or RAPIDAPI_KEY not configured. OPUS API features will be disabled.", file=sys.stderr)
-    # Set URL variables to None for safety
-    GET_ATTRIBUTES_URL = None
-    CREATE_COMPONENT_URL = None
-    VARIATE_URL = None
-    GET_JOB_RESULT_URL = None
-else:
-    # Construct full URLs
-    GET_ATTRIBUTES_URL = urljoin(RAPIDAPI_HOST_URL, GET_ATTRIBUTES_PATH)
-#    CREATE_BATCH_URL = urljoin(RAPIDAPI_HOST_URL, CREATE_BATCH_PATH)
-    CREATE_COMPONENT_URL = urljoin(RAPIDAPI_HOST_URL, CREATE_COMPONENT_PATH)
-    VARIATE_URL = urljoin(RAPIDAPI_HOST_URL, VARIATE_PATH)
-    GET_JOB_RESULT_URL = urljoin(RAPIDAPI_HOST_URL, GET_JOB_RESULT_PATH)
-    # Optionally warn if old OPUS_API is still set
-
-# --- End OPUS Setup ---
+# --- OPUS RapidAPI moved to optional _opus module ---
+# refactor-opus-optional-and-debt-cleanup：原 OPUS imports / setup
+# （requests / dotenv / langchain）已全部迁出 bridge 顶层到独立可选模块
+# ``_opus.py``。bridge 顶层不再 import 这些，使无 RapidAPI key（亦无
+# langchain）的默认安装仍能启动并注册所有 MCP tool。只有四个真正发
+# RapidAPI 请求的 wrapper 委托 ``_opus``；``opus_get_model_names`` 无 key
+# 可用；``opus_import_model_url`` 原地保留为 Houdini relay，不依赖 ``_opus``。
+HOUDINI_CONNECTION_TIMEOUT = 300  # 5 minutes for Houdini operations (rendering can be slow)
 
 
 logging.basicConfig(level=logging.INFO)
@@ -121,6 +74,28 @@ try:
     from . import _best_practices as _bp
 except ImportError:
     import _best_practices as _bp  # type: ignore
+
+try:
+    from . import _rag as _rag
+except ImportError:
+    import _rag as _rag  # type: ignore
+
+try:
+    from . import _hip_parser as _hip
+except ImportError:
+    import _hip_parser as _hip  # type: ignore
+
+# OPUS RapidAPI 可选模块（refactor-opus-optional-and-debt-cleanup）。
+# 容错加载：package 与 flat 两种布局均尝试；加载失败时仅五个委托给
+# ``_opus`` 的 wrapper 返回 module unavailable，``opus_import_model_url``
+# relay 与 bridge 其余工具不受影响。
+try:
+    from . import _opus as _opus
+except ImportError:
+    try:
+        import _opus as _opus  # type: ignore
+    except ImportError:
+        _opus = None  # type: ignore
 
 RENDER_POLICY_COMMANDS = _rp.RENDER_POLICY_COMMANDS
 register_render_policy_command = _rp.register_render_policy_command
@@ -157,327 +132,10 @@ def _apply_render_policy_to_renderer(renderer, consent_token=None,
     return _rp.evaluate_render_policy_command(
         command or "render_viewport_base64", params)
 
-# --- Minimal api.utils.fix_rgb replication ---
-# Assume it takes a list/tuple and returns [r, g, b] if valid, else None
-def fix_rgb(color_val):
-    if isinstance(color_val, (list, tuple)) and len(color_val) == 3:
-        try:
-            # Ensure they are numbers (int or float) and within typical 0-255 or 0-1 range
-            # For simplicity, just check if they are numbers. API might expect 0-255 ints.
-            rgb = [float(c) for c in color_val]
-            # Basic check - could add range validation 0-255 or 0-1 if needed
-            return rgb # Returning as floats for now
-        except (ValueError, TypeError):
-            return None
-    return None
-# --- End utils replication ---
+# OPUS helper functions（fix_rgb / get_struct_params / format_params /
+# create_opus_* / variate_opus_result / get_opus_job_result 等）已全部迁出
+# 到独立可选模块 `_opus.py`。bridge 仅保留薄 wrapper 委托。
 
-
-# --- OPUS Helper Functions (Updated for RapidAPI) ---
-def get_all_component_names() -> List[str]:
-    # result = ["Sofa", "Chair", "Table", "CoffeeTable"] # Original subset
-    result = [
-        "Sofa", "Chair", "Table", "CoffeeTable",
-         "Library", "StreetBench", "StreetLamp", "MailboxStandalone",
-         "AntennaStandalone", "ParkingMeterStandalone", "AirConditionerStandalone",
-         "BasketballHoop", "BusStop", "FloorLamp", "Bed", "TvUnit",
-         "Sewer", "GarageDoorStandalone",
-    ] # User provided list
-    return result
-
-def get_struct_params(struct: str) -> tuple[bool, dict]:
-    if not RAPIDAPI_HOST_URL: return False, {"error": "RAPIDAPI_HOST_URL not configured"}
-    url = GET_ATTRIBUTES_URL
-    payload = {} # GET request, params in URL
-    params = { "name": struct }
-    headers = {
-        'x-rapidapi-host': RAPIDAPI_HOST,
-        'x-rapidapi-key': RAPIDAPI_KEY
-    }
-    try:
-        response = requests.request("GET", url, headers=headers, params=params, data=payload, timeout=TIMEOUT)
-        if str(response.status_code).startswith("2"):
-            r = response.json()
-            struct_result = r.get(struct) # Check if response structure changed
-            if struct_result:
-                return True, struct_result
-            elif isinstance(r, dict) and not struct_result: # Maybe the top-level key is gone?
-                 if struct in r.get("result", {}): # Check common patterns
-                     return True, r["result"]
-                 else:
-                     # Fallback: return the whole response if structure unclear but success
-                     logger.warning(f"Structure '{struct}' key not found directly in RapidAPI response, returning full JSON: {r}")
-                     return True, r 
-            else:
-                return False, {"error": f"Structure '{struct}' not found in RapidAPI response: {r}"}
-        else:
-            return False, {"error": f"RapidAPI Error {response.status_code}: {response.text}"}
-    except requests.exceptions.RequestException as e:
-        return False, {"error": f"RapidAPI request failed: {str(e)}"}
-
-def format_params(opus_response: dict) -> dict:
-    formatted = {}
-    # Adjust based on actual RapidAPI response structure if needed
-    # Assuming original structure: { "StructureName": { "assets": [...] } }
-    # Or maybe it's now just { "assets": [...] } or similar?
-    # This needs verification against actual RapidAPI output.
-    
-    # Attempt 1: Original structure
-    for asset_key, asset_data in opus_response.items():
-        if isinstance(asset_data, dict) and "assets" in asset_data:
-             for element in asset_data.get("assets", []):
-                name = element.get("name")
-                params = element.get("parameters", [])
-                if not name: continue
-                for p in params:
-                    pname = p.get("name")
-                    prange = p.get("range")
-                    ptype = p.get("type")
-                    if pname and prange is not None and ptype is not None:
-                         formatted[f"{name}/{pname}"] = (prange, ptype)
-    
-    # Attempt 2: If assets are directly under top level (heuristic)
-    if not formatted and "assets" in opus_response and isinstance(opus_response["assets"], list):
-        logger.warning("format_params: Using fallback structure parsing (assets at top level).")
-        for element in opus_response.get("assets", []):
-            name = element.get("name")
-            params = element.get("parameters", [])
-            if not name: continue
-            for p in params:
-                pname = p.get("name")
-                prange = p.get("range")
-                ptype = p.get("type")
-                if pname and prange is not None and ptype is not None:
-                        formatted[f"{name}/{pname}"] = (prange, ptype)
-                        
-    # Attempt 3: If params are directly under top level (another heuristic)
-    elif not formatted and "parameters" in opus_response and isinstance(opus_response["parameters"], list):
-        logger.warning("format_params: Using fallback structure parsing (parameters at top level).")
-        # How to get the asset name here? Assume it's part of the param name?
-        # This path is less likely or needs more info.
-        pass # Add logic if this structure is encountered
-
-    if not formatted:
-         logger.warning(f"format_params: Could not extract parameters from response: {opus_response}")
-         
-    return formatted
-
-def get_color_params(component_name: str, opus_asset_keys: List[str]) -> dict:
-    result = {}
-    # Component level color
-    result.setdefault(
-        f"{component_name}/color_rgb",
-        (
-            "List[float]", # Assuming List[float] based on fix_rgb output
-            f"Valid RGB color [R, G, B] (values likely 0-1 or 0-255, check API docs). Use if the user sets the entire color of the {component_name} or provided a single color without specifying a part."
-        ),
-    )
-    # Asset level colors
-    for asset in opus_asset_keys:
-        result.setdefault(
-            f"{asset}/color_rgb",
-            (
-                "List[float]", # Assuming List[float]
-                f"Valid RGB color [R, G, B] for the {asset} part. Use if user set the color of this specific part of the {component_name}."
-            ),
-        )
-    return result
-
-def get_param_json(param_json: dict, color_params: dict) -> str:
-    if not LANGCHAIN_AVAILABLE:
-        # Fallback: simple JSON representation if Langchain is missing
-        combined = {}
-        for key, value in param_json.items():
-            combined[key] = {"range": value[0], "type": value[1], "description": f"Allowed range: {value[0]}"}
-        for key, value in color_params.items():
-            combined[key] = {"type": value[0], "description": value[1]}
-        return json.dumps(combined, indent=2)
-
-    # Langchain way
-    response_schemas = []
-    for key, value in param_json.items():
-        response_schemas.append(
-            ResponseSchema(name=key, description=f"Allowed range: {value[0]}", type=str(value[1])) # Ensure type is string
-        )
-    for key, value in color_params.items():
-        response_schemas.append(
-            ResponseSchema(name=key, description=str(value[1]), type=str(value[0])) # Ensure type is string
-        )
-    try:
-        output_parser = StructuredOutputParser.from_response_schemas(response_schemas)
-        prompt_var = output_parser.get_format_instructions(only_json=True)
-        return prompt_var
-    except Exception as e:
-        logger.error(f"Langchain StructuredOutputParser failed: {e}")
-        # Fallback if Langchain parsing fails
-        combined = {key: {"range": value[0], "type": value[1]} for key, value in param_json.items()}
-        combined.update({key: {"type": value[0], "description": value[1]} for key, value in color_params.items()})
-        return json.dumps(combined, indent=2)
-
-
-def get_formatted_opus_params(structure: str) -> dict:
-    # this is the main function to be called, copy of lambda function
-    f, structure_json = get_struct_params(structure)
-    if f:
-        formatted_params = format_params(structure_json)
-        # Extract keys carefully, might need adjustment based on format_params heuristics
-        asset_keys = list(structure_json.keys()) if isinstance(structure_json, dict) else [] 
-        if not asset_keys and "assets" in structure_json and isinstance(structure_json["assets"], list):
-             asset_keys = [a.get("name") for a in structure_json["assets"] if a.get("name")]
-             
-        color_params = get_color_params(structure, asset_keys) 
-        schema_str = get_param_json(formatted_params, color_params)
-        # Try to parse back to JSON for consistent return type
-        try:
-            schema_json = json.loads(schema_str)
-            return {"statusCode": 200, "result": schema_json}
-        except json.JSONDecodeError:
-             # If get_param_json returned non-JSON string (e.g. Langchain format instructions)
-             return {"statusCode": 200, "result_format_instructions": schema_str}
-    else:
-        # structure_json should contain the error from get_struct_params
-        status_code = 500 # Default error code
-        if isinstance(structure_json, dict) and "error" in structure_json:
-             if "RapidAPI Error 4" in structure_json["error"]: #粗略检查 4xx 错误
-                  status_code = 400 # Or map specific codes if needed
-             elif "RapidAPI Error 5" in structure_json["error"]:
-                  status_code = 503 # Service unavailable or internal error
-                  
-        return {"statusCode": status_code, "error": structure_json.get("error", "Unknown error retrieving parameters")} 
-
-def check_rgbs(structure: str, params: dict) -> dict:
-    clean_params = {}
-    if not isinstance(params, dict): return {} # Guard against non-dict input
-    for k, v in params.items():
-        if "color_rgb" in k:
-            # Handle simplified key case from get_color_params
-            if k == f"{structure}/color_rgb":
-                valid_rgb = fix_rgb(v)
-                if valid_rgb is not None:
-                    clean_params[k] = valid_rgb # Use the potentially simplified key
-            elif "/" in k: # Assume format like "asset/color_rgb"
-                 valid_rgb = fix_rgb(v)
-                 if valid_rgb is not None:
-                    clean_params[k] = valid_rgb
-            # Optional: Add handling for _layout/color_rgb if needed? User code had it commented.
-            # elif "_layout/color_rgb" in k:
-            #     k_fixed = f"{structure}/color_rgb" # Map it?
-            #     valid_rgb = fix_rgb(v)
-            #     if valid_rgb is not None:
-            #         clean_params[k_fixed] = valid_rgb
-        else:
-            clean_params[k] = v
-    return clean_params
-
-def create_opus_batch(component_type: str, params: dict, count: int = 1) -> tuple[bool, dict]:
-    if not RAPIDAPI_HOST_URL: return False, {"error": "RAPIDAPI_HOST_URL not configured"}
-    url = CREATE_COMPONENT_URL # Use the correct RapidAPI URL
-    p = {
-        "name": component_type,
-        "parameters": params,
-        "extensions": ["gltf"], # Hardcoded GLTF for now
-    #    "count": count, # Add count parameter
-        # Add texture_resolution? Required by user example?
-        # "texture_resolution": "1024", # Assuming default, adjust if needed
-    }
-    payload = json.dumps(p)
-    headers = {
-        'Content-Type': 'application/json',
-        'x-rapidapi-host': RAPIDAPI_HOST,
-        'x-rapidapi-key': RAPIDAPI_KEY
-    }
-    try:
-        response = requests.request("POST", url, headers=headers, data=payload, timeout=TIMEOUT)
-        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-        r = response.json()
-        # Check response structure for batch_id (might be different from old API)
-        batch_id = r.get("batch_job_id") or r.get("batch_id") or r.get("job_id") # Check common keys
-        if batch_id:
-            return True, r # Return the full response which contains the ID
-        else:
-             logger.error(f"RapidAPI batch creation success but no batch_id found in response: {r}")
-             return False, {"error": "API succeeded but batch_id missing in response."}
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"RapidAPI Error {e.response.status_code} creating batch: {e.response.text}")
-        try:
-             # Try to return the JSON error body if possible
-             error_json = e.response.json()
-             error_json["status_code"] = e.response.status_code # Add status code for later use
-             return False, error_json
-        except json.JSONDecodeError:
-             return False, {"error": f"RapidAPI Error {e.response.status_code}: {e.response.text}", "status_code": e.response.status_code}
-    except requests.exceptions.RequestException as e:
-        logger.error(f"RapidAPI request failed creating batch: {str(e)}")
-        return False, {"error": f"RapidAPI request failed: {str(e)}"}
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to decode RapidAPI response: {str(e)}")
-        return False, {"error": "Failed to decode RapidAPI response."}
-
-
-def create_opus_component(structure: str, params: dict, count: int = 1) -> dict:
-    # Ensure params is a dict
-    if not isinstance(params, dict):
-         return {"statusCode": 400, "error": "Parameters must be a valid JSON object (dict)."}
-         
-    clean_params = check_rgbs(structure, params)
-    status, result_json = create_opus_batch(structure, clean_params, count)
-    if status:
-        # Extract batch ID (key might vary)
-        batch_id = result_json.get("batch_job_id") or result_json.get("batch_id") or result_json.get("job_id")
-        if batch_id:
-             logger.info(f"OPUS (RapidAPI) batch job created: {batch_id}")
-             # Return a consistent success structure
-             return {"statusCode": 200, "batch_id": batch_id, "raw_response": result_json}
-        else:
-             # This case should be handled inside create_opus_batch now
-             logger.error(f"API success but no batch_job_id found in response: {result_json}")
-             return {"statusCode": 500, "error": "API succeeded but batch_id missing."}
-    else:
-        # result_json already contains the error from create_opus_batch
-        return {"statusCode": result_json.pop("status_code", 500), **result_json} # Use status_code if available
-
-
-def variate_opus_result(result_id: str, count: int = 12) -> dict:
-    if not RAPIDAPI_HOST_URL: return {"statusCode": 500, "error": "RAPIDAPI_HOST_URL not configured"}
-    url = VARIATE_URL # Use RapidAPI URL
-    p = {
-         "base_job_uid": result_id, # Parameter name might change, check RapidAPI docs
-         "count": count
-         # Any other params needed for variation?
-    }
-    payload = json.dumps(p)
-    headers = {
-        'Content-Type': 'application/json',
-        'x-rapidapi-host': RAPIDAPI_HOST,
-        'x-rapidapi-key': RAPIDAPI_KEY
-    }
-    try:
-        response = requests.request("POST", url, headers=headers, data=payload, timeout=TIMEOUT)
-        response.raise_for_status()
-        result_json = response.json()
-        # Extract batch_id (key might vary)
-        batch_id = result_json.get("batch_job_id") or result_json.get("batch_id") or result_json.get("job_id")
-        if batch_id:
-            logger.info(f"OPUS (RapidAPI) variation batch job created: {batch_id}")
-            return {"statusCode": 200, "batch_id": batch_id, "raw_response": result_json}
-        else:
-            logger.error(f"RapidAPI variation success but no batch_id found: {result_json}")
-            return {"statusCode": 500, "error": "API variation succeeded but batch_id missing."}
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"RapidAPI Error {e.response.status_code} creating variation: {e.response.text}")
-        try:
-             error_json = e.response.json()
-             return {"statusCode": e.response.status_code, "error": error_json}
-        except json.JSONDecodeError:
-             return {"statusCode": e.response.status_code, "error": e.response.text}
-    except requests.exceptions.RequestException as e:
-        logger.error(f"RapidAPI request failed creating variation: {str(e)}")
-        return {"statusCode": 500, "error": f"Request failed: {str(e)}"}
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to decode variation RapidAPI response: {str(e)}")
-        return {"statusCode": 500, "error": "Failed to decode variation RapidAPI response."}
-
-# --- End OPUS Helper Functions ---
 
 
 @dataclass
@@ -1171,7 +829,11 @@ def get_houdini_connection() -> HoudiniConnection:
 # Now define the MCP server that Claude will talk to over stdio
 mcp = FastMCP(
     "HoudiniMCP",
-    description="A bridging server that connects Claude to Houdini via MCP stdio + TCP, with OPUS API integration."
+    # refactor-opus-optional-and-debt-cleanup：mcp 1.12.2 接收但忽略
+    # ``description=``（不会成为 client-visible instructions）；mcp >=1.12.3
+    # 显式拒绝 ``description``。改用正式参数 ``instructions=``，使原 metadata
+    # 文本经 MCP initialize 协议对 client 可见，并消除升级时的构造错误。
+    instructions="A bridging server that connects Claude to Houdini via MCP stdio + TCP, with OPUS API integration."
 )
 
 @asynccontextmanager
@@ -1248,6 +910,104 @@ def get_best_practices(ctx, query=None, category=None, id=None):
     """
     return _bp.get_best_practices(
         query=query, category=category, bp_id=id,
+        response_cap_fn=getattr(cmn, "apply_response_cap", None))
+
+
+# -------------------------------------------------------------------
+# BM25 Doc RAG Tools（bridge-local；不建立 Houdini 连接）
+# 与 get_best_practices 同置于 event tools 与 Original Houdini Tools
+# 之间的无 # PR 探针区，避免被任何 "# PR N" bounded AST 探针扫到。
+# 本工具与 get_houdini_help / verify_hou_api 互补：那两个面向单条
+# API / 节点结构化查询（local-help-first + 在线回退，本 change 未改）；
+# search_docs / get_doc 面向跨文档主题检索，只读已校验本地 JSON 索引。
+# -------------------------------------------------------------------
+@mcp.tool()
+def search_docs(ctx, query, limit=10):
+    """跨 Houdini 文档做 BM25 检索（bridge-local，无 Houdini 连接）。
+
+    本工具 **不建立 Houdini TCP 连接**，直接在 bridge 进程内加载并查询
+    本地 RAG 索引（``index.v1.json``）。与 ``get_houdini_help`` /
+    ``verify_hou_api`` 互补：那两个面向单条 API / 节点的结构化查询
+    （local-help-first + 在线回退），本工具面向「跨文档主题检索」，
+    如「怎么搭 pyro 网络」「karma 采样设置」。
+
+    参数说明：
+    - query: 检索文本；tokenizer 会保留 hou.xxx() API 与 /obj/geo1 节点
+      路径整体语义，下划线复合词同时按完整与拆分匹配。
+    - limit: 可选，返回条目上限，clamp 到 [1, 50]，默认 10。
+
+    返回统一 envelope：status（success/error）、query、limit、matched
+    （response cap 前所有 BM25 正分文档总数）、returned（cap 后实际
+    results 长度，恒等于 len(results)）、results（每条含 path / title /
+    score / 围绕首个命中位置的 snippet）。索引缺失返回
+    rag_index_missing；损坏 / 不兼容返回 rag_index_unavailable；命中
+    stale 缓存时附 _index_warning。响应整体过 apply_response_cap。
+    """
+    return _rag.search_docs(
+        query=query, limit=limit,
+        response_cap_fn=getattr(cmn, "apply_response_cap", None))
+
+
+@mcp.tool()
+def get_doc(ctx, path):
+    """按相对路径取回已索引文档的全文（bridge-local，无 Houdini 连接）。
+
+    本工具 **不建立 Houdini TCP 连接**，``path`` 只与已校验索引中的规范
+    化 POSIX 相对 path 做精确匹配，全文从 JSON 内嵌 content 返回，
+    **绝不拼接源文件系统路径或回读索引外文件**（含 ``..`` 遍历串）。
+    与 ``get_houdini_help`` / ``verify_hou_api`` 互补：那两个面向在线
+    结构化字段查询，本工具面向已索引离线文档的整篇读取。
+
+    参数说明：
+    - path: 索引中文档的 POSIX 相对路径（如 ``nodes/sop/box.html``），
+      可先用 search_docs 取得。
+
+    返回统一 envelope：status（success/error）、path、title、length、
+    content（全文，过 apply_response_cap）、returned（1 命中 / 0 未命中）。
+    path 不存在或非法返回 rag_doc_not_found；索引缺失 / 损坏分别返回
+    rag_index_missing / rag_index_unavailable。
+    """
+    return _rag.get_doc(
+        path=path,
+        response_cap_fn=getattr(cmn, "apply_response_cap", None))
+
+
+@mcp.tool()
+def parse_hip_offline(ctx, file_path, include_params=False, max_depth=10):
+    """离线 best-effort 解析 .hip/.hiplc/.hipnc（bridge-local，无 Houdini 连接）。
+
+    本工具 **不建立 Houdini TCP 连接、不 import hou**，直接在 bridge 进程
+    内按真实 legacy cpio/odc entry 流式读取 archive（magic 070707、76 字节
+    header），best-effort 提取节点 type、def comment/position/connections、
+    可选 parm 序列化原始值、postit 文本与 netbox label，并对不可信输入施加
+    file/entry/section/total/node 五类硬限额（``max_depth`` 仅裁输出树）。
+
+    与 ``serialize_scene`` / ``get_node_info`` 互补：那两个面向**在线** Houdini
+    连接的实时节点树查询；本工具面向**离线**文件审计（如查看一个 .hip 里
+    有哪些节点/连线，而不必启动 Houdini）。
+
+    参数说明：
+    - file_path: ``.hip``/``.hiplc``/``.hipnc`` 文件路径；其他扩展名返回
+      ``unsupported_extension``。
+    - include_params: 可选，True 时每节点附 ``parameters``（archive 中序列化
+      的原始 parm 文本，**不求值、不比较默认、不保证动画/表达式完整**）。
+    - max_depth: 可选，输出 ``structure`` 树深度，clamp 到 ``[1,64]``；
+      flat ``nodes``/``connections`` 不受影响。
+
+    返回统一 envelope：``status``（success/error）、``file_path``、
+    ``save_version``（从 ``.variables`` 的 ``_HIP_SAVEVERSION`` 明确提取，
+    不可得为 null）、``nodes``（flat）、``connections``、``postits``、
+    ``netboxes``、``structure``（depth-clipped 树）、``metadata``（含
+    complete_entries/bytes_consumed/trailer_seen/duplicate_entries/
+    skipped_sections/limits）。error 形如
+    ``error:{code,message,details}`` 并尽可能附 partial（trailer_seen=false，
+    不含截断 body）。error code：unsupported_extension / invalid_archive /
+    corrupt_archive / truncated_archive / resource_limit_exceeded /
+    hip_not_found / hip_io_error。success 与 error-partial 均**过**
+    ``apply_response_cap``。
+    """
+    return _hip.parse_hip_offline(
+        file_path, include_params=include_params, max_depth=max_depth,
         response_cap_fn=getattr(cmn, "apply_response_cap", None))
 
 
@@ -2043,8 +1803,11 @@ def opus_get_model_names(ctx: Context) -> List[str]:
     """
     Returns a list of available OPUS component/structure names.
     """
-    # Currently uses the hardcoded list from helpers
-    return get_all_component_names()
+    # 委托 _opus 模块（无 RapidAPI key 也可用，纯硬编码 catalog，不检查配置）。
+    # _opus 容错加载失败时返回空 list（module unavailable）。
+    if _opus is None:
+        return []
+    return _opus.get_all_component_names()
 
 @mcp.tool()
 def opus_get_model_params_schema(ctx: Context, structure: str) -> dict:
@@ -2055,8 +1818,10 @@ def opus_get_model_params_schema(ctx: Context, structure: str) -> dict:
     """
     if not structure:
         return {"statusCode": 400, "error": "Structure name cannot be empty."}
-    # This function now returns a dict with statusCode and result/error
-    return get_formatted_opus_params(structure)
+    if _opus is None:
+        return {"statusCode": 503, "error": "OPUS module unavailable."}
+    # 委托 _opus；配置不全时返回稳定 disabled error（不 import requests/langchain）。
+    return _opus.get_formatted_opus_params(structure)
 
 @mcp.tool()
 def opus_create_model(ctx: Context, structure: str, parameters: Dict[str, Any], count: int = 1) -> dict:
@@ -2072,8 +1837,10 @@ def opus_create_model(ctx: Context, structure: str, parameters: Dict[str, Any], 
     if not isinstance(count, int) or count < 1:
          return {"statusCode": 400, "error": "Count must be a positive integer."}
          
-    # This function handles API call and returns dict with statusCode and batch_id/error
-    return create_opus_component(structure, parameters, count)
+    if _opus is None:
+        return {"statusCode": 503, "error": "OPUS module unavailable."}
+    # 委托 _opus；配置不全时返回稳定 disabled error。
+    return _opus.create_opus_component(structure, parameters, count)
 
 @mcp.tool()
 def opus_variate_model(ctx: Context, result_id: str, count: int = 12) -> dict:
@@ -2087,8 +1854,10 @@ def opus_variate_model(ctx: Context, result_id: str, count: int = 12) -> dict:
     if not isinstance(count, int) or count < 1:
          return {"statusCode": 400, "error": "Count must be a positive integer."}
 
-    # This function handles API call and returns dict with statusCode and batch_id/error
-    return variate_opus_result(result_id, count)
+    if _opus is None:
+        return {"statusCode": 503, "error": "OPUS module unavailable."}
+    # 委托 _opus；配置不全时返回稳定 disabled error。
+    return _opus.variate_opus_result(result_id, count)
 
 # -------------------------------------------------------------------
 # NEW Tools Forwarding to Houdini for OPUS Job Handling
@@ -2103,10 +1872,10 @@ def opus_check_job_status(ctx: Context, batch_id: str) -> dict:
     """
     if not batch_id:
         return {"error": "Batch ID cannot be empty."}
-    
-    # Call the helper function directly
-    result = get_opus_job_result(batch_job_id=batch_id)
-    return result # Return the dictionary (contains result or error)
+    if _opus is None:
+        return {"error": "OPUS module unavailable."}
+    # 委托 _opus；配置不全时返回稳定 disabled error。
+    return _opus.get_opus_job_result(batch_job_id=batch_id)
 
 @mcp.tool()
 def opus_import_model_url(ctx: Context, download_url: str, node_name: str = None) -> str:
@@ -2150,45 +1919,7 @@ def opus_import_model_url(ctx: Context, download_url: str, node_name: str = None
         logger.error(f"Unexpected error in opus_import_model_url tool: {str(e)}", exc_info=True)
         return f"Server Error importing model: {str(e)}"
 
-# --- Add get_opus_job_result helper (Updated for RapidAPI) --- 
-def get_opus_job_result(batch_job_id: str) -> dict:
-    """
-    Query OPUS API via RapidAPI for latest job info (including download URLs).
-    Uses GET_JOB_RESULT_URL constructed from RapidAPI env vars.
-    Returns the JSON response as a dictionary.
-    On error, returns a dictionary with an 'error' key.
-    """
-    if not RAPIDAPI_HOST_URL: # Check RapidAPI config
-        return {"error": "RAPIDAPI_HOST_URL not configured."}
-    if not batch_job_id:
-        return {"error": "batch_job_id cannot be empty."}
-        
-    url = GET_JOB_RESULT_URL # Use RapidAPI URL
-    params = { "result_uid": batch_job_id } # Parameter name from user example, check RapidAPI docs
-    headers = { 
-        "accept": "application/json",
-        'x-rapidapi-host': RAPIDAPI_HOST,
-        'x-rapidapi-key': RAPIDAPI_KEY
-    }
-    try:
-        logger.info(f"Querying job status (RapidAPI): URL={url}, Params={params}")
-        resp = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
-        resp.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-        return resp.json()
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"RapidAPI Error {e.response.status_code} getting job result: {e.response.text}")
-        try:
-             # Return the error structure from the API if possible
-             return {"error": e.response.json(), "status_code": e.response.status_code} 
-        except json.JSONDecodeError:
-             return {"error": f"RapidAPI Error {e.response.status_code}: {e.response.text}", "status_code": e.response.status_code}
-    except requests.exceptions.RequestException as e:
-        logger.error(f"RapidAPI request failed getting job result: {str(e)}")
-        return {"error": f"RapidAPI request failed: {str(e)}"}
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to decode job status RapidAPI response: {str(e)}")
-        return {"error": "Failed to decode job status RapidAPI response."}
-# --- End get_opus_job_result helper ---
+
 
 
 # ... (rest of existing code, main function etc) ...
@@ -2717,16 +2448,14 @@ def main():
     _houdini_port = args.port
     logger.info(f"Configured to connect to Houdini on port {_houdini_port}")
 
-    # Check necessary RapidAPI variables are set before running
-    if not RAPIDAPI_HOST_URL or not RAPIDAPI_HOST or not RAPIDAPI_KEY:
-         logger.warning("RAPIDAPI_HOST_URL, RAPIDAPI_HOST, or RAPIDAPI_KEY not configured. OPUS API features will be disabled.")
-         logger.warning("To enable OPUS features, configure your RapidAPI key in urls.env")
-         # Don't exit - allow server to start without OPUS features
+    # OPUS RapidAPI 配置检查（refactor-opus-optional-and-debt-cleanup）：
+    # 配置读取延迟到 ``_opus``，bridge 不再在顶层持有 RAPIDAPI_* 全局。
+    # 仅在启动时 best-effort 日志，不阻止 server 启动（无 key 也应能跑）。
+    if _opus is not None and _opus.is_configured():
+        logger.info("OPUS RapidAPI configured; schema/create/variate/check tools enabled.")
     else:
-        logger.info(f"Using RapidAPI Host URL: {RAPIDAPI_HOST_URL}")
-        logger.info(f"Using RapidAPI Host Header: {RAPIDAPI_HOST}")
-
-    logger.info(f"Langchain available: {LANGCHAIN_AVAILABLE}")
+        logger.warning("RAPIDAPI_HOST_URL, RAPIDAPI_HOST, or RAPIDAPI_KEY not configured. OPUS API features will be disabled.")
+        logger.warning("To enable OPUS features, configure your RapidAPI key in urls.env")
     mcp.run()
 
 if __name__ == "__main__":

@@ -13,6 +13,14 @@ def start_server(host='127.0.0.1', port=9876):
     server.start()
     if server.running:
         hou.session.houdinimcp_server = server
+        # G1 sentinel housekeeping（refactor-opus-optional-and-debt-cleanup）：
+        # server 成功运行后 best-effort 清一次过期 consent sentinel。清理异常
+        # 不得停止或回滚已成功运行的 server；already-running 早退 / 启动失败
+        # 路径不执行启动清理（见上方 early return 与下方 else 分支）。
+        try:
+            _render_policy._cleanup_expired_sentinels()
+        except Exception:
+            pass
     else:
         hou.session.houdinimcp_server = None
 

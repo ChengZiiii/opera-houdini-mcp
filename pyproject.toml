@@ -5,9 +5,18 @@ description = "MCP server enabling Claude Desktop to control SideFX Houdini via 
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "mcp[cli]>=1.4.1",
+    "mcp[cli]==1.12.2",
     "requests>=2.31.0",
     "python-dotenv>=1.0.0",
+]
+
+# refactor-opus-optional-and-debt-cleanup：langchain 两项仅服务 OPUS schema
+# 格式化，从必需依赖移入 ``opus`` extra。默认安装不再拉 langchain；schema
+# 工具在无 langchain 时走 raw JSON 降级（见 _opus.get_param_json）。
+# mcp[cli] 精确锁定 1.12.2：FastMCP ``instructions=`` 在该版本成为 client-visible
+# metadata，且 >=1.12.3 显式拒绝 ``description=``。
+[project.optional-dependencies]
+opus = [
     "langchain>=0.1.0",
     "langchain-classic>=1.0.0",
 ]
