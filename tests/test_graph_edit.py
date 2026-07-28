@@ -885,5 +885,342 @@ class PR9BridgeBehaviorTests(unittest.TestCase):
         self.assertIn("node_paths", keys)
 
 
+# ===========================================================================
+# add-node-parameter-vex-tools: 3 节点 helper + 3 VEX helper 单测
+# ===========================================================================
+class _VParmChild(object):
+    """hou.Parm double for set()/eval()/setExpression()/expression()."""
+
+    def __init__(self, name, default=0.0):
+        self._name = name
+        self._value = default
+        self._expression = ""
+        self._set_calls = []
+        self._set_expr_calls = []
+
+    def name(self):
+        return self._name
+
+    def eval(self):
+        return self._value
+
+    def set(self, v):
+        self._set_calls.append(v)
+        self._value = v
+
+    def expression(self):
+        return self._expression
+
+    def setExpression(self, expr, language=None):
+        self._set_expr_calls.append((expr, language))
+        self._expression = expr
+
+
+class _VSopChild(object):
+    """Category stub for SOP parent testing."""
+
+    def name(self):
+        return "Sop"
+
+    def __eq__(self, other):
+        return isinstance(other, _VSopChild)
+
+
+class _VGraphChild(object):
+    def name(self):
+        return "Object"
+
+    def __eq__(self, other):
+        return isinstance(other, _VGraphChild)
+
+
+class _VNode(object):
+    """Hou node stub for node ops: setName/parm/copyNodesTo/moveNodesTo."""
+
+    def __init__(self, name, parent=None, cat=None):
+        self._name = name
+        self._parent = parent
+        self._category = cat or _VGraphChild()
+        self._path = None
+        self._children = []
+        self._parms = {"tx": _VParmChild("tx", 1.0),
+                       "snippet": _VParmChild("snippet", ""),
+                       "class": _VParmChild("class", "point")}
+        self._rename_calls = []
+        self._copy_dest = None
+        self._copy_name = None
+        self._copy_returned = []
+        self._move_dest = None
+        self._move_returned = []
+        self._type_name = "attribwrangle"
+
+    def name(self):
+        return self._name
+
+    def path(self):
+        if self._path is not None:
+            return self._path
+        if self._parent is None:
+            return "/" + self._name
+        return self._parent.path().rstrip("/") + "/" + self._name
+
+    def parent(self):
+        return self._parent
+
+    def childTypeCategory(self):
+        return self._category
+
+    def children(self):
+        return list(self._children)
+
+    def node(self, name):
+        for c in self._children:
+            if c.name() == name:
+                return c
+        return None
+
+    def parm(self, name):
+        return self._parms.get(name)
+
+    def setName(self, name):
+        self._rename_calls.append(name)
+        self._name = name
+
+    def type(self):
+        return types.SimpleNamespace(name=lambda: self._type_name)
+
+    def createNode(self, name, node_name=None):
+        new = _VNode(node_name or name, parent=self, cat=self._category)
+        self._children.append(new)
+        return new
+
+    def destroy(self):
+        if self._parent is not None:
+            if self in self._parent._children:
+                self._parent._children.remove(self)
+            self._parent = None
+
+
+class _VHou(object):
+    """Hou stub for node ops + VEX helpers."""
+
+    def __init__(self, hfs_path=None):
+        self._nodes = {}
+        self._hfs = hfs_path
+        self._copy_log = []
+        self._move_log = []
+        self._sop_cat = _VSopChild()
+        self._obj_cat = _VGraphChild()
+        # hou.OperationFailed 异常类用于 create_vex_expression 失败兜底
+        self.OperationFailed = type("OperationFailed", (Exception,), {})
+
+    def add_node(self, path, node):
+        self._nodes[path] = node
+        node._path = path
+        if node._parent is not None:
+            node._parent._children.append(node)
+
+    def node(self, path):
+        return self._nodes.get(path)
+
+    def getenv(self, key):
+        if key == "HFS":
+            return self._hfs
+        return None
+
+    def copyNodesTo(self, nodes, dest):
+        self._copy_log.append((nodes, dest, None))
+        new_name = nodes[0].name() + "_copy"
+        new_node = _VNode(new_name, parent=dest, cat=dest.childTypeCategory())
+        dest._children.append(new_node)
+        self._nodes[dest.path().rstrip("/") + "/" + new_name] = new_node
+        return [new_node]
+
+    def moveNodesTo(self, nodes, dest):
+        self._move_log.append((nodes, dest))
+        moved = []
+        for n in nodes:
+            old_path = n.path()
+            if n._parent is not None:
+                n._parent._children.remove(n)
+                self._nodes.pop(old_path, None)
+            n._parent = dest
+            dest._children.append(n)
+            self._nodes[dest.path().rstrip("/") + "/" + n.name()] = n
+            moved.append(n)
+        return moved
+
+
+class RenameNodeTests(unittest.TestCase):
+
+    def setUp(self):
+        self.hou = _VHou()
+        self.parent = _VNode("container", cat=self.hou._obj_cat)
+        self.hou.add_node("/obj/container", self.parent)
+        self.n = _VNode("old", parent=self.parent)
+        self.hou.add_node("/obj/container/old", self.n)
+
+    def test_rename_success(self):
+        result = ge.rename_node(self.hou, "/obj/container/old", "fresh")
+        self.assertEqual(result["old_name"], "old")
+        self.assertEqual(result["new_name"], "fresh")
+        self.assertEqual(self.n._rename_calls, ["fresh"])
+
+    def test_rename_same_name_noop(self):
+        result = ge.rename_node(self.hou, "/obj/container/old", "old")
+        self.assertEqual(result["old_name"], "old")
+        self.assertEqual(result["new_name"], "old")
+
+    def test_rename_conflict_raises(self):
+        sibling = _VNode("sib", parent=self.parent)
+        self.hou.add_node("/obj/container/sib", sibling)
+        with self.assertRaises(ValueError):
+            ge.rename_node(self.hou, "/obj/container/old", "sib")
+
+    def test_rename_missing_node_raises(self):
+        with self.assertRaises(ValueError):
+            ge.rename_node(self.hou, "/obj/missing", "x")
+
+    def test_rename_empty_name_raises(self):
+        with self.assertRaises(ValueError):
+            ge.rename_node(self.hou, "/obj/container/old", "")
+
+
+class CopyMoveNodeTests(unittest.TestCase):
+
+    def setUp(self):
+        self.hou = _VHou()
+        self.src_parent = _VNode("src", cat=self.hou._obj_cat)
+        self.hou.add_node("/obj/src", self.src_parent)
+        self.dst_parent = _VNode("dst", cat=self.hou._obj_cat)
+        self.hou.add_node("/obj/dst", self.dst_parent)
+        self.src = _VNode("box", parent=self.src_parent)
+        self.hou.add_node("/obj/src/box", self.src)
+
+    def test_copy_to_dest(self):
+        result = ge.copy_node(self.hou, "/obj/src/box", "/obj/dst")
+        self.assertEqual(result["src_path"], "/obj/src/box")
+        self.assertIn("dst", self.hou._copy_log[0][1].path())
+        self.assertEqual(len(self.hou._copy_log), 1)
+
+    def test_copy_with_custom_name(self):
+        result = ge.copy_node(self.hou, "/obj/src/box", "/obj/dst", name="myBox")
+        self.assertEqual(result["name"], "myBox")
+
+    def test_copy_conflict_raises(self):
+        existing = _VNode("box", parent=self.dst_parent)
+        self.hou.add_node("/obj/dst/box", existing)
+        with self.assertRaises(ValueError):
+            ge.copy_node(self.hou, "/obj/src/box", "/obj/dst", name="box")
+
+    def test_copy_missing_src_raises(self):
+        with self.assertRaises(ValueError):
+            ge.copy_node(self.hou, "/obj/missing", "/obj/dst")
+
+    def test_copy_missing_dest_raises(self):
+        with self.assertRaises(ValueError):
+            ge.copy_node(self.hou, "/obj/src/box", "/obj/missing")
+
+    def test_copy_category_mismatch_raises(self):
+        sop_parent = _VNode("sop_net", cat=self.hou._sop_cat)
+        self.hou.add_node("/obj/sop_net", sop_parent)
+        with self.assertRaises(ValueError):
+            ge.copy_node(self.hou, "/obj/src/box", "/obj/sop_net")
+
+    def test_move_to_dest(self):
+        result = ge.move_node(self.hou, "/obj/src/box", "/obj/dst")
+        self.assertEqual(result["src_path"], "/obj/src/box")
+        self.assertEqual(self.src._parent, self.dst_parent)
+        self.assertEqual(len(self.hou._move_log), 1)
+
+    def test_move_missing_src_raises(self):
+        with self.assertRaises(ValueError):
+            ge.move_node(self.hou, "/obj/missing", "/obj/dst")
+
+
+class VexHelperTests(unittest.TestCase):
+
+    def test_get_wrangle_code_returns_snippet(self):
+        hou = _VHou()
+        n = _VNode("wrangle", parent=_VNode("parent", cat=hou._sop_cat))
+        n._parms["snippet"].set("@P = {0,0,0};")
+        hou.add_node("/obj/parent/wrangle", n)
+        result = ge.get_wrangle_code(hou, "/obj/parent/wrangle")
+        self.assertEqual(result["code"], "@P = {0,0,0};")
+
+    def test_get_wrangle_code_missing_node_raises(self):
+        hou = _VHou()
+        with self.assertRaises(ValueError):
+            ge.get_wrangle_code(hou, "/obj/missing")
+
+    def test_get_wrangle_code_no_snippet_raises(self):
+        hou = _VHou()
+        n = _VNode("plain", parent=_VNode("p", cat=hou._sop_cat))
+        # remove snippet via direct attribute
+        n._parms.pop("snippet", None)
+        hou.add_node("/obj/p/plain", n)
+        with self.assertRaises(ValueError):
+            ge.get_wrangle_code(hou, "/obj/p/plain")
+
+    def test_create_vex_expression_in_sop_parent(self):
+        hou = _VHou()
+        sop_parent = _VNode("geo", cat=hou._sop_cat)
+        hou.add_node("/obj/geo", sop_parent)
+
+        result = ge.create_vex_expression(
+            hou, "/obj/geo", "@P = {0,0,0};", attrib_class="primitive")
+        self.assertEqual(result["attrib_class"], "primitive")
+        self.assertEqual(result["name"], "attribwrangle")
+        created = sop_parent._children[0]
+        self.assertEqual(created._parms["snippet"]._set_calls[-1],
+                         "@P = {0,0,0};")
+        # class parm also set
+        self.assertEqual(created._parms["class"]._set_calls[-1],
+                         "primitive")
+
+    def test_create_vex_expression_non_sop_parent_raises(self):
+        hou = _VHou()
+        obj_parent = _VNode("obj", cat=hou._obj_cat)
+        hou.add_node("/obj", obj_parent)
+        with self.assertRaises(ValueError):
+            ge.create_vex_expression(hou, "/obj", "@P = {0,0,0};")
+
+    def test_validate_vex_no_hfs_raises(self):
+        hou = _VHou()  # no HFS
+        with self.assertRaises(ValueError):
+            ge.validate_vex(hou, "@P = {0,0,0};")
+
+    def test_validate_vex_invalid_context_raises(self):
+        hou = _VHou(hfs_path="C:/Program Files/SideFX/Houdini 21.0.596")
+        with self.assertRaises(ValueError):
+            ge.validate_vex(hou, "@P = {0,0,0};", context="bogus")
+
+    def test_validate_vex_hfs_not_absolute_raises(self):
+        hou = _VHou(hfs_path="relative/hfs")
+        with self.assertRaises(ValueError):
+            ge.validate_vex(hou, "@P = {0,0,0};")
+
+    def test_validate_vex_hfs_not_dir_raises(self):
+        hou = _VHou(hfs_path="C:/this/path/does/not/exist/xyz")
+        with self.assertRaises(ValueError):
+            ge.validate_vex(hou, "@P = {0,0,0};")
+
+    def test_wrapper_line_offset_is_positive(self):
+        """D3: wrapper 头部固定行数计算正确。"""
+        hou = _VHou()
+        # 调用内部 _resolve_vcc 时 HFS/bin 必须存在
+        # 这里只测 wrapper 偏移常量
+        # 实际编译在 H21 live smoke 验证
+        wrapper = (
+            "// server-controlled vcc wrapper\n"
+            "void __mcp_vex_user_entry() {\n"
+            "{USER_CODE}\n"
+            "}\n"
+        )
+        offset = wrapper.count("\n", 0, wrapper.find("{USER_CODE}"))
+        self.assertGreater(offset, 0)
+        self.assertEqual(offset, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

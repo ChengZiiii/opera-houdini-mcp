@@ -2716,6 +2716,621 @@ def create_render_node(ctx: Context, node_type: str,
 
 
 # -------------------------------------------------------------------
+# add-hda-management-tools：10 个 HDA/OTL bridge tool。
+# 全部透传 server 端同名命令；不接受 ``override`` /
+# ``allow_protected`` / ``authorization`` / 任何隐藏绕过参数。
+# 三分类见 server.py：
+# - READ_ONLY：hda_list / hda_get / get_hda_sections /
+#   get_hda_section_content
+# - MUTATING：hda_create / update_hda / set_hda_section_content
+# - NO_UNDO：hda_install / uninstall_hda / reload_hda
+# -------------------------------------------------------------------
+@mcp.tool()
+def hda_list(ctx: Context, category: str = None) -> dict:
+    """枚举已加载 HDA（add-hda-management-tools，READ_ONLY）。
+
+    使用 ``hou.hda.loadedFiles()`` + ``hou.hda.definitionsInFile()``
+    按 ``(libraryFilePath, nameWithCategory())`` 去重。响应过
+    server 端 ``apply_response_cap``。``category`` 可选透传过滤。
+    """
+    params = {}
+    if category is not None:
+        params["category"] = category
+    return _houdini_call("hda_list", params)
+
+
+@mcp.tool()
+def hda_get(ctx: Context, node_type: str) -> dict:
+    """读取 definition metadata（add-hda-management-tools，READ_ONLY）。
+
+    ``node_type`` 仅接受 ``hou.NodeType.nameWithCategory()`` 完整
+    类别名（如 ``Sop/box``）；短名称 / 未知 / 歧义均返回稳定
+    error。响应过 ``apply_response_cap``。
+    """
+    return _houdini_call("hda_get", {"node_type": node_type})
+
+
+@mcp.tool()
+def hda_install(ctx: Context, file_path: str) -> dict:
+    """安装 HDA 库（add-hda-management-tools，NO_UNDO）。
+
+    落盘 + 全局 HDA registry 副作用，**不**可由 Houdini undo 恢复。
+    响应过 ``apply_response_cap``。
+    """
+    return _houdini_call("hda_install", {"file_path": file_path})
+
+
+@mcp.tool()
+def hda_create(ctx: Context, node_path: str, name: str,
+                save_path: str, label: str = None) -> dict:
+    """从节点创建 HDA（add-hda-management-tools，MUTATING）。
+
+    先 ``canCreateDigitalAsset()``，再
+    ``createDigitalAsset(name=, hda_file_name=, description=)``。
+    ``label`` 可选，作为 description。响应过 ``apply_response_cap``。
+    """
+    params = {"node_path": node_path, "name": name,
+              "save_path": save_path}
+    if label is not None:
+        params["label"] = label
+    return _houdini_call("hda_create", params)
+
+
+@mcp.tool()
+def uninstall_hda(ctx: Context, file_path: str) -> dict:
+    """卸载 HDA 库（add-hda-management-tools，NO_UNDO）。
+
+    落盘 + registry 副作用，**不**可由 Houdini undo 恢复。
+    """
+    return _houdini_call("uninstall_hda", {"file_path": file_path})
+
+
+@mcp.tool()
+def reload_hda(ctx: Context, file_path: str) -> dict:
+    """重载 HDA 库（add-hda-management-tools，NO_UNDO）。
+
+    落盘 + registry 副作用，**不**可由 Houdini undo 恢复。
+    """
+    return _houdini_call("reload_hda", {"file_path": file_path})
+
+
+@mcp.tool()
+def update_hda(ctx: Context, node_path: str) -> dict:
+    """从实例更新定义（add-hda-management-tools，MUTATING）。
+
+    验证节点存在、拥有 definition、实例类型匹配后调
+    ``definition.updateFromNode(node)``；**不**使用
+    ``definition.save()``。响应过 ``apply_response_cap``。
+    """
+    return _houdini_call("update_hda", {"node_path": node_path})
+
+
+@mcp.tool()
+def get_hda_sections(ctx: Context, node_type: str) -> dict:
+    """枚举 sections metadata（add-hda-management-tools，READ_ONLY）。
+
+    每项含 ``name / size / protected / binary / utf8``；``utf8``
+    严格探测；``binary`` 固定 true。响应过 ``apply_response_cap``。
+    """
+    return _houdini_call("get_hda_sections", {"node_type": node_type})
+
+
+@mcp.tool()
+def get_hda_section_content(ctx: Context, node_type: str,
+                             section: str, encoding: str,
+                             offset: int = 0,
+                             limit: int = 8192) -> dict:
+    """分页读取 section 正文（add-hda-management-tools，READ_ONLY）。
+
+    ``encoding`` 显式必填 ``utf8`` / ``base64``；两种模式均以
+    ``binaryContents()`` 一次拿到的 raw bytes 为唯一分页真相。
+    响应过 ``apply_response_cap``。
+    """
+    return _houdini_call("get_hda_section_content", {
+        "node_type": node_type, "section": section,
+        "encoding": encoding, "offset": offset, "limit": limit})
+
+
+@mcp.tool()
+def set_hda_section_content(ctx: Context, node_type: str,
+                             section: str, content: str) -> dict:
+    """allowlist 写入 section（add-hda-management-tools，MUTATING）。
+
+    ``section`` 仅 ``Help`` / ``IconSVG`` 大小写敏感精确匹配允许；
+    其他全部 ``section_write_denied`` 且零写入。``content`` UTF-8
+    字节上限 65536。响应过 ``apply_response_cap``。
+    """
+    return _houdini_call("set_hda_section_content", {
+        "node_type": node_type, "section": section, "content": content})
+
+
+# -------------------------------------------------------------------
+# add-geometry-export-and-measure：8 个几何测量/导出 bridge tool。
+# 全部透传 server 端同名命令；不接受隐藏绕过参数。三分类见 server.py：
+# - MUTATING：set_detail_attrib（创建 Attribute Create SOP，单 undo group）
+# - NO_UNDO：geo_export（外部文件系统 mutation，不可 undo）
+#            + 6 个 cooked Geometry 查询（get_bounding_box /
+#            get_groups / get_group_members / get_attrib_values /
+#            get_prim_intrinsics / find_nearest_point；访问 cooked
+#            Geometry 可能触发 SOP cook，不可由 HIP undo 恢复）
+# -------------------------------------------------------------------
+@mcp.tool()
+def get_bounding_box(ctx, node_path):
+    """解包几何 6 元 bounds 为 ``{min,max,size,center}``
+    （add-geometry-export-and-measure，NO_UNDO）。
+
+    使用 ``geo.intrinsicValue("bounds")`` 的
+    ``(xmin, xmax, ymin, ymax, zmin, zmax)`` 标准布局。响应过 server
+    端 ``apply_response_cap``。
+    """
+    return _houdini_call("get_bounding_box", {"node_path": node_path})
+
+
+@mcp.tool()
+def get_groups(ctx, node_path):
+    """返回四类 groups（point / prim / vertex / edge）name 列表
+    （add-geometry-export-and-measure，NO_UNDO）。
+
+    edge groups 在 H21+ 通过 ``geo.edgeGroups()`` 公开。响应过
+    server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("get_groups", {"node_path": node_path})
+
+
+@mcp.tool()
+def get_group_members(ctx, node_path, group_type, group_name,
+                      offset=0, limit=1000):
+    """分页读取 group 成员
+    （add-geometry-export-and-measure，NO_UNDO）。
+
+    - ``offset / limit`` 必填；``limit`` 默认 1000。
+    - vertex 成员 ``{prim_index, vertex_index, point_index}``；
+      edge 成员 ``[min_point, max_point]`` 排序端点对。
+    - 返回 ``{values, offset, limit, total, next_offset}``。响应过
+      server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("get_group_members", {
+        "node_path": node_path, "group_type": group_type,
+        "group_name": group_name,
+        "offset": offset, "limit": limit})
+
+
+@mcp.tool()
+def get_attrib_values(ctx, node_path, attribute, attrib_class="point",
+                      offset=0, limit=1000):
+    """按 owner/storage/tuple-size 分派读取属性，原生分页
+    （add-geometry-export-and-measure，NO_UNDO）。
+
+    - ``attrib_class`` 接受 ``point / prim / vertex / detail``。
+    - 返回 ``{values, offset, limit, total, next_offset, storage,
+      tuple_size}``。响应过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("get_attrib_values", {
+        "node_path": node_path, "attribute": attribute,
+        "attrib_class": attrib_class,
+        "offset": offset, "limit": limit})
+
+
+@mcp.tool()
+def get_prim_intrinsics(ctx, node_path, prim_index, names=None):
+    """仅查询指定 ``prim_index`` 的 intrinsics
+    （add-geometry-export-and-measure，NO_UNDO）。
+
+    ``names`` 可选子集过滤；越界返回结构化 error。响应过 server
+    端 ``apply_response_cap``。
+    """
+    params = {"node_path": node_path, "prim_index": prim_index}
+    if names is not None:
+        params["names"] = names
+    return _houdini_call("get_prim_intrinsics", params)
+
+
+@mcp.tool()
+def find_nearest_point(ctx, node_path, position, max_distance=1.0):
+    """最近点查询：``Point | None`` 双路径
+    （add-geometry-export-and-measure，NO_UNDO）。
+
+    - ``position`` 必须是 ``[x, y, z]``。
+    - ``max_distance`` 默认 1.0，作为 ``geo.nearestPoint`` 的
+      ``max_radius``。
+    - Point 返回 ``{point_index, point_position, distance}``；None
+      返回三字段均 null。响应过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("find_nearest_point", {
+        "node_path": node_path, "position": position,
+        "max_distance": max_distance})
+
+
+@mcp.tool()
+def set_detail_attrib(ctx, node_path, name, value, attrib_type="float",
+                      node_name=None):
+    """创建 Attribute Create SOP，class=detail
+    （add-geometry-export-and-measure，MUTATING）。
+
+    - 创建 + 连接 + 配置是单 undo group 的连续步骤；失败 destroy
+      半成品。
+    - **不**调用 cooked ``node.geometry()`` 的写方法。
+    - ``attrib_type`` 接受 ``float / int / string / vector``。
+    - 响应过 server 端 ``apply_response_cap``。
+    """
+    params = {"node_path": node_path, "name": name, "value": value,
+              "attrib_type": attrib_type}
+    if node_name is not None:
+        params["node_name"] = node_name
+    return _houdini_call("set_detail_attrib", params)
+
+
+@mcp.tool()
+def geo_export(ctx, node_path, format, output_path, overwrite=False):
+    """translator 驱动的原子几何导出
+    （add-geometry-export-and-measure，NO_UNDO）。
+
+    - ``format`` 接受 ``bgeo / bgeo.gz / bgeo.lzma / bgeo.bz2 / geo``
+      （H21+ 实机 ``geo.saveToFile`` 验证）。
+    - ``output_path`` 扩展名必须与 format 匹配；不匹配返回
+      ``extension_mismatch``。
+    - 临时文件 ``fsync`` + ``os.replace`` 原子覆盖；``overwrite=False``
+      且目标存在返回 ``target_exists``；失败清理临时文件。
+    - 落盘副作用不进 Houdini undo group；响应过 server 端
+      ``apply_response_cap``。
+    """
+    return _houdini_call("geo_export", {
+        "node_path": node_path, "format": format,
+        "output_path": output_path, "overwrite": overwrite})
+
+
+# -------------------------------------------------------------------
+# add-node-parameter-vex-tools：14 个新增 bridge tool（净新增）。
+# 旧 modify_node 已在 server.py 原地扩展 flags，不重写新桥。
+# 三分类见 server.py：
+# - READ_ONLY：get_parameter / get_expression / get_wrangle_code
+# - NO_UNDO：validate_vex（vcc 临时 .vfl + subprocess 副作用）
+# - MUTATING：rename_node / copy_node / move_node / set_parameter /
+#   revert_parameter / link_parameters / lock_parameter /
+#   create_spare_parameter / create_spare_parameters /
+#   create_vex_expression
+# 风格：与 PR 9 / HDA / geo 保持一致（无类型注解 + 中文 docstring）。
+# -------------------------------------------------------------------
+@mcp.tool()
+def rename_node(ctx, path, new_name):
+    """重命名节点（add-node-parameter-vex-tools，MUTATING）。
+
+    预检同名冲突；返回新 path / old_name / new_name。响应过
+    ``apply_response_cap``。
+    """
+    return _houdini_call("rename_node", {
+        "path": path, "new_name": new_name})
+
+
+@mcp.tool()
+def copy_node(ctx, src_path, dest_parent, name=None):
+    """复制节点到 dest_parent 下（add-node-parameter-vex-tools，MUTATING）。
+
+    使用 ``hou.copyNodesTo``；预检目标 category 与同名冲突。
+    ``name`` 可选，None 时由 hou 决定。响应过 ``apply_response_cap``。
+    """
+    params = {"src_path": src_path, "dest_parent": dest_parent}
+    if name is not None:
+        params["name"] = name
+    return _houdini_call("copy_node", params)
+
+
+@mcp.tool()
+def move_node(ctx, src_path, dest_parent):
+    """移动节点到 dest_parent 下（add-node-parameter-vex-tools，MUTATING）。
+
+    使用 ``hou.moveNodesTo``；预检目标 category。响应过
+    ``apply_response_cap``。
+    """
+    return _houdini_call("move_node", {
+        "src_path": src_path, "dest_parent": dest_parent})
+
+
+@mcp.tool()
+def get_parameter(ctx, path, parameter):
+    """读取 parm 当前值/类型/表达式/时间依赖
+    （add-node-parameter-vex-tools，READ_ONLY）。
+
+    返回 ``{value, type, expression, is_time_dependent}``；无 expression
+    时 ``expression: None``。响应过 ``apply_response_cap``。
+    """
+    return _houdini_call("get_parameter", {
+        "path": path, "parameter": parameter})
+
+
+@mcp.tool()
+def set_parameter(ctx, path, parameter, value):
+    """写 parm 值（add-node-parameter-vex-tools，MUTATING）。
+
+    单 undo group；失败抛 error。响应过 ``apply_response_cap``。
+    """
+    return _houdini_call("set_parameter", {
+        "path": path, "parameter": parameter, "value": value})
+
+
+@mcp.tool()
+def get_expression(ctx, path, parameter):
+    """读取 parm 表达式（add-node-parameter-vex-tools，READ_ONLY）。
+
+    返回 ``{expression}``，空表达式时 ``expression: None``。响应过
+    ``apply_response_cap``。
+    """
+    return _houdini_call("get_expression", {
+        "path": path, "parameter": parameter})
+
+
+@mcp.tool()
+def revert_parameter(ctx, path, parameter):
+    """恢复 parm 至默认值（add-node-parameter-vex-tools，MUTATING）。
+
+    走 ``parm.revertToDefaults()``，单 undo group。响应过
+    ``apply_response_cap``。
+    """
+    return _houdini_call("revert_parameter", {
+        "path": path, "parameter": parameter})
+
+
+@mcp.tool()
+def link_parameters(ctx, source, target):
+    """建立 parm 之间的真实引用（add-node-parameter-vex-tools，MUTATING）。
+
+    使用 ``Parm.set(Parm)`` / ``setExpression()`` 建跨 parm 引用；
+    不用 channel alias 冒充。``source`` / ``target`` 形式
+    ``node_path.parm_name``。响应过 ``apply_response_cap``。
+    """
+    return _houdini_call("link_parameters", {
+        "source": source, "target": target})
+
+
+@mcp.tool()
+def lock_parameter(ctx, path, parameter, locked):
+    """切换 parm 锁定状态（add-node-parameter-vex-tools，MUTATING）。
+
+    ``locked`` 接受 bool；单 undo group。响应过 ``apply_response_cap``。
+    """
+    return _houdini_call("lock_parameter", {
+        "path": path, "parameter": parameter, "locked": locked})
+
+
+@mcp.tool()
+def create_spare_parameter(ctx, path, name, data_type, label=None,
+                            default=None, min_value=None, max_value=None,
+                            menu_items=None, menu_labels=None, folder=None,
+                            num_components=1):
+    """单项 spare 参数创建（add-node-parameter-vex-tools，MUTATING）。
+
+    通过 ``parmTemplateGroup()`` 复制 + 一次性
+    ``setParmTemplateGroup()`` 提交。``data_type`` 接受 ``float / int /
+    string / toggle / menu``。``folder`` 可选。响应过
+    ``apply_response_cap``。
+    """
+    params = {"path": path, "name": name, "data_type": data_type,
+              "num_components": num_components}
+    if label is not None:
+        params["label"] = label
+    if default is not None:
+        params["default"] = default
+    if min_value is not None:
+        params["min_value"] = min_value
+    if max_value is not None:
+        params["max_value"] = max_value
+    if menu_items is not None:
+        params["menu_items"] = menu_items
+    if menu_labels is not None:
+        params["menu_labels"] = menu_labels
+    if folder is not None:
+        params["folder"] = folder
+    return _houdini_call("create_spare_parameter", params)
+
+
+@mcp.tool()
+def create_spare_parameters(ctx, path, parameters, folder=None):
+    """批量 spare 参数创建（add-node-parameter-vex-tools，MUTATING）。
+
+    ``parameters`` 是 list of spec dict；先全量校验、失败零部分提交。
+    单次 ``setParmTemplateGroup()`` 完成。响应过 ``apply_response_cap``。
+    """
+    params = {"path": path, "parameters": parameters}
+    if folder is not None:
+        params["folder"] = folder
+    return _houdini_call("create_spare_parameters", params)
+
+
+@mcp.tool()
+def get_wrangle_code(ctx, path):
+    """读取 Attribute Wrangle SOP 的 snippet
+    （add-node-parameter-vex-tools，READ_ONLY）。
+
+    返回 ``{path, name, type, code}``。响应过 ``apply_response_cap``。
+    """
+    return _houdini_call("get_wrangle_code", {"path": path})
+
+
+@mcp.tool()
+def validate_vex(ctx, code, context="cvex"):
+    """用真实 HFS/bin/vcc 编译 VEX（add-node-parameter-vex-tools，NO_UNDO）。
+
+    临时 ``.vfl`` + ``subprocess.run([vcc, ...], shell=False, timeout=10)``；
+    不调用 Python exec / eval / compile / execute_code / hou.hscript /
+    hou.vexLint / hou.text.vexSyntaxCheck；不执行编译产物。10 秒超时、
+    输出 64KB 上限、finally 清理源与产物。返回
+    ``{valid, context, diagnostics: [{severity, line, column, message}]}``。
+    响应过 ``apply_response_cap``。
+    """
+    return _houdini_call("validate_vex", {
+        "code": code, "context": context})
+
+
+@mcp.tool()
+def create_vex_expression(ctx, parent_path, code, attrib_class="point",
+                           name=None):
+    """在 SOP parent 下创建 Attribute Wrangle
+    （add-node-parameter-vex-tools，MUTATING）。
+
+    设置 ``snippet`` 与 ``runover``（point / primitive / vertex / detail /
+    number）；单 undo group。父节点 category 非 Sop 时返回 error。响应过
+    ``apply_response_cap``。
+    """
+    params = {"parent_path": parent_path, "code": code,
+              "attrib_class": attrib_class}
+    if name is not None:
+        params["name"] = name
+    return _houdini_call("create_vex_expression", params)
+
+
+# -------------------------------------------------------------------
+# add-scene-context-selection-materials：9 个净新增 bridge tool。
+# 全部透传 server 端同名命令；不引入隐藏 override / 授权参数。
+# 三分类见 server.py：
+# - READ_ONLY：get_network_overview / get_cook_chain / explain_node /
+#   get_scene_summary / get_selection / list_materials /
+#   list_material_types
+# - MUTATING：create_material_network
+# - NO_UNDO：set_selection
+# 风格：与 PR 9 / HDA / geo 保持一致（无类型注解 + 中文 docstring）。
+# 放置在 PR 7 section header 之前以避免被 test_bridge_style PR 7 probe
+# 误识别（与 add-hda-management-tools / add-geometry-export-and-measure
+# / add-node-parameter-vex-tools 的放置策略保持一致）。
+# -------------------------------------------------------------------
+@mcp.tool()
+def get_network_overview(ctx, parent_path, max_depth=2, max_nodes=500):
+    """有界 BFS 遍历 parent 节点的网络拓扑（add-scene-context-selection-materials，READ_ONLY）。
+
+    ``max_depth`` 控制 BFS 深度（0 = 仅 parent_path），
+    ``max_nodes`` 限制 HOM 访问节点预算；返回 ``nodes / edges /
+    visited_count / truncated / truncation_reason``。节点去重
+    使用 path-based visited，环 / 共享祖先仅记一次。响应过 server
+    端 ``apply_response_cap``。
+    """
+    return _houdini_call("get_network_overview", {
+        "parent_path": parent_path,
+        "max_depth": max_depth,
+        "max_nodes": max_nodes,
+    })
+
+
+@mcp.tool()
+def get_cook_chain(ctx, node_path, max_depth=20, max_nodes=500):
+    """有界 DFS 上游 cook chain（add-scene-context-selection-materials，READ_ONLY）。
+
+    从 ``node_path`` 沿 ``inputs()`` 关系向上递归；path-based
+    visited 在入栈前判定，菱形 / 环自动去重。``max_nodes`` 是
+    HOM 访问预算硬约束；触发时 ``truncated=True``。响应过
+    server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("get_cook_chain", {
+        "node_path": node_path,
+        "max_depth": max_depth,
+        "max_nodes": max_nodes,
+    })
+
+
+@mcp.tool()
+def explain_node(ctx, node_path, include_params=False, max_params=64):
+    """单节点结构化摘要（add-scene-context-selection-materials，READ_ONLY）。
+
+    字段：``path / name / type / category / input_count /
+    output_count / inputs / outputs``；``include_params=True`` 时
+    附 ``non_default_parameters``（最多 ``max_params`` 条）。仅读
+    不修改场景。响应过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("explain_node", {
+        "node_path": node_path,
+        "include_params": include_params,
+        "max_params": max_params,
+    })
+
+
+@mcp.tool()
+def get_scene_summary(ctx, max_nodes=2000):
+    """全场景 category counts + 时间线（add-scene-context-selection-materials，READ_ONLY）。
+
+    ``max_nodes`` 控制 HOM 遍历预算；返回 ``total_nodes /
+    category_counts / frame / fps / start_frame / end_frame /
+    truncated / truncation_reason``。不返回完整节点列表，只聚合
+    category 分布。响应过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("get_scene_summary", {
+        "max_nodes": max_nodes,
+    })
+
+
+@mcp.tool()
+def get_selection(ctx):
+    """读取当前节点选择（add-scene-context-selection-materials，READ_ONLY）。
+
+    固定走 ``hou.selectedNodes()``，不接受 ``selectedItems()``；
+    因此不混入 network box / note / dot。返回 ``selected / count``，
+    每项 ``path / type / category``。响应过 server 端
+    ``apply_response_cap``。
+    """
+    return _houdini_call("get_selection", {})
+
+
+@mcp.tool()
+def set_selection(ctx, node_paths, clear_others=True):
+    """覆盖节点选择（add-scene-context-selection-materials，NO_UNDO）。
+
+    全量预校验 ``node_paths``，任一无效 → 0 部分改变；clear 仅
+    走当前 ``selectedNodes()`` 的 ``setSelected(False)``，**不**
+    调 ``clearAllSelected()`` 避免影响 box / note / dot。UI /
+    viewport 运行态写，**不**能由 HIP undo 恢复；该命令归
+    ``NO_UNDO_COMMANDS``，batch dispatcher 会在执行前关闭 undo
+    segment。响应过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("set_selection", {
+        "node_paths": node_paths,
+        "clear_others": clear_others,
+    })
+
+
+@mcp.tool()
+def list_materials(ctx, parent_path="/mat"):
+    """枚举 parent 下材质节点（add-scene-context-selection-materials，READ_ONLY）。
+
+    验证 parent 存在且 childTypeCategory 为 Sop（Houdini 21
+    真实材质节点归属）；每项 ``path / name / node_type / category``，
+    稳定按 path 排序。响应过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("list_materials", {
+        "parent_path": parent_path,
+    })
+
+
+@mcp.tool()
+def list_material_types(ctx, category="Vop"):
+    """枚举材质 category 下的 node types（add-scene-context-selection-materials，READ_ONLY）。
+
+    ``category`` 仅接受 ``Vop`` / ``Shop``；使用对应 category 的
+    ``nodeTypes()``，稳定排序返回 ``name / node_type / category /
+    description``，``node_type`` 走 ``nameWithCategory()`` 完整
+    类别名。未知 / 不支持 category 返 ``unsupported_category``。
+    响应过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("list_material_types", {
+        "category": category,
+    })
+
+
+@mcp.tool()
+def create_material_network(ctx, parent_path, name="mat"):
+    """在 parent 下创建 matnet（add-scene-context-selection-materials，MUTATING）。
+
+    验证 parent 存在、未锁定、childTypeCategory 为 Sop 后调
+    ``createNode("matnet", name)``；错误结构化区分
+    ``parent_not_found / parent_locked / unsupported_parent_
+    category / node_type_unavailable``。此 tool 归
+    ``MUTATING_COMMANDS``，server handler 通过
+    ``hou.undos.group`` 入 undo group。响应过 server 端
+    ``apply_response_cap``。
+    """
+    return _houdini_call("create_material_network", {
+        "parent_path": parent_path,
+        "name": name,
+    })
+
+
+# -------------------------------------------------------------------
 # PR 16 Connection Diagnostic Tools (placed before PR 15 / PR 7 sections
 # so existing test_bridge_style (PR 7) and test_help PR 15 probes — which
 # scan @mcp.tool() strictly after their own header lines — do not pick it
@@ -2865,7 +3480,6 @@ def get_material_info(ctx, material_path):
     .tiff / .rat / .tex）的 parm。
     """
     return _houdini_call("get_material_info", {"material_path": material_path})
-
 
 
 def main():

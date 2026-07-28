@@ -18,6 +18,36 @@ from . import _common as cmn
 
 
 # ---------------------------------------------------------------------------
+# add-scene-context-selection-materials: 材质发现与网络创建常量
+# ---------------------------------------------------------------------------
+# ``list_material_types`` 支持的完整 Houdini node type category 名。
+# 仅这两个 category 真正公开可作为材质节点（Vop = VEX Builder / Vop
+# 网络；Shop = 老式 SHOP 网络，向后兼容）。其它 category（Object / Sop
+# / Lop ...）不接受。
+SUPPORTED_MATERIAL_CATEGORIES = frozenset({"Vop", "Shop"})
+
+
+# ---------------------------------------------------------------------------
+# Section: 错误 envelope helper（与 _geo_measure / _hda / _selection 保持
+# 一致形状）
+# ---------------------------------------------------------------------------
+def _error(code, message, details=None):
+    """统一错误 envelope；``details`` 可为 None。"""
+    payload = {"status": "error", "error": {"code": code,
+                                            "message": message}}
+    if details is not None:
+        payload["error"]["details"] = details
+    return payload
+
+
+def _success(data):
+    payload = {"status": "success"}
+    for key, value in data.items():
+        payload[key] = value
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # PR 7: 50+ 参数白名单。覆盖 Principled Shader 主要参数 + 通用贴图相关字段
 # 实际节点类型只需包含其中子集，未含在白名单的 parm 一律不出现在
 # get_material_info 输出里 —— 保证响应体稳定。
@@ -492,3 +522,285 @@ def get_material_info(hou, material_path):
             })
 
     return info
+
+
+# ---------------------------------------------------------------------------
+# add-scene-context-selection-materials: 净新增 3 个材质工具
+# ---------------------------------------------------------------------------
+def list_material_types(hou, category="Vop"):
+    """枚举指定 category 下可作为材质节点的全部 type。
+
+    使用 ``hou.nodeTypeCategories()`` + ``category.nodeTypes()``，稳定
+    排序返回 ``{name, node_type, category, description}``。``node_type``
+    使用 ``nameWithCategory()`` 完整类别名。
+
+    未知 / 不支持 category → ``unsupported_category`` 错误。
+    """
+    if not isinstance(category, str) or not category.strip():
+        return _error("invalid_category",
+                       "category must be a non-empty string",
+                       {"field": "category", "value": category})
+    category_name = category.strip()
+    if category_name not in SUPPORTED_MATERIAL_CATEGORIES:
+        return _error("unsupported_category",
+                       "category %r is not a material category; supported: %s"
+                       % (category_name,
+                          sorted(SUPPORTED_MATERIAL_CATEGORIES)),
+                       {"field": "category", "value": category_name,
+                        "supported": sorted(SUPPORTED_MATERIAL_CATEGORIES)})
+    try:
+        categories = hou.nodeTypeCategories()
+    except Exception as error:
+        return _error("categories_lookup_failed",
+                       "hou.nodeTypeCategories() failed: %s" % error,
+                       {"exception": error.__class__.__name__})
+    cat_obj = categories.get(category_name)
+    if cat_obj is None:
+        return _error("unsupported_category",
+                       "category %r not present in this Houdini session"
+                       % category_name,
+                       {"field": "category", "value": category_name})
+    try:
+        node_types = cat_obj.nodeTypes()
+    except Exception as error:
+        return _error("node_types_lookup_failed",
+                       "nodeTypes() failed: %s" % error,
+                       {"field": "category", "value": category_name,
+                        "exception": error.__class__.__name__})
+    out = []
+    for full_name, nt in sorted(node_types.items(), key=lambda kv: kv[0]):
+        if nt is None:
+            continue
+        try:
+            nw = nt.nameWithCategory()
+        except Exception:
+            nw = full_name
+        try:
+            description = nt.description()
+        except Exception:
+            description = ""
+        # base name
+        if "/" in full_name:
+            _, _, base = full_name.partition("/")
+        else:
+            base = full_name
+        out.append({
+            "name": base,
+            "node_type": nw,
+            "category": category_name,
+            "description": description,
+        })
+    return _success({
+        "types": out,
+        "count": len(out),
+        "category": category_name,
+    })
+
+
+def list_materials(hou, parent_path="/mat"):
+    """枚举 ``parent_path`` 下的全部材质节点（基于 ``childTypeCategory``
+    派生）。
+
+    验证 parent 存在；其 child category 必须是可作为材质节点的 category
+    （``Sop`` + 经典 /mat 容器，Houdini 21.0 仍把材质节点放在 ``Sop``
+    category 下的 ``matnet`` / ``material`` 子网络）。每项返回
+    ``{path, name, node_type, category}``。
+    """
+    if not isinstance(parent_path, str) or not parent_path.strip():
+        return _error("invalid_parent_path",
+                       "parent_path must be a non-empty string",
+                       {"field": "parent_path"})
+    try:
+        parent = hou.node(parent_path)
+    except Exception as error:
+        return _error("parent_resolve_failed",
+                       "hou.node(%r) failed: %s" % (parent_path, error),
+                       {"field": "parent_path",
+                        "exception": error.__class__.__name__})
+    if parent is None:
+        return _error("parent_not_found",
+                       "no node at path %r" % parent_path,
+                       {"field": "parent_path", "value": parent_path})
+    # 验证 child category 支持材质节点：H21+ 真实情况是
+    # ``parent.childTypeCategory()`` 返回 ``Mat`` category（包含
+    # principledshader / material 等），也允许 ``Sop``（geometry
+    # 内嵌材质子网）或 ``Vop``（VEX 材质）。list_materials 不要求
+    # 必须是 matnet 容器，只要求该 category 存在。
+    try:
+        child_cat = parent.childTypeCategory()
+    except Exception:
+        child_cat = None
+    if child_cat is None:
+        return _error("unsupported_parent_category",
+                       "parent %r has no childTypeCategory" % parent_path,
+                       {"field": "parent_path", "value": parent_path})
+    try:
+        child_cat_name = child_cat.name()
+    except Exception:
+        child_cat_name = ""
+    if child_cat_name not in ("Mat", "Sop", "Vop", "Shop"):
+        return _error("unsupported_parent_category",
+                       "parent %r child category %r cannot host material "
+                       "nodes" % (parent_path, child_cat_name),
+                       {"field": "parent_path", "value": parent_path,
+                        "child_category": child_cat_name})
+    try:
+        children = parent.children() or []
+    except Exception as error:
+        return _error("children_list_failed",
+                       "parent.children() failed: %s" % error,
+                       {"field": "parent_path",
+                        "exception": error.__class__.__name__})
+    out = []
+    for child in children:
+        try:
+            path = child.path()
+        except Exception:
+            path = ""
+        try:
+            name = child.name()
+        except Exception:
+            name = ""
+        try:
+            type_name = child.type().name()
+        except Exception:
+            type_name = ""
+        try:
+            category = child.type().category().name()
+        except Exception:
+            category = ""
+        try:
+            nt = child.type().nameWithCategory()
+        except Exception:
+            nt = ""
+        out.append({
+            "path": path,
+            "name": name,
+            "node_type": nt or type_name,
+            "category": category,
+        })
+    out.sort(key=lambda entry: entry.get("path", ""))
+    return _success({
+        "materials": out,
+        "count": len(out),
+        "parent_path": parent_path,
+    })
+
+
+def create_material_network(hou, parent_path, name="mat"):
+    """在 parent 下创建 matnet（material 容器网络）。
+
+    - 验证 parent 存在、未锁定、``childTypeCategory`` 为 ``Sop``
+      （material 容器必须能在它下创建 matnet / material 节点）。
+    - 失败返回结构化 error：``parent_not_found`` / ``parent_locked`` /
+      ``unsupported_parent_category`` / ``node_type_unavailable``。
+
+    Args:
+        hou: hou 参数注入
+        parent_path: 父容器路径（通常为 ``/mat`` 或 ``/obj`` 下的 geo）
+        name: 网络名（默认 ``"mat"``）
+
+    Returns:
+        dict: ``{"status": "success", "path", "type", "name"}``。
+    """
+    if not isinstance(parent_path, str) or not parent_path.strip():
+        return _error("invalid_parent_path",
+                       "parent_path must be a non-empty string",
+                       {"field": "parent_path"})
+    if not isinstance(name, str) or not name.strip():
+        return _error("invalid_name",
+                       "name must be a non-empty string",
+                       {"field": "name"})
+    network_name = name.strip()
+
+    try:
+        parent = hou.node(parent_path)
+    except Exception as error:
+        return _error("parent_resolve_failed",
+                       "hou.node(%r) failed: %s" % (parent_path, error),
+                       {"field": "parent_path",
+                        "exception": error.__class__.__name__})
+    if parent is None:
+        return _error("parent_not_found",
+                       "no node at path %r" % parent_path,
+                       {"field": "parent_path", "value": parent_path})
+
+    # 锁定检测：Houdini node 暴露 ``isLocked()`` / ``isEditable()``；
+    # 任一存在且返回 True 即视为锁定。
+    locked = False
+    is_locked_attr = getattr(parent, "isLocked", None)
+    if callable(is_locked_attr):
+        try:
+            locked = bool(is_locked_attr())
+        except Exception:
+            locked = False
+    else:
+        is_editable_attr = getattr(parent, "isEditable", None)
+        if callable(is_editable_attr):
+            try:
+                locked = not bool(is_editable_attr())
+            except Exception:
+                locked = False
+    if locked:
+        return _error("parent_locked",
+                       "parent %r is locked" % parent_path,
+                       {"field": "parent_path", "value": parent_path})
+
+    # 验证 childTypeCategory 是合法材质容器：H21 真实情况是
+    # /mat 的 childTypeCategory 是 Vop / Mat，/obj matnet 的也是
+    # Vop / Mat；Vop / Mat / Sop / Shop 任一都可作为材质网络父。
+    try:
+        child_cat = parent.childTypeCategory()
+    except Exception as error:
+        return _error("unsupported_parent_category",
+                       "parent %r childTypeCategory() failed: %s"
+                       % (parent_path, error),
+                       {"field": "parent_path",
+                        "exception": error.__class__.__name__})
+    if child_cat is None:
+        return _error("unsupported_parent_category",
+                       "parent %r has no childTypeCategory" % parent_path,
+                       {"field": "parent_path", "value": parent_path})
+    try:
+        child_cat_name = child_cat.name()
+    except Exception:
+        child_cat_name = ""
+    if child_cat_name not in ("Mat", "Sop", "Vop", "Shop", "Object"):
+        return _error("unsupported_parent_category",
+                       "parent %r child category %r cannot host matnet"
+                       % (parent_path, child_cat_name),
+                       {"field": "parent_path", "value": parent_path,
+                        "child_category": child_cat_name})
+
+    # H21 真实情况：``matnet`` 是 namespace-less 节点（Houdini
+    # 内置容器节点），不在 ``hou.nodeTypeCategories()`` 任何 category
+    # 的 ``nodeTypes()`` 内，但 ``parent.createNode("matnet", ...)``
+    # 直接调用可以成功。因此我们跳过 ``nodeTypes()`` 预检查，
+    # 直接尝试 createNode；失败时返回 ``node_type_unavailable``。
+    try:
+        new_node = parent.createNode("matnet", network_name)
+    except Exception as error:
+        # hou.OperationFailed 包含 "Invalid node type name" 提示
+        return _error("node_type_unavailable",
+                       "createNode('matnet', %r) failed in parent %r: %s"
+                       % (network_name, parent_path, error),
+                       {"field": "name", "value": network_name,
+                        "exception": error.__class__.__name__})
+
+    try:
+        new_path = new_node.path()
+    except Exception:
+        new_path = ""
+    try:
+        type_name = new_node.type().name()
+    except Exception:
+        type_name = "matnet"
+    try:
+        actual_name = new_node.name()
+    except Exception:
+        actual_name = network_name
+    return _success({
+        "path": new_path,
+        "type": type_name,
+        "name": actual_name,
+    })

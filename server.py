@@ -49,6 +49,10 @@ from . import _events as evs
 from . import _animation as anim
 from . import _render_jobs as _rjobs
 from . import _render_settings as _rset
+from . import _hda as _hda
+from . import _geo_measure as gme
+from . import _parameters as parm
+from . import _selection as sel
 
 RENDER_POLICY_COMMANDS = getattr(_rp, "RENDER_POLICY_COMMANDS", {})
 register_render_policy_command = getattr(
@@ -183,6 +187,33 @@ class HoudiniMCPServer:
         "set_expression",
         # C9: 受限可撤销 ROP 写入（白名单内 parm / 受限创建）。
         "set_render_settings", "create_render_node",
+        # add-hda-management-tools: 3 个 HDA 写入（场景内 / 定义内
+        # 可撤销）— 创建 / 从实例更新 / Help+IconSVG 写入。
+        "hda_create", "update_hda", "set_hda_section_content",
+        # add-geometry-export-and-measure: 创建 Attribute Create SOP
+        # （detail 属性），单 undo group；set_detail_attrib 是本 change
+        # 唯一进入 MUTATING 的命令。
+        "set_detail_attrib",
+        # add-node-parameter-vex-tools: 10 个场景写命令。
+        # 节点操作：rename_node / copy_node / move_node（hou.copyNodesTo /
+        # hou.moveNodesTo 单调用 = 单 undo group）。
+        # 参数操作：set_parameter / revert_parameter / lock_parameter
+        # （Parm 通道持久写）。
+        # 引用：link_parameters（Parm.set(Parm) 真实引用）。
+        # spare：create_spare_parameter / create_spare_parameters（PTG
+        # 单次提交；批量先全量校验、失败零部分提交）。
+        # VEX：create_vex_expression（attribwrangle 创建 + run-over
+        #   + snippet 写入，单 undo group）。
+        "rename_node", "copy_node", "move_node",
+        "set_parameter", "revert_parameter", "link_parameters",
+        "lock_parameter",
+        "create_spare_parameter", "create_spare_parameters",
+        "create_vex_expression",
+        # add-scene-context-selection-materials: 1 个 MUTATING。
+        # create_material_network 在 parent 下创建 matnet（material 容
+        # 器），属场景写可由 Houdini undo 恢复。其余 8 个工具在
+        # READ_ONLY / NO_UNDO_COMMANDS 中固化。
+        "create_material_network",
         # R10: capture_pane_screenshot, capture_multiple_panes and
         # render_node_network are intentionally classified in NO_UNDO_COMMANDS.
     })
@@ -200,6 +231,24 @@ class HoudiniMCPServer:
         "get_frame", "get_keyframes",
         # C9: ROP 枚举 / 白名单 parm 读取，只查询不写。
         "list_render_nodes", "get_render_settings",
+        # add-hda-management-tools: 4 个 HDA 只读工具 — 枚举 / 检视 /
+        # section metadata / section 正文只读。
+        "hda_list", "hda_get",
+        "get_hda_sections", "get_hda_section_content",
+        # add-node-parameter-vex-tools: 3 个只读命令 — 参数读取 /
+        # 表达式读取 / wrangle snippet 读取。不修改场景、参数或
+        # 外部资源。
+        "get_parameter", "get_expression", "get_wrangle_code",
+        # add-scene-context-selection-materials: 6 个只读场景 / 材质
+        # 工具 — overview / cook chain / explain / scene summary / 材
+        # 质列表 / 材质类型枚举。只查询节点拓扑、参数摘要或类型
+        # registry，不执行 cook、不写入场景。
+        "get_network_overview", "get_cook_chain", "explain_node",
+        "get_scene_summary", "list_materials", "list_material_types",
+        # add-scene-context-selection-materials: get_selection 读取
+        # hou.selectedNodes()，只查询不写，归 READ_ONLY_COMMANDS。
+        # set_selection 写 UI/viewport 运行态，归 NO_UNDO_COMMANDS。
+        "get_selection",
     })
 
     NO_UNDO_COMMANDS = frozenset({
@@ -218,6 +267,29 @@ class HoudiniMCPServer:
         # C9: 同步 render + 落盘副作用 + OS 进程启动都不由 HIP undo
         # 恢复，必须 no-undo。
         "start_render",
+        # add-hda-management-tools: 3 个 HDA 全局库副作用 — install /
+        # uninstall / reload 改变 Houdini 全局 HDA registry / 磁盘文件
+        # 状态，不能由 HIP undo 恢复，必须 no-undo 且不得同时进入
+        # MUTATING_COMMANDS。
+        "hda_install", "uninstall_hda", "reload_hda",
+        # add-geometry-export-and-measure: 7 个命令进入 NO_UNDO。
+        # geo_export 是 no-undo 外部文件系统 mutation；
+        # 其余 6 个查询访问 cooked Geometry，可能触发 SOP cook/运行
+        # 态缓存，**不**进 MUTATING（避免 MUT + NO_UNDO 双归属）。
+        "geo_export",
+        "get_bounding_box", "get_groups", "get_group_members",
+        "get_attrib_values", "get_prim_intrinsics",
+        "find_nearest_point",
+        # add-node-parameter-vex-tools: validate_vex 临时写 .vfl + 启动
+        # vcc subprocess + 落盘产物，**不**修改场景，但有外部副作用。
+        # 不得归 read-only（会让缓存层误以为可重入），不得归 MUTATING
+        # （避免被 hou.undos.group 收纳），必须 NO_UNDO。
+        "validate_vex",
+        # add-scene-context-selection-materials: set_selection 修改
+        # Houdini UI / viewport 选择运行态，**不**能由 HIP undo 恢复，
+        # 且节点选择是 UI 级副作用，**不**进 MUTATING。get_selection
+        # 仍属只读，归 READ_ONLY_COMMANDS。
+        "set_selection",
     })
 
     OPTIONAL_ASSET_COMMANDS = frozenset({
@@ -529,6 +601,77 @@ class HoudiniMCPServer:
         "set_render_settings": self.handle_set_render_settings,
         "create_render_node": self.handle_create_render_node,
         "start_render": self.handle_start_render,
+        # add-hda-management-tools：10 个 HDA/OTL handler。
+        # 三分类见 MUTATING_COMMANDS / READ_ONLY_COMMANDS /
+        # NO_UNDO_COMMANDS；唯一穷尽互斥断言见
+        # _validate_handler_classification。统一走 _hda 模块
+        # （hou 注入）+ apply_response_cap。
+        "hda_list": self.handle_hda_list,
+        "hda_get": self.handle_hda_get,
+        "hda_install": self.handle_hda_install,
+        "hda_create": self.handle_hda_create,
+        "uninstall_hda": self.handle_uninstall_hda,
+        "reload_hda": self.handle_reload_hda,
+        "update_hda": self.handle_update_hda,
+        "get_hda_sections": self.handle_get_hda_sections,
+        "get_hda_section_content": self.handle_get_hda_section_content,
+        "set_hda_section_content": self.handle_set_hda_section_content,
+        # add-geometry-export-and-measure：8 个几何测量/导出 handler。
+        # 三分类见上方 MUTATING / NO_UNDO 注释：1 MUTATING
+        # （set_detail_attrib）+ 7 NO_UNDO；唯一穷尽互斥断言见
+        # _validate_handler_classification。统一走 _geo_measure
+        # （hou 注入）+ apply_response_cap。
+        "get_bounding_box": self.handle_get_bounding_box,
+        "get_groups": self.handle_get_groups,
+        "get_group_members": self.handle_get_group_members,
+        "get_attrib_values": self.handle_get_attrib_values,
+        "get_prim_intrinsics": self.handle_get_prim_intrinsics,
+        "find_nearest_point": self.handle_find_nearest_point,
+        "set_detail_attrib": self.handle_set_detail_attrib,
+        "geo_export": self.handle_geo_export,
+        # add-node-parameter-vex-tools：14 个新 handler（旧 modify_node
+        # 原地扩展 flags，不重复注册）。
+        # 三分类：
+        # - READ_ONLY：get_parameter / get_expression / get_wrangle_code
+        # - NO_UNDO：validate_vex（临时 .vfl + vcc subprocess）
+        # - MUTATING：rename_node / copy_node / move_node /
+        #   set_parameter / revert_parameter / link_parameters /
+        #   lock_parameter / create_spare_parameter /
+        #   create_spare_parameters / create_vex_expression
+        # 唯一穷尽互斥断言见 _validate_handler_classification。统一走
+        # _graph_edit / _parameters（hou 注入）+ apply_response_cap。
+        "rename_node": self.handle_rename_node,
+        "copy_node": self.handle_copy_node,
+        "move_node": self.handle_move_node,
+        "get_parameter": self.handle_get_parameter,
+        "set_parameter": self.handle_set_parameter,
+        "get_expression": self.handle_get_expression,
+        "revert_parameter": self.handle_revert_parameter,
+        "link_parameters": self.handle_link_parameters,
+        "lock_parameter": self.handle_lock_parameter,
+        "create_spare_parameter": self.handle_create_spare_parameter,
+        "create_spare_parameters": self.handle_create_spare_parameters,
+        "get_wrangle_code": self.handle_get_wrangle_code,
+        "validate_vex": self.handle_validate_vex,
+        "create_vex_expression": self.handle_create_vex_expression,
+        # add-scene-context-selection-materials：9 个净新增 handler。
+        # 4 场景（get_network_overview / get_cook_chain / explain_node
+        # / get_scene_summary）走 _scene + apply_response_cap，归
+        # READ_ONLY_COMMANDS；2 选择（get_selection / set_selection）走
+        # _selection + apply_response_cap，set_selection 归
+        # NO_UNDO_COMMANDS；3 材质（list_materials / list_material_types
+        # / create_material_network）走 _materials + apply_response_cap，
+        # create_material_network 归 MUTATING_COMMANDS、其余两个归
+        # READ_ONLY_COMMANDS。
+        "get_network_overview": self.handle_get_network_overview,
+        "get_cook_chain": self.handle_get_cook_chain,
+        "explain_node": self.handle_explain_node,
+        "get_scene_summary": self.handle_get_scene_summary,
+        "get_selection": self.handle_get_selection,
+        "set_selection": self.handle_set_selection,
+        "list_materials": self.handle_list_materials,
+        "list_material_types": self.handle_list_material_types,
+        "create_material_network": self.handle_create_material_network,
     }
 
         if getattr(getattr(hou, "session", None),
@@ -976,32 +1119,55 @@ class HoudiniMCPServer:
         except Exception as e:
             raise Exception(f"Failed to create node: {str(e)}")
 
-    def modify_node(self, path, parameters=None, position=None, name=None):
-        """Modifies an existing node."""
+    def modify_node(self, path, parameters=None, position=None, name=None,
+                    flags=None):
+        """Modifies an existing node.
+
+        add-node-parameter-vex-tools (D1) 扩展：仅在末尾追加可选
+        ``flags=None``，保持旧字段与旧行为不变。``flags`` 接受白名单
+        dict（display / render / bypass / selectable / template）；未传
+        flags 时与 change 前完全一致。flags / parameters / position / name
+        共用一个 undo group（modify_node 本身归 MUTATING_COMMANDS，由
+        ``_undo_group`` 上下文管理）。
+        """
         node = hou.node(path)
         if not node:
             raise ValueError(f"Node not found: {path}")
-        
+
         changes = []
         old_name = node.name()
-        
+
         if name and name != old_name:
             node.setName(name)
             changes.append(f"Renamed from {old_name} to {name}")
-        
+
         if position and len(position) >= 2:
             node.setPosition([position[0], position[1]])
             changes.append(f"Position set to {position}")
-        
+
         if parameters:
             for p_name, p_val in parameters.items():
-                parm = node.parm(p_name)
-                if parm:
-                    old_val = parm.eval()
-                    parm.set(p_val)
+                p = node.parm(p_name)
+                if p:
+                    old_val = p.eval()
+                    p.set(p_val)
                     changes.append(f"Parameter {p_name} changed from {old_val} to {p_val}")
-        
-        return {"path": node.path(), "changes": changes}
+
+        applied_flags = {}
+        unsupported_flags = []
+        if flags is not None:
+            parm._validate_flag_keys(flags)
+            applied_flags, unsupported_flags = parm._flag_helper(hou, node, flags)
+            if applied_flags:
+                changes.append("Flags applied: {0}".format(applied_flags))
+            if unsupported_flags:
+                changes.append("Flags unsupported: {0}".format(unsupported_flags))
+
+        result = {"path": node.path(), "changes": changes}
+        if flags is not None:
+            result["flags_applied"] = applied_flags
+            result["flags_unsupported"] = unsupported_flags
+        return result
 
     def delete_node(self, path):
         """Deletes a node from the scene."""
@@ -2400,6 +2566,277 @@ class HoudiniMCPServer:
             consent_token=consent_token)
 
     # -------------------------------------------------------------------------
+    # add-hda-management-tools：10 个 HDA/OTL handler（薄封装
+    # ``_hda`` 模块 + apply_response_cap；section 写入 allowlist 与
+    # 装/卸/重载 no-undo 边界全部在模块层固化）
+    # -------------------------------------------------------------------------
+    def handle_hda_list(self, category=None):
+        """add-hda-management-tools：枚举已加载 HDA 并去重。
+
+        薄封装到 ``_hda.hda_list``；按 ``(libraryFilePath,
+        nameWithCategory())`` 去重。响应过 ``apply_response_cap``。
+        """
+        return _hda.hda_list(hou, category=category)
+
+    def handle_hda_get(self, node_type):
+        """add-hda-management-tools：读取 definition metadata。
+
+        薄封装到 ``_hda.hda_get``；不接受短名称。响应过
+        ``apply_response_cap``。
+        """
+        return _hda.hda_get(hou, node_type)
+
+    def handle_hda_install(self, file_path):
+        """add-hda-management-tools：安装 HDA 库（``hou.hda.installFile``）。
+
+        落盘 + 全局 HDA registry 副作用，**不**可由 Houdini undo 恢复
+        （NO_UNDO_COMMANDS）。响应过 ``apply_response_cap``。
+        """
+        return _hda.hda_install(hou, file_path)
+
+    def handle_hda_create(self, node_path, name, save_path, label=None):
+        """add-hda-management-tools：从节点创建 HDA。
+
+        薄封装到 ``_hda.hda_create``；先 ``canCreateDigitalAsset()``，
+        再 ``createDigitalAsset(name=, hda_file_name=,
+        description=)``。响应过 ``apply_response_cap``。
+        """
+        return _hda.hda_create(hou, node_path, name, save_path,
+                                label=label)
+
+    def handle_uninstall_hda(self, file_path):
+        """add-hda-management-tools：卸载 HDA 库（NO_UNDO_COMMANDS）。
+
+        薄封装到 ``_hda.uninstall_hda``；落盘 + registry 副作用。
+        """
+        return _hda.uninstall_hda(hou, file_path)
+
+    def handle_reload_hda(self, file_path):
+        """add-hda-management-tools：重载 HDA 库（NO_UNDO_COMMANDS）。
+
+        薄封装到 ``_hda.reload_hda``。
+        """
+        return _hda.reload_hda(hou, file_path)
+
+    def handle_update_hda(self, node_path):
+        """add-hda-management-tools：从实例更新定义。
+
+        薄封装到 ``_hda.update_hda``；调 ``definition.updateFromNode``，
+        **不**使用 ``definition.save()``。响应过 ``apply_response_cap``。
+        """
+        return _hda.update_hda(hou, node_path)
+
+    def handle_get_hda_sections(self, node_type):
+        """add-hda-management-tools：枚举 sections metadata。
+
+        薄封装到 ``_hda.get_hda_sections``；``utf8`` 严格探测，
+        ``binary`` 固定 true。响应过 ``apply_response_cap``。
+        """
+        return _hda.get_hda_sections(hou, node_type)
+
+    def handle_get_hda_section_content(self, node_type, section,
+                                        encoding, offset=0, limit=8192):
+        """add-hda-management-tools：分页读取 section 正文。
+
+        薄封装到 ``_hda.get_hda_section_content``；强制显式
+        ``encoding="utf8"|"base64"``，双模式均以
+        ``binaryContents()`` 原始 bytes 为唯一分页真相。响应过
+        ``apply_response_cap``。
+        """
+        return _hda.get_hda_section_content(
+            hou, node_type, section, encoding, offset=offset, limit=limit)
+
+    def handle_set_hda_section_content(self, node_type, section, content):
+        """add-hda-management-tools：allowlist 写入 section。
+
+        薄封装到 ``_hda.set_hda_section_content``；仅 ``Help`` /
+        ``IconSVG`` 大小写敏感精确匹配允许；UTF-8 入站字节上限
+        65536。响应过 ``apply_response_cap``。
+        """
+        return _hda.set_hda_section_content(
+            hou, node_type, section, content)
+
+    # -------------------------------------------------------------------------
+    # add-geometry-export-and-measure：8 个几何测量/导出 handler
+    # （薄封装 ``_geo_measure`` 模块 + apply_response_cap；分类硬约束
+    # 在 MUTATING_COMMANDS / NO_UNDO_COMMANDS 中固化，handler 仅透传）
+    # -------------------------------------------------------------------------
+    def handle_get_bounding_box(self, node_path):
+        """add-geometry-export-and-measure：解包 6 元
+        ``(xmin,xmax,ymin,ymax,zmin,zmax)`` 为 ``{min,max,size,center}``。
+
+        薄封装到 ``_geo_measure.get_bounding_box``。响应过
+        ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(gme.get_bounding_box(hou, node_path))
+
+    def handle_get_groups(self, node_path):
+        """add-geometry-export-and-measure：四类 groups（point / prim /
+        vertex / edge）的 name 列表。
+
+        薄封装到 ``_geo_measure.get_groups``。响应过
+        ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(gme.get_groups(hou, node_path))
+
+    def handle_get_group_members(self, node_path, group_type, group_name,
+                                 offset=0, limit=1000):
+        """add-geometry-export-and-measure：分页 + vertex/edge 规范 schema。
+
+        薄封装到 ``_geo_measure.get_group_members``。响应过
+        ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(gme.get_group_members(
+            hou, node_path, group_type, group_name,
+            offset=offset, limit=limit))
+
+    def handle_get_attrib_values(self, node_path, attribute,
+                                 attrib_class="point", offset=0, limit=1000):
+        """add-geometry-export-and-measure：按 owner/storage/tuple-size
+        分派读取；原生分页。
+
+        薄封装到 ``_geo_measure.get_attrib_values``。响应过
+        ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(gme.get_attrib_values(
+            hou, node_path, attribute,
+            attrib_class=attrib_class, offset=offset, limit=limit))
+
+    def handle_get_prim_intrinsics(self, node_path, prim_index, names=None):
+        """add-geometry-export-and-measure：仅查询指定 prim 的 intrinsics。
+
+        薄封装到 ``_geo_measure.get_prim_intrinsics``；``prim_index``
+        越界返回结构化 error。响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(gme.get_prim_intrinsics(
+            hou, node_path, prim_index, names=names))
+
+    def handle_find_nearest_point(self, node_path, position,
+                                  max_distance=1.0):
+        """add-geometry-export-and-measure：Point / None 双路径。
+
+        薄封装到 ``_geo_measure.find_nearest_point``；None 时
+        ``point_index / point_position / distance`` 全部 null。响应过
+        ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(gme.find_nearest_point(
+            hou, node_path, position, max_distance=max_distance))
+
+    def handle_set_detail_attrib(self, node_path, name, value,
+                                 attrib_type="float", node_name=None):
+        """add-geometry-export-and-measure：创建 Attribute Create SOP，
+        class=detail；单 undo group。
+
+        薄封装到 ``_geo_measure.set_detail_attrib``；**不**调用 cooked
+        ``node.geometry()`` 写方法。响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(gme.set_detail_attrib(
+            hou, node_path, name, value,
+            attrib_type=attrib_type, node_name=node_name))
+
+    def handle_geo_export(self, node_path, format, output_path,
+                          overwrite=False):
+        """add-geometry-export-and-measure：translator registry + 原子覆盖。
+
+        薄封装到 ``_geo_measure.geo_export``；同目录临时文件 + fsync +
+        ``os.replace``；``overwrite=False`` 且目标存在返回
+        ``target_exists``。属于 no-undo 外部文件系统 mutation。响应过
+        ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(gme.geo_export(
+            hou, node_path, format, output_path, overwrite=overwrite))
+
+    # -------------------------------------------------------------------------
+    # add-node-parameter-vex-tools: 14 个新 handler（薄封装到 _graph_edit /
+    # _parameters，hou 注入 + apply_response_cap）。
+    # -------------------------------------------------------------------------
+    def handle_rename_node(self, path, new_name):
+        """rename_node：hou 重命名 + 同名预检。响应过 apply_response_cap。"""
+        return cmn.apply_response_cap(ge.rename_node(hou, path, new_name))
+
+    def handle_copy_node(self, src_path, dest_parent, name=None):
+        """copy_node：hou.copyNodesTo + category / 同名预检。"""
+        return cmn.apply_response_cap(
+            ge.copy_node(hou, src_path, dest_parent, name=name)
+        )
+
+    def handle_move_node(self, src_path, dest_parent):
+        """move_node：hou.moveNodesTo + category 预检。"""
+        return cmn.apply_response_cap(
+            ge.move_node(hou, src_path, dest_parent)
+        )
+
+    def handle_get_parameter(self, path, parameter):
+        """get_parameter：{value, type, expression, is_time_dependent}。"""
+        return cmn.apply_response_cap(
+            parm.get_parameter(hou, path, parameter)
+        )
+
+    def handle_set_parameter(self, path, parameter, value):
+        """set_parameter：单 Parm 写，单 undo group。"""
+        return cmn.apply_response_cap(
+            parm.set_parameter(hou, path, parameter, value)
+        )
+
+    def handle_get_expression(self, path, parameter):
+        """get_expression：返回 expression 或 None。"""
+        return cmn.apply_response_cap(
+            parm.get_expression(hou, path, parameter)
+        )
+
+    def handle_revert_parameter(self, path, parameter):
+        """revert_parameter：revertToDefaults。"""
+        return cmn.apply_response_cap(
+            parm.revert_parameter(hou, path, parameter)
+        )
+
+    def handle_link_parameters(self, source, target):
+        """link_parameters：Parm.set(Parm) 真实引用，不用 alias。"""
+        return cmn.apply_response_cap(
+            parm.link_parameters(hou, source, target)
+        )
+
+    def handle_lock_parameter(self, path, parameter, locked):
+        """lock_parameter：setLocked。"""
+        return cmn.apply_response_cap(
+            parm.lock_parameter(hou, path, parameter, locked)
+        )
+
+    def handle_create_spare_parameter(self, path, name, data_type, label=None,
+                                      default=None, min_value=None,
+                                      max_value=None, menu_items=None,
+                                      menu_labels=None, folder=None,
+                                      num_components=1):
+        """create_spare_parameter：PTG 单次提交。"""
+        return cmn.apply_response_cap(parm.create_spare_parameter(
+            hou, path, name, data_type, label=label, default=default,
+            min_value=min_value, max_value=max_value, menu_items=menu_items,
+            menu_labels=menu_labels, folder=folder,
+            num_components=num_components,
+        ))
+
+    def handle_create_spare_parameters(self, path, parameters, folder=None):
+        """create_spare_parameters：批量先全量校验、单次提交。"""
+        return cmn.apply_response_cap(
+            parm.create_spare_parameters(hou, path, parameters, folder=folder)
+        )
+
+    def handle_get_wrangle_code(self, path):
+        """get_wrangle_code：Attribute Wrangle snippet 只读。"""
+        return cmn.apply_response_cap(ge.get_wrangle_code(hou, path))
+
+    def handle_validate_vex(self, code, context="cvex"):
+        """validate_vex：vcc 编译，仅编译不执行；10s 超时；NO_UNDO。"""
+        return cmn.apply_response_cap(ge.validate_vex(hou, code, context=context))
+
+    def handle_create_vex_expression(self, parent_path, code,
+                                     attrib_class="point", name=None):
+        """create_vex_expression：SOP parent 下创建 attribwrangle 并配置。"""
+        return cmn.apply_response_cap(ge.create_vex_expression(
+            hou, parent_path, code, attrib_class=attrib_class, name=name,
+        ))
+
+    # -------------------------------------------------------------------------
     # Existing Placeholder asset library methods
     # -------------------------------------------------------------------------
     # -------------------------------------------------------------------------
@@ -2676,3 +3113,110 @@ class HoudiniMCPServer:
     def import_asset(self):
         """Placeholder for asset import logic."""
         return {"error": "import_asset not implemented"}
+
+    # -------------------------------------------------------------------------
+    # add-scene-context-selection-materials: 9 个净新增 handler
+    # （4 场景 + 2 选择 + 3 材质）。所有响应过 apply_response_cap
+    # 防御性二次封顶。三分类唯一穷尽互斥断言由 _validate_handler_
+    # classification 在 __init__ / _get_command_handlers 末尾统一执行；
+    # handler 实现只做透传，分类在 MUTATING_COMMANDS /
+    # READ_ONLY_COMMANDS / NO_UNDO_COMMANDS 三个 frozenset 中固化。
+    # -------------------------------------------------------------------------
+    def handle_get_network_overview(self, parent_path, max_depth=2,
+                                     max_nodes=500):
+        """add-scene-context-selection-materials：parent 节点 BFS 拓扑。
+
+        走 ``_scene.get_network_overview``；返回 ``nodes / edges /
+        visited_count / truncated / truncation_reason``。响应过
+        ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            scn.get_network_overview(hou, parent_path,
+                                     max_depth=max_depth,
+                                     max_nodes=max_nodes))
+
+    def handle_get_cook_chain(self, node_path, max_depth=20,
+                                max_nodes=500):
+        """add-scene-context-selection-materials：上游 cook chain。
+
+        走 ``_scene.get_cook_chain``；path-based visited 去重 + HOM
+        遍历预算截断。响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            scn.get_cook_chain(hou, node_path,
+                                max_depth=max_depth,
+                                max_nodes=max_nodes))
+
+    def handle_explain_node(self, node_path, include_params=False,
+                              max_params=64):
+        """add-scene-context-selection-materials：单节点结构化摘要。
+
+        走 ``_scene.explain_node``；可附 ``non_default_parameters``。
+        响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            scn.explain_node(hou, node_path,
+                              include_params=include_params,
+                              max_params=max_params))
+
+    def handle_get_scene_summary(self, max_nodes=2000):
+        """add-scene-context-selection-materials：全场景 category counts。
+
+        走 ``_scene.get_scene_summary``；不返回完整节点列表，只聚合
+        category 分布 + 时间线 + 截断 metadata。响应过
+        ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            scn.get_scene_summary(hou, max_nodes=max_nodes))
+
+    def handle_get_selection(self):
+        """add-scene-context-selection-materials：当前节点选择。
+
+        走 ``_selection.get_selection``；**仅**用 ``selectedNodes()``，
+        不读 box / note / dot。响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(sel.get_selection(hou))
+
+    def handle_set_selection(self, node_paths, clear_others=True):
+        """add-scene-context-selection-materials：覆盖节点选择。
+
+        走 ``_selection.set_selection``；全部预校验 + 零部分改变
+        + ``setSelected(False)`` 单调（不调 ``clearAllSelected()``）。
+        此 handler 归 ``NO_UNDO_COMMANDS``，**不**进 undo group
+        （HOUDINI 端无持久可恢复选择历史）。响应过
+        ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            sel.set_selection(hou, node_paths, clear_others=clear_others))
+
+    def handle_list_materials(self, parent_path="/mat"):
+        """add-scene-context-selection-materials：parent 下材质节点列表。
+
+        走 ``_materials.list_materials``；每项 ``path / name / node_type
+        / category``，稳定按 path 排序。响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            mats.list_materials(hou, parent_path=parent_path))
+
+    def handle_list_material_types(self, category="Vop"):
+        """add-scene-context-selection-materials：枚举材质 category 下
+        node types。
+
+        走 ``_materials.list_material_types``；``node_type`` 走
+        ``nameWithCategory()`` 完整名；未知 / 不支持 category 返
+        ``unsupported_category``。响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            mats.list_material_types(hou, category=category))
+
+    def handle_create_material_network(self, parent_path, name="mat"):
+        """add-scene-context-selection-materials：parent 下创建 matnet。
+
+        走 ``_materials.create_material_network``；错误结构化区分
+        ``parent_not_found / parent_locked / unsupported_parent_
+        category / node_type_unavailable``。此 handler 归
+        ``MUTATING_COMMANDS``，由 server `_undo_group` 上下文管理
+        入 hou.undos.group。响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            mats.create_material_network(hou, parent_path, name=name))
