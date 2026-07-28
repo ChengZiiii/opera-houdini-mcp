@@ -37,6 +37,7 @@ from typing import Dict, Any, List
 from contextlib import asynccontextmanager
 from mcp.server.fastmcp import FastMCP, Context
 import asyncio
+from urllib.parse import quote as _url_quote, unquote as _url_unquote
 
 # --- OPUS RapidAPI moved to optional _opus module ---
 # refactor-opus-optional-and-debt-cleanup：原 OPUS imports / setup
@@ -4259,6 +4260,364 @@ def get_material_info(ctx, material_path):
     .tiff / .rat / .tex）的 parm。
     """
     return _houdini_call("get_material_info", {"material_path": material_path})
+
+
+# -------------------------------------------------------------------
+# MCP Resources (add-mcp-resources, batch 6)
+# -------------------------------------------------------------------
+# 8 个 ``@mcp.resource`` URI 视图：MCP client 可按需 ``resources/read`` 拉取
+# 场景上下文；本 change 不宣称 client 启动时自动读取或注入。设计约束：
+# - 4 静态 + 4 模板，全部 ``mime_type="application/json"``；
+# - 每个 handler 返预序列化 JSON 字符串（让 FastMCP 直接写入
+#   ``TextResourceContents.text``，不依赖其 dict 二次缩进序列化）；
+# - 模板参数为可逆百分号编码的 Houdini 节点路径；解码后 canonical
+#   re-encode 不一致则 ``code="invalid_encoded_path"``；
+# - response envelope 经 ``cmn.apply_response_cap``，并以
+#   ``len(text.encode("utf-8")) <= 16384`` 收口，超限迭代缩短 cap 后
+#   payload 真实 list 并重算 matched/returned/truncated；
+# - C10 ``hda_list``、C17 ``lop_stage_info`` 是硬依赖；底层能力失败返
+#   ``code="backend_capability_error"`` 稳定 JSON envelope，异常不得
+#   逃逸到 MCP transport；
+# - 实现 MUST NOT patch / monkey-patch vendored FastMCP。
+
+
+_RESOURCE_MAX_BYTES = 16384
+_RESOURCE_JSON_SEP = (",", ":")
+
+
+def _encode_houdini_path(path):
+    """可逆百分号编码（safe="", strict UTF-8）。"""
+    return _url_quote(path, safe="", encoding="utf-8", errors="strict")
+
+
+def _decode_houdini_path(token):
+    """strict UTF-8 解码 + canonical re-encode 校验，非规范或非法 UTF-8
+    抛 ``ValueError``（resource layer 捕获后转 ``invalid_encoded_path``）。"""
+    decoded = _url_unquote(token, encoding="utf-8", errors="strict")
+    if _encode_houdini_path(decoded) != token:
+        raise ValueError("non-canonical encoded path token")
+    return decoded
+
+
+def _largest_list_path(payload, path=None):
+    """在 envelope/payload 树中找最大 list 的 (key_path, list_ref)。
+
+    优先级：顶层 list > 嵌套 dict 内 list > 不存在返回 (None, None)。
+    """
+    if path is None:
+        path = ()
+    best_key = None
+    best_list = None
+    best_len = 0
+    if isinstance(payload, list):
+        return path, payload
+    if not isinstance(payload, dict):
+        return None, None
+    for k, v in payload.items():
+        if isinstance(v, list) and len(v) > best_len:
+            best_key = k
+            best_list = v
+            best_len = len(v)
+    if best_key is not None:
+        return path + (best_key,), best_list
+    for k, v in payload.items():
+        if isinstance(v, dict):
+            sub_path, sub_list = _largest_list_path(v, path + (k,))
+            if sub_list is not None:
+                return sub_path, sub_list
+    return None, None
+
+
+def _count_list(payload, list_path):
+    """读取 envelope 树中 list_path 处的 list 长度；不存在为 0。"""
+    cur = payload
+    for key in list_path:
+        if not isinstance(cur, dict) or key not in cur:
+            return 0
+        cur = cur[key]
+    if isinstance(cur, list):
+        return len(cur)
+    return 0
+
+
+def _set_list(payload, list_path, new_list):
+    """在 envelope 树中替换 list_path 处的 list。"""
+    cur = payload
+    for key in list_path[:-1]:
+        if not isinstance(cur, dict) or key not in cur:
+            return
+        cur = cur[key]
+    if isinstance(cur, dict) and list_path and list_path[-1] in cur:
+        cur[list_path[-1]] = new_list
+
+
+def _serialize_deterministic(obj):
+    """确定性 JSON 序列化（ensure_ascii=False / sort_keys / 紧凑 / no NaN）。"""
+    return json.dumps(
+        obj,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=_RESOURCE_JSON_SEP,
+        allow_nan=False,
+    )
+
+
+def _resource_error(resource_name, code, message, dependency):
+    """构造稳定错误 envelope 并返回序列化字符串。"""
+    envelope = {
+        "status": "error",
+        "resource": resource_name,
+        "code": code,
+        "message": message,
+        "dependency": dependency,
+        "matched": 0,
+        "returned": 0,
+        "truncated": False,
+    }
+    return _serialize_deterministic(envelope)
+
+
+def _resource_envelope(resource_name, dependency, payload, matched):
+    """构造成功 envelope → 走 cap → 按 cap 后真实 list 长度算 returned →
+    16KB UTF-8 字节预算迭代缩减。始终返预序列化 str。"""
+    # 原始 payload 的最大 list 路径（用于决定是否走 list 计数分支）
+    orig_list_path, orig_list_ref = _largest_list_path(payload)
+    has_list = orig_list_ref is not None
+    envelope = {
+        "status": "success",
+        "resource": resource_name,
+        "dependency": dependency,
+        "matched": matched,
+        "returned": matched,
+        "truncated": False,
+        "data": payload,
+    }
+    # 首次强制走 apply_response_cap（不得绕过）
+    capped = cmn.apply_response_cap(envelope)
+    # 解析 cap 后真实 list 长度（cap 可能改路径 / 删字段 / 截空）
+    cap_list_path, cap_list_ref = _largest_list_path(capped)
+    cap_truncated = bool(capped.get("_truncated"))
+    if not has_list:
+        # 单对象：matched/returned 始终 1
+        capped["matched"] = matched
+        capped["returned"] = matched
+        capped["truncated"] = cap_truncated
+    elif cap_list_ref is not None:
+        real_len = len(cap_list_ref)
+        capped["matched"] = matched
+        capped["returned"] = real_len
+        capped["truncated"] = (real_len < matched) or cap_truncated
+    else:
+        # 原始有 list 但 cap 后 list 路径消失（被 cap 完全删除/整段 drop）
+        # 通过 cap 的 _truncated_count 推断 returned
+        truncated_count = capped.get("_truncated_count", 0) or 0
+        real_len = max(matched - truncated_count, 0)
+        capped["matched"] = matched
+        capped["returned"] = real_len
+        capped["truncated"] = (real_len < matched) or cap_truncated
+
+    text = _serialize_deterministic(capped)
+    # UTF-8 字节预算迭代缩减
+    if has_list and len(text.encode("utf-8")) > _RESOURCE_MAX_BYTES:
+        current_path, current_list = _largest_list_path(capped)
+        if current_path is not None:
+            original_list = len(current_list)
+            while (len(text.encode("utf-8")) > _RESOURCE_MAX_BYTES
+                   and original_list > 0):
+                original_list -= 1
+                _set_list(capped, current_path, [])
+                real_len = original_list
+                capped["matched"] = matched
+                capped["returned"] = real_len
+                capped["truncated"] = (real_len < matched) or bool(
+                    capped.get("_truncated"))
+                text = _serialize_deterministic(capped)
+    return text
+
+
+def _resource_response(resource_name, dependency_cmd, call_result):
+    """统一 resource 响应入口：call_result 来自 ``_houdini_call``，本身已
+    套 ``{status, ...}`` envelope；本层只负责套 resource envelope、cap、
+    序列化与字节预算。"""
+    if not isinstance(call_result, dict):
+        # 异常路径：_houdini_call 失败应返 dict；非 dict 直接 stable error
+        return _resource_error(
+            resource_name, "backend_capability_error",
+            "houdini call returned non-dict envelope", dependency_cmd,
+        )
+    if call_result.get("status") == "error":
+        message = str(call_result.get("message", ""))
+        return _resource_error(
+            resource_name, "backend_capability_error", message, dependency_cmd,
+        )
+    # 成功：取 ``result`` 字段（_houdini_call 约定）；若缺则按 list
+    if "result" in call_result:
+        payload = call_result["result"]
+    else:
+        payload = call_result
+    # 计算 matched = 顶层 list 长度 / 单对象 1
+    if isinstance(payload, list):
+        matched = len(payload)
+        # 把 list 包一层以走相同 envelope 结构
+        wrapped = {"items": payload}
+        text = _resource_envelope(resource_name, dependency_cmd, wrapped, matched)
+        return text
+    list_path, list_ref = _largest_list_path(payload)
+    if list_ref is None:
+        matched = 1
+    else:
+        matched = len(list_ref)
+    return _resource_envelope(resource_name, dependency_cmd, payload, matched)
+
+
+# --- mcp resources ---  # 8 个固定注册
+
+
+def _safe_resource_response(resource_name, dependency_cmd, call_fn):
+    """resource handler 顶层守卫：捕获 ``_houdini_call`` / codec / 其他任何
+    异常，统一转 stable error envelope，不得把异常转交到 MCP transport。"""
+    try:
+        result = call_fn()
+    except Exception as e:
+        return _resource_error(
+            resource_name, "backend_capability_error", str(e), dependency_cmd,
+        )
+    return _resource_response(resource_name, dependency_cmd, result)
+
+
+@mcp.resource(
+    "houdini://scene/info",
+    name="scene_info",
+    mime_type="application/json",
+)
+def scene_info_resource():
+    """场景基本信息（houdini_version / node_count / file_path / fps /
+    start_frame / end_frame 等）。relay 到既有 ``get_scene_info`` cmd。"""
+    return _safe_resource_response(
+        "scene_info", "get_scene_info",
+        lambda: _houdini_call("get_scene_info"),
+    )
+
+
+@mcp.resource(
+    "houdini://scene/tree",
+    name="scene_tree",
+    mime_type="application/json",
+)
+def scene_tree_resource():
+    """场景节点树序列化。relay 到既有 ``serialize_scene`` cmd。"""
+    return _safe_resource_response(
+        "scene_tree", "serialize_scene",
+        lambda: _houdini_call("serialize_scene"),
+    )
+
+
+@mcp.resource(
+    "houdini://errors",
+    name="errors",
+    mime_type="application/json",
+)
+def errors_resource():
+    """场景中包含 cook error / warning 的节点列表。relay 到既有
+    ``find_error_nodes`` cmd。"""
+    return _safe_resource_response(
+        "errors", "find_error_nodes",
+        lambda: _houdini_call("find_error_nodes"),
+    )
+
+
+@mcp.resource(
+    "houdini://hdas",
+    name="hdas",
+    mime_type="application/json",
+)
+def hdas_resource():
+    """已加载 HDA 列表（C10 硬依赖 ``hda_list``；底层能力失败返
+    ``code=backend_capability_error`` 稳定 JSON envelope，不跳过注册）。"""
+    return _safe_resource_response(
+        "hdas", "hda_list",
+        lambda: _houdini_call("hda_list"),
+    )
+
+
+@mcp.resource(
+    "houdini://scene/nodes/{encoded_path}",
+    name="scene_node",
+    mime_type="application/json",
+)
+def scene_node_resource(encoded_path: str):
+    """单节点详情，路径以可逆百分号编码。relay 到既有 ``get_node_info`` cmd。"""
+    try:
+        path = _decode_houdini_path(encoded_path)
+    except (ValueError, UnicodeError):
+        return _resource_error(
+            "scene_node", "invalid_encoded_path",
+            "encoded path token failed canonical round-trip",
+            "get_node_info",
+        )
+    return _safe_resource_response(
+        "scene_node", "get_node_info",
+        lambda: _houdini_call("get_node_info", {"path": path}),
+    )
+
+
+@mcp.resource(
+    "houdini://node-types/{context}",
+    name="node_types",
+    mime_type="application/json",
+)
+def node_types_resource(context: str):
+    """按 category 过滤的可用 node type 列表。relay 到既有
+    ``list_node_types`` cmd。"""
+    return _safe_resource_response(
+        "node_types", "list_node_types",
+        lambda: _houdini_call("list_node_types", {"category": context}),
+    )
+
+
+@mcp.resource(
+    "houdini://geometry/{encoded_node_path}/summary",
+    name="geometry_summary",
+    mime_type="application/json",
+)
+def geometry_summary_resource(encoded_node_path: str):
+    """节点几何摘要（点/面/属性计数 + bbox + cook 状态等）。路径以可逆
+    百分号编码。relay 到既有 ``get_geo_summary`` cmd。"""
+    try:
+        path = _decode_houdini_path(encoded_node_path)
+    except (ValueError, UnicodeError):
+        return _resource_error(
+            "geometry_summary", "invalid_encoded_path",
+            "encoded path token failed canonical round-trip",
+            "get_geo_summary",
+        )
+    return _safe_resource_response(
+        "geometry_summary", "get_geo_summary",
+        lambda: _houdini_call("get_geo_summary", {"node_path": path}),
+    )
+
+
+@mcp.resource(
+    "houdini://usd/{encoded_node_path}/stage",
+    name="usd_stage",
+    mime_type="application/json",
+)
+def usd_stage_resource(encoded_node_path: str):
+    """LOP 节点对应 USD stage 摘要（prim 统计 / composition / layers）。路径
+    以可逆百分号编码。C17 硬依赖 ``lop_stage_info``；底层能力失败返
+    ``code=backend_capability_error`` 稳定 JSON envelope。"""
+    try:
+        path = _decode_houdini_path(encoded_node_path)
+    except (ValueError, UnicodeError):
+        return _resource_error(
+            "usd_stage", "invalid_encoded_path",
+            "encoded path token failed canonical round-trip",
+            "lop_stage_info",
+        )
+    return _safe_resource_response(
+        "usd_stage", "lop_stage_info",
+        lambda: _houdini_call("lop_stage_info", {"lop_path": path}),
+    )
 
 
 def main():
