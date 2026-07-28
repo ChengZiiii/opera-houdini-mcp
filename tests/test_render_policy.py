@@ -714,11 +714,16 @@ class FourLayerEnforceRegressionTests(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_all_six_commands_registered_and_enforce(self):
-        """3.6：6 个 render command 全部注册并走 policy 校验。"""
+        """3.6：6 个 render command 全部注册并走 policy 校验。
+
+        C9 add-render-workflow-tools：start_render 加入同一
+        RENDER_POLICY_COMMANDS registry；其它六个不变。
+        """
         expected = {
             "render_single_view", "render_quad_view", "render_specific_camera",
             "render_viewport_base64", "render_quad_views_base64",
             "render_specific_camera_base64",
+            "start_render",
         }
         self.assertEqual(
             set(self.mod.RENDER_POLICY_COMMANDS.keys()), expected)

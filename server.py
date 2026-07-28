@@ -46,6 +46,9 @@ from . import _capture_paths as cap
 from . import _render_b64 as rb64
 from . import _help as hlp
 from . import _events as evs
+from . import _animation as anim
+from . import _render_jobs as _rjobs
+from . import _render_settings as _rset
 
 RENDER_POLICY_COMMANDS = getattr(_rp, "RENDER_POLICY_COMMANDS", {})
 register_render_policy_command = getattr(
@@ -170,6 +173,16 @@ class HoudiniMCPServer:
         "set_node_position", "set_node_color", "create_network_box",
         "create_wrangle", "set_wrangle_code", "create_material",
         "assign_material",
+        # PR 19: animation / frame / expression 数据写
+        # （set_keyframe / set_keyframes / delete_keyframe / set_expression
+        # 是参数通道持久写；set_frame_range / set_playback_range 是场景
+        # 状态写，均可 undo）。set_frame / playbar_control 是运行态时间线
+        # 写，在 NO_UNDO_COMMANDS 中，不进 undo group。
+        "set_frame_range", "set_playback_range",
+        "set_keyframe", "set_keyframes", "delete_keyframe",
+        "set_expression",
+        # C9: 受限可撤销 ROP 写入（白名单内 parm / 受限创建）。
+        "set_render_settings", "create_render_node",
         # R10: capture_pane_screenshot, capture_multiple_panes and
         # render_node_network are intentionally classified in NO_UNDO_COMMANDS.
     })
@@ -183,6 +196,10 @@ class HoudiniMCPServer:
         "get_material_info", "get_houdini_help", "verify_hou_api",
         "check_connection", "ping_houdini", "get_asset_categories",
         "search_assets",
+        # PR 19: 帧 / 关键帧状态读取，不修改场景或参数
+        "get_frame", "get_keyframes",
+        # C9: ROP 枚举 / 白名单 parm 读取，只查询不写。
+        "list_render_nodes", "get_render_settings",
     })
 
     NO_UNDO_COMMANDS = frozenset({
@@ -194,6 +211,13 @@ class HoudiniMCPServer:
         "render_viewport_base64", "render_quad_views_base64",
         "render_specific_camera_base64",
         "get_pending_events", "subscribe_events", "unsubscribe_events",
+        # PR 19: 运行态时间线写 — 帧和播放控制不产生可撤销场景编辑。
+        # batch dispatcher 在 NO_UNDO 命令前关闭 undo segment，确保这些
+        # 命令永远不在 hou.undos.group 中执行。
+        "set_frame", "playbar_control",
+        # C9: 同步 render + 落盘副作用 + OS 进程启动都不由 HIP undo
+        # 恢复，必须 no-undo。
+        "start_render",
     })
 
     OPTIONAL_ASSET_COMMANDS = frozenset({
@@ -482,7 +506,30 @@ class HoudiniMCPServer:
             "subscribe_events": self.subscribe_events,
             "unsubscribe_events": self.unsubscribe_events,
             "batch": self.batch,
-        }
+# PR 19: 动画与帧控制（10 个 handler；分类见
+        # MUTATING_COMMANDS / READ_ONLY_COMMANDS / NO_UNDO_COMMANDS。
+        # 全部走 _animation 模块 + apply_response_cap）。
+        "get_frame": self.get_frame,
+        "set_frame": self.set_frame,
+        "set_frame_range": self.set_frame_range,
+        "set_playback_range": self.set_playback_range,
+        "set_keyframe": self.set_keyframe,
+        "set_keyframes": self.set_keyframes,
+        "delete_keyframe": self.delete_keyframe,
+        "get_keyframes": self.get_keyframes,
+        "playbar_control": self.playbar_control,
+        "set_expression": self.set_expression,
+        # C9 add-render-workflow-tools：5 个 ROP 设置 / 渲染 handler。
+        # 三分类见 MUTATING_COMMANDS / READ_ONLY_COMMANDS /
+        # NO_UNDO_COMMANDS；start_render 加入共享 RENDER_POLICY_COMMANDS
+        # registry（bridge Layer 1 / server Layer 2 / _render_jobs
+        # Layer 3 / _render_node_sync Layer 4 同源 policy helper）。
+        "list_render_nodes": self.handle_list_render_nodes,
+        "get_render_settings": self.handle_get_render_settings,
+        "set_render_settings": self.handle_set_render_settings,
+        "create_render_node": self.handle_create_render_node,
+        "start_render": self.handle_start_render,
+    }
 
         if getattr(getattr(hou, "session", None),
                    "houdinimcp_use_assetlib", False):
@@ -2275,6 +2322,84 @@ class HoudiniMCPServer:
         return cmn.apply_response_cap(result)
 
     # -------------------------------------------------------------------------
+    # C9 add-render-workflow-tools：5 个 ROP handler（薄封装 _render_settings
+    # / _render_jobs + apply_response_cap；start_render 在 server 这一层
+    # 重复 Layer 2 校验，再交给 _render_jobs 的 Layer 3 / Layer 4）
+    # -------------------------------------------------------------------------
+    def handle_list_render_nodes(self, parent_path="/out"):
+        """C9：枚举 parent_path 下可分类 ROP 节点（ifd / opengl / karmarender）。
+
+        薄封装到 _render_settings.list_render_nodes；响应过
+        apply_response_cap。
+        """
+        return _rset.list_render_nodes(hou, parent_path=parent_path)
+
+    def handle_get_render_settings(self, node_path):
+        """C9：读取 node_path 白名单 parm 值。
+
+        薄封装到 _render_settings.get_render_settings；未知 ROP
+        type 整体 error。响应过 apply_response_cap。
+        """
+        return _rset.get_render_settings(hou, node_path)
+
+    def handle_set_render_settings(self, node_path, parameters):
+        """C9：受限可撤销写入（design.md §"set_render_settings"）。
+
+        薄封装到 _render_settings.set_render_settings；完整预校
+        验 + 快照 + 显式恢复契约（render_settings_apply_failed /
+        render_settings_restore_failed）由模块负责。响应过
+        apply_response_cap。
+        """
+        return _rset.set_render_settings(
+            hou, node_path, parameters)
+
+    def handle_create_render_node(self, node_type, parent_path="/out",
+                                  name=None, parameters=None):
+        """C9：受限创建可分类 ROP 节点（ifd / opengl / karmarender）。
+
+        薄封装到 _render_settings.create_render_node；创建后通过
+        同一白名单设置参数并校验 renderer 可识别。未知 node type
+        整体 error。响应过 apply_response_cap。
+        """
+        return _rset.create_render_node(
+            hou, node_type, parent_path=parent_path, name=name,
+            parameters=parameters)
+
+    def handle_start_render(self, node_path, frame_range=None,
+                            consent_token=None):
+        """C9：同步启动 ROP 渲染（design.md §"start_render 四层防御"）。
+
+        入口为 server Layer 2：从真实 node 重新推断 policy renderer，
+        不信任 bridge 传入值（bridge 提供的 ``policy_renderer`` 仅
+        Layer 1 用，server handler 已在 bridge batch preflight 中
+        阻挡，无效的 bridge 提示根本不会到这里）。Layer 3-4 由
+        ``_render_jobs.start_render`` 内部再次校验。任何 redirect /
+        interrupt / error 立即 return，**不**调 ``node.render()``。
+
+        响应过 apply_response_cap。同步阻塞到 render 完成 / 失败 /
+        中断；不签发 progress handle。
+        """
+        # Layer 2：从真实 node 独立 infer + policy；client 给的 hint
+        # 由 bridge Layer 1 处理，这里不接受。
+        resolved = _rset._resolve_rop_node(hou, node_path)
+        if resolved.get("status") == "error":
+            return cmn.apply_response_cap(resolved)
+        node = resolved["node"]
+        type_name = resolved["type"]
+        renderer = _rset._resolve_policy_renderer(node, type_name)
+        decision, payload = _rp._enforce_render_policy_layer(
+            renderer, consent_token)
+        if decision == "redirect":
+            return cmn.apply_response_cap(payload)
+        if decision == "interrupt":
+            return cmn.apply_response_cap(payload)
+        if decision == "error":
+            return cmn.apply_response_cap(payload)
+        return _rjobs.start_render(
+            hou, node_path, frame_range=frame_range,
+            consent_token=consent_token)
+
+    # -------------------------------------------------------------------------
     # Existing Placeholder asset library methods
     # -------------------------------------------------------------------------
     # -------------------------------------------------------------------------
@@ -2331,6 +2456,135 @@ class HoudiniMCPServer:
             help_type, item_name, timeout=timeout)
         result["_ai_hint"] = _synthesize_ai_hint(item_name, result)
         return cmn.apply_response_cap(result)
+
+    # -------------------------------------------------------------------------
+    # PR 19: 动画与帧控制（thin wrapper to _animation + apply_response_cap）
+    # 10 个 handler：2 只读 + 6 可 undo 数据写 + 2 no-undo 运行态写。
+    # 详见 MUTATING_COMMANDS / READ_ONLY_COMMANDS / NO_UNDO_COMMANDS 注释。
+    # 设计契约（来自 openspec/changes/add-animation-and-frame-control）：
+    # - frame / fps / time / range 端点 / keyframe frame 与 value 全部按
+    #   float 处理，sub-frame 不被截断；bool / NaN / ±inf 拒绝。
+    # - get_frame / get_keyframes 只读；set_expression 与 keyframe /
+    #   range 写同属 MUTATING_COMMANDS，可 undo；
+    #   set_frame / playbar_control 是 NO_UNDO_COMMANDS，运行态时间线
+    #   写，batch 中由 dispatcher 在 NO_UNDO 前关闭 undo segment，保证
+    #   不进入 hou.undos.group。
+    # -------------------------------------------------------------------------
+    def get_frame(self):
+        """PR 19：读取当前帧 / 时间 / fps / 三组 range / increment，全部 float。
+
+        返回 dict 字段：frame / time / fps / frame_range /
+        playback_range / frame_increment；任一 hou 调用抛异常时降级
+        为 status=error 而非向调用方抛异常。响应整体过
+        ``apply_response_cap`` 截断大 payload（虽然本接口规模小，仍
+        保持 defense-in-depth）。
+        """
+        return cmn.apply_response_cap(anim.get_frame(hou))
+
+    def set_frame(self, frame):
+        """PR 19：写入当前帧（运行态时间线写，no-undo）。
+
+        ``frame`` 接受 int / float；拒绝 bool / NaN / ±inf / 非数值；
+        hou 接受 float 值并保留 sub-frame。任何 hou 异常降级为
+        error dict。响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(anim.set_frame(hou, frame))
+
+    def set_frame_range(self, start, end):
+        """PR 19：写入全局 frame range。
+
+        ``start`` / ``end`` 必须为有限浮点且 ``start <= end``；end 可
+        sub-frame。错误（如 start > end）返回 status=error 不写；成功
+        时由 hou.playbar.setFrameRange 持久化（场景写，可 undo）。
+        响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            anim.set_frame_range(hou, start, end))
+
+    def set_playback_range(self, start, end):
+        """PR 19：写入 playback range（场景写，可 undo）。
+
+        校验同 ``set_frame_range``；调 ``hou.playbar.setPlaybackRange``。
+        响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            anim.set_playback_range(hou, start, end))
+
+    def set_keyframe(self, path, parameter, frame, value):
+        """PR 19：单关键帧写入（场景写，可 undo）。
+
+        ``path`` / ``parameter`` 必为非空字符串；``frame`` / ``value``
+        必须为有限浮点。value 创建 ``hou.Keyframe(float(value))`` 并
+        ``keyframe.setFrame(float(frame))`` 后 ``parm.setKeyframe``。
+        字符串参数 / NaN / inf 等返回 status=error 不写。响应过
+        ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            anim.set_keyframe(hou, path, parameter, frame, value))
+
+    def set_keyframes(self, keyframes):
+        """PR 19：批量关键帧写入（场景写，可 undo）。
+
+        ``keyframes`` 为 list，每项 dict 至少含 ``path`` /
+        ``parameter`` / ``frame`` / ``value``；任一项无效则**整调用**
+        失败、零写入。全部有效时在单个 ``hou.undos.group`` 内逐项
+        写入并返回 ``set_count`` / ``requested``。错误列表（如有）
+        响应过 ``apply_response_cap`` 截断。
+        """
+        return cmn.apply_response_cap(
+            anim.set_keyframes(hou, keyframes))
+
+    def delete_keyframe(self, path, parameter, frame):
+        """PR 19：删除指定帧的关键帧（场景写，可 undo）。
+
+        ``frame`` 必须为有限浮点（删除 sub-frame 精确点）。调用后
+        再读 ``parm.keyframes()`` 验证目标帧已消失；不消失则
+        status=error（"no keyframe found at frame ..."）。响应过
+        ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            anim.delete_keyframe(hou, path, parameter, frame))
+
+    def get_keyframes(self, path, parameter):
+        """PR 19：读取 parm 的全部关键帧（只读）。
+
+        返回 list 中每项 ``{"frame": float, "value": float}``，不
+        做 ``int()`` 截断；空关键帧列表返回 ``keyframes=[]``。响应过
+        ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            anim.get_keyframes(hou, path, parameter))
+
+    def playbar_control(self, action):
+        """PR 19：playbar 播放 / 步进 / 跳转（运行态时间线写，no-undo）。
+
+        ``action`` 取值：
+        - ``play`` / ``reverse`` / ``stop``：直接调 SideFX HOM 同名方法。
+        - ``step_forward`` / ``step_backward``：仅通过
+          ``hou.setFrame(current ± hou.playbar.frameIncrement())`` 路径
+          并 clamp 到当前 playback range 闭区间，**不引入其他 step
+          helper**（incremement 非有限正数 / range 不可用 → error 且
+          **不**调 hou.setFrame）。
+        - ``goto_start`` / ``goto_end``：直接设 playback range 端点。
+
+        整个 action 集在 ``NO_UNDO_COMMANDS`` 中，batch dispatcher 在
+        该命令前关闭 undo segment。响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            anim.playbar_control(hou, action))
+
+    def set_expression(self, path, parameter, expression,
+                       language="hscript"):
+        """PR 19：写入 parm 表达式（参数通道持久写，**可 undo**）。
+
+        ``language`` 接受 ``hscript`` / ``python``，映射到对应
+        ``hou.exprLanguage``；其他值（包括 ``hscript`` 大小写
+        变体）一律 status=error。该命令属于参数通道数据写，**不**
+        归为只读或 no-undo（设计 D3）。响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            anim.set_expression(hou, path, parameter, expression,
+                                 language=language))
 
     # -------------------------------------------------------------------------
     # PR 16: 连接诊断（check_connection / ping_houdini，不持久化连接）

@@ -459,6 +459,47 @@ def _engine_policy_adapter(params):
     return {"status": "error", "message": "unknown render policy action"}
 
 
+def _enforce_render_policy_layer(renderer, consent_token=None):
+    """server handler / _render_jobs Layer 3-4 共用的 policy 校验 helper。
+
+    四层防御（design.md §"安全调用链"）：所有非 bridge 层都用此
+    helper 拿到 ``(decision, payload)`` 二元组。``payload`` 已是
+    fork 既有结构化 dict（``_redirect`` / ``_interrupt`` / error），
+    由调用方 ``apply_response_cap`` 后透传。
+
+    语义与 ``_engine_policy_adapter`` / ``_renderer_policy_adapter``
+    完全一致：
+    - ``allow`` -> ``("allow", None)``：调用方可继续 render。
+    - ``opengl`` -> ``("redirect", dict)``：调用方立即 return。
+    - ``karma_cpu`` / ``karma_xpu`` -> 缺 / 错 / 过期 token 返
+      ``("interrupt", dict)``；有效 token -> ``("allow", None)``。
+    - 未知 renderer / 未知 action -> ``("error", dict)``。
+
+    Args:
+        renderer: ``mantra`` / ``opengl`` / ``karma_cpu`` / ``karma_xpu``
+            / 未知值。
+        consent_token: karma 路径可选 token；其它 renderer 忽略。
+
+    Returns:
+        ``(str, dict_or_None)``。
+    """
+    if not renderer:
+        return ("error", {"status": "error",
+                          "message": ("unsupported ROP type / engine; "
+                                      "cannot map to policy renderer")})
+    action, payload = enforce_render_policy(renderer)
+    if action == "allow":
+        return ("allow", None)
+    if action == "redirect":
+        return ("redirect", payload)
+    if action == "interrupt":
+        if consent_token and consume_consent_token(consent_token):
+            return ("allow", None)
+        return ("interrupt", payload)
+    return ("error", {"status": "error",
+                       "message": "unknown render policy action"})
+
+
 def _renderer_policy_adapter(params):
     """执行 renderer base64 command 的 Layer 1 policy 校验。"""
     params = params if isinstance(params, dict) else {}
@@ -508,3 +549,54 @@ for _command in (
         "render_viewport_base64", "render_quad_views_base64",
         "render_specific_camera_base64"):
     register_render_policy_command(_command, _renderer_policy_adapter)
+
+
+# ---------------------------------------------------------------------------
+# C9 add-render-workflow-tools：start_render Layer 1 adapter
+# ---------------------------------------------------------------------------
+def _start_render_policy_adapter(params):
+    """start_render 的纯 Layer 1 helper（design.md §"安全调用链"）。
+
+    不读 hou、不发 TCP；以必填 ``policy_renderer`` 提示做无 TCP 初筛：
+    - 缺失 / 非字符串 / 未知 -> **直接 None 放行**（让 server Layer 2
+      从真实 node 重新推断 + 校验；bridge 公开 tool 仍要求必填
+      ``policy_renderer``，未填会在 bridge 层 error 控制 dict 返
+      回）。这样直接 TCP batch（无 bridge 包装）走 server 时不会
+      因缺 hint 误阻断，server Layer 2 是真正的兜底。
+    - ``opengl`` -> 透传既有 redirect dict。
+    - ``karma_cpu`` / ``karma_xpu`` -> 既有 interrupt dict；带有效
+      consent_token 时降级为 None（放行到 server Layer 2-4）。
+    - ``mantra`` -> None（放行）。
+
+    与 bridge 公开 ``start_render`` tool 完全相同（除 hint 缺失语义
+    见上）；batch adapter 共用此 helper。把 adapter 放这里是为了
+    server.py 和 bridge 共享同一注册入口（design.md §"batch 不可绕过"）。
+    """
+    params = params if isinstance(params, dict) else {}
+    policy_renderer = params.get("policy_renderer")
+    # Hint 缺失：放行；bridge 公开 tool 仍要求必填并在此之前拦截。
+    if not isinstance(policy_renderer, str) or not policy_renderer.strip():
+        return None
+    renderer = policy_renderer.strip()
+    if renderer not in ("mantra", "opengl", "karma_cpu", "karma_xpu"):
+        return {"status": "error",
+                "message": ("unknown policy_renderer hint %r; expected "
+                            "one of 'mantra' / 'opengl' / 'karma_cpu' / "
+                            "'karma_xpu'") % renderer,
+                "field": "policy_renderer"}
+    action, payload = enforce_render_policy(renderer)
+    if action == "allow":
+        return None
+    if action == "redirect":
+        return payload
+    if action == "interrupt":
+        token = params.get("consent_token")
+        if token and consume_consent_token(token):
+            return None
+        return payload
+    return {"status": "error",
+            "message": "unknown render policy action"}
+
+
+register_render_policy_command(
+    "start_render", _start_render_policy_adapter)

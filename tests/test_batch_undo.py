@@ -116,12 +116,15 @@ class RegistryTests(unittest.TestCase):
                 handlers)
 
     def test_render_registry_has_only_current_six_entries(self):
+        # C9 add-render-workflow-tools：start_render 加入同一 registry，
+        # 共 7 项；其余 6 个保持不变。
         self.assertEqual(
             set(server_mod.RENDER_POLICY_COMMANDS),
             {
                 "render_single_view", "render_quad_view",
                 "render_specific_camera", "render_viewport_base64",
                  "render_quad_views_base64", "render_specific_camera_base64",
+                 "start_render",
             })
 
     def test_render_policy_defaults_only_fill_omitted_values(self):

@@ -101,6 +101,16 @@ RENDER_POLICY_COMMANDS = _rp.RENDER_POLICY_COMMANDS
 register_render_policy_command = _rp.register_render_policy_command
 
 
+# ---------------------------------------------------------------------------
+# monitor_render — bridge-only stdlib OS process 查询（design.md §"monitor_render 降级"）
+# ---------------------------------------------------------------------------
+_MONITOR_RENDERER_BASENAMES = frozenset({
+    "husk", "husk.exe",
+    "mantra", "mantra.exe",
+    "mantra-bin", "mantra-bin.exe",
+})
+
+
 def _apply_render_policy_to_engine(render_engine, karma_engine=None,
                                    consent_token=None, command=None):
     """应用 fork-render-policy-redirect-and-consent 入口校验。
@@ -2286,6 +2296,426 @@ def render_specific_camera_base64(ctx, camera_path, resolution=(640, 480),
 
 
 # -------------------------------------------------------------------
+# PR 19 Animation & Frame Control Tools (placed before PR-16 / PR-15 /
+# PR-18 / PR-7 sections so all four pre-existing AST probes
+# (test_bridge_style PR-7 / test_connection PR-16 /
+# test_verify_hou_api PR-18 / test_help PR-15) which scan strictly
+# inside their own header boundaries do not pick these tools up; PR
+# 19 ships its own source-level check in test_animation.py). 10 个
+# 工具的语义、number / float 校验与 sub-frame 透传契约来自
+# _animation 模块；服务器端的分类（2 read-only / 6 mutating / 2
+# no-undo）保证 undo group 边界符合设计 D3。
+# -------------------------------------------------------------------
+@mcp.tool()
+def get_frame(ctx):
+    """读取当前帧 / 时间 / fps / 三组 range / increment，全部 float（PR 19）。
+
+    返回 dict 字段：frame / time / fps / frame_range /
+    playback_range / frame_increment；任一 hou 调用抛异常时降级为
+    status=error 而非向调用方抛异常。仅读取时间线状态，不修改场
+    景或参数（READ_ONLY_COMMANDS）。响应整体过 server 端
+    ``apply_response_cap`` 截断大 payload（虽然规模小，仍保持
+    defense-in-depth）。
+    """
+    return _houdini_call("get_frame", {})
+
+
+@mcp.tool()
+def set_frame(ctx, frame):
+    """设置当前帧（PR 19，运行态时间线写，no-undo）。
+
+    ``frame`` 接受 int / float；拒绝 bool / NaN / ±inf / 非数值；
+    hou 接受 float 值并保留 sub-frame。任何 hou 异常降级为 error
+    dict。该命令在 NO_UNDO_COMMANDS 中，batch dispatcher 会在调
+    用前自动关闭当前 undo segment，确保不进入 ``hou.undos.group``。
+    """
+    return _houdini_call("set_frame", {"frame": frame})
+
+
+@mcp.tool()
+def set_frame_range(ctx, start, end):
+    """设置全局 frame range（PR 19，场景写，可 undo）。
+
+    ``start`` / ``end`` 必须为有限浮点且 ``start <= end``；end
+    可 sub-frame。错误（如 start > end）返回 status=error 不写；
+    成功时由 hou.playbar.setFrameRange 持久化。
+    """
+    return _houdini_call("set_frame_range",
+                         {"start": start, "end": end})
+
+
+@mcp.tool()
+def set_playback_range(ctx, start, end):
+    """设置 playback range（PR 19，场景写，可 undo）。
+
+    校验同 ``set_frame_range``；调 ``hou.playbar.setPlaybackRange``。
+    """
+    return _houdini_call("set_playback_range",
+                         {"start": start, "end": end})
+
+
+@mcp.tool()
+def set_keyframe(ctx, path, parameter, frame, value):
+    """单关键帧写入（PR 19，场景写，可 undo）。
+
+    ``path`` / ``parameter`` 必为非空字符串；``frame`` / ``value``
+    必须为有限浮点。value 创建 ``hou.Keyframe(float(value))`` 并
+    ``keyframe.setFrame(float(frame))`` 后 ``parm.setKeyframe``。
+    字符串参数 / NaN / inf 等返回 status=error 不写。
+    """
+    return _houdini_call("set_keyframe", {
+        "path": path,
+        "parameter": parameter,
+        "frame": frame,
+        "value": value,
+    })
+
+
+@mcp.tool()
+def set_keyframes(ctx, keyframes):
+    """批量关键帧写入（PR 19，场景写，可 undo）。
+
+    ``keyframes`` 为 list，每项 dict 至少含 ``path`` /
+    ``parameter`` / ``frame`` / ``value``；任一项无效则**整调
+    用**失败、零写入（在 server 上层预校验拒绝）。全部有效时
+    在单个 ``hou.undos.group`` 内逐项写入并返回 ``set_count`` /
+    ``requested``。错误列表同样受 server 端 ``apply_response_cap``
+    截断保护。
+    """
+    return _houdini_call("set_keyframes",
+                         {"keyframes": keyframes})
+
+
+@mcp.tool()
+def delete_keyframe(ctx, path, parameter, frame):
+    """删除指定帧的关键帧（PR 19，场景写，可 undo）。
+
+    ``frame`` 必须为有限浮点（删除 sub-frame 精确点）。目标帧
+    不存在返回 status=error（"no keyframe found at frame ..."），
+    不写。实际删除后再次读取 keyframes 列表验证已消失。
+    """
+    return _houdini_call("delete_keyframe", {
+        "path": path,
+        "parameter": parameter,
+        "frame": frame,
+    })
+
+
+@mcp.tool()
+def get_keyframes(ctx, path, parameter):
+    """读取 parm 的全部关键帧（PR 19，只读）。
+
+    返回 list 中每项 ``{"frame": float, "value": float}``，不
+    做 ``int()`` 截断；空关键帧列表返回 ``keyframes=[]``。本
+    工具仅查询状态（READ_ONLY_COMMANDS），不会修改场景或参数。
+    """
+    return _houdini_call("get_keyframes",
+                         {"path": path, "parameter": parameter})
+
+
+@mcp.tool()
+def playbar_control(ctx, action):
+    """playbar 播放 / 步进 / 跳转（PR 19，运行态时间线写，no-undo）。
+
+    ``action`` 取值：
+    - ``play`` / ``reverse`` / ``stop``：直接调 SideFX HOM 同名方法。
+    - ``step_forward`` / ``step_backward``：仅通过
+      ``hou.setFrame(current ± hou.playbar.frameIncrement())``
+      路径并 clamp 到当前 playback range 闭区间，**不引入其
+      他 step helper**（increment 非有限正数 / range 不可用
+      → error 且 **不**调 hou.setFrame）。
+    - ``goto_start`` / ``goto_end``：直接设 playback range 端点。
+
+    整个 action 集在 NO_UNDO_COMMANDS 中，batch dispatcher 在
+    该命令前关闭 undo segment，保证不进入 ``hou.undos.group``。
+    """
+    return _houdini_call("playbar_control",
+                         {"action": action})
+
+
+@mcp.tool()
+def set_expression(ctx, path, parameter, expression,
+                   language="hscript"):
+    """写入 parm 表达式（PR 19，参数通道持久写，**可 undo**）。
+
+    ``language`` 接受 ``hscript`` / ``python``，映射到对应
+    ``hou.exprLanguage``；其他值（包括大小写变体）一律
+    status=error。该命令属于参数通道数据写
+    （MUTATING_COMMANDS），**不**归为只读或 no-undo；与其他
+    关键帧 / 范围写共用 undo group 策略。
+    """
+    return _houdini_call("set_expression", {
+        "path": path,
+        "parameter": parameter,
+        "expression": expression,
+        "language": language,
+    })
+
+
+# -------------------------------------------------------------------
+# C9 add-render-workflow-tools（placed between PR 19 and PR 16 so all
+# four pre-existing AST probes — test_bridge_style PR 7 / test_help
+# PR 15 / test_verify_hou_api PR 18 / test_connection PR 16 — which
+# scan strictly inside their own header boundaries do not pick these
+# tools up; same convention as PR 19）
+# -------------------------------------------------------------------
+def _query_renderer_processes_windows():
+    """Windows 路径：用 PowerShell + CIM 拿 husk / mantra 进程字段。
+
+    解析失败 / 命令缺失 / 权限不足返回空 list 与详细 warning；不抛异常。
+    """
+    script = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        "Get-CimInstance Win32_Process -Filter \"Name like 'husk%.exe' or "
+        "Name like 'mantra%.exe'\" | "
+        "Select-Object ProcessId,Name,CommandLine,"
+        "@{n='CPU';e={try {[double]$_.KernelModeTime + [double]$_.UserModeTime} "
+        "catch { '' }}},"
+        "@{n='WorkingSetSizeMB';e={try {[math]::Round($_.WorkingSetSize/1MB,2)} "
+        "catch { '' }}} | "
+        "ForEach-Object { [PSCustomObject]@{"
+        "ProcessId=$_.ProcessId; Name=$_.Name; "
+        "CommandLine=$_.CommandLine; CPU=$_.CPU; "
+        "WorkingSetSizeMB=$_.WorkingSetSizeMB} } | "
+        "ConvertTo-Json -Depth 4 -Compress"
+    )
+    try:
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", script],
+            capture_output=True, text=True, timeout=15)
+    except (OSError, ValueError) as error:
+        return [], ["powershell_exec_failed: {0}".format(error)]
+    if completed.returncode != 0:
+        return [], ["powershell_exit_code: {0}".format(
+            completed.returncode)]
+    stdout = (completed.stdout or "").strip()
+    if not stdout:
+        return [], []
+    try:
+        parsed = json.loads(stdout)
+    except ValueError:
+        return [], ["powershell_output_parse_failed"]
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return [], ["powershell_unexpected_shape"]
+    results = []
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("Name") or ""
+        results.append({
+            "pid": entry.get("ProcessId"),
+            "name": name,
+            "command": entry.get("CommandLine") or "",
+            "cpu": _as_float_or_null(entry.get("CPU")),
+            "memory_mb": _as_float_or_null(entry.get("WorkingSetSizeMB")),
+        })
+    return results, []
+
+
+def _query_renderer_processes_posix():
+    """POSIX 路径：用 ``ps`` 拿 husk / mantra 进程字段。"""
+    ps_command = ["ps", "-ax", "-o", "pid=,comm=,args="]
+    try:
+        completed = subprocess.run(
+            ps_command, capture_output=True, text=True, timeout=15)
+    except (OSError, ValueError) as error:
+        return [], ["ps_exec_failed: {0}".format(error)]
+    if completed.returncode != 0:
+        return [], ["ps_exit_code: {0}".format(completed.returncode)]
+    results = []
+    for line in (completed.stdout or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        basename = os.path.basename(parts[1])
+        if basename not in _MONITOR_RENDERER_BASENAMES:
+            continue
+        results.append({
+            "pid": pid,
+            "name": basename,
+            "command": parts[2],
+            "cpu": None,
+            "memory_mb": None,
+        })
+    return results, []
+
+
+def _as_float_or_null(value):
+    """CIM 输出可能是数字、空串或其它；统一为 float 或 None。"""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        as_float = float(value)
+        if as_float != as_float or as_float in (float("inf"),
+                                                  float("-inf")):
+            return None
+        return as_float
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            as_float = float(stripped)
+        except ValueError:
+            return None
+        if as_float != as_float or as_float in (float("inf"),
+                                                  float("-inf")):
+            return None
+        return as_float
+    return None
+
+
+def _monitor_render_renderer_processes():
+    """按平台分发；返回 ``(entries, warnings)``。entries 每项含
+    pid / name（必填）/ command；cpu / memory_mb 可得为 float，否则
+    None。warnings 列出 cpu_unavailable / memory_unavailable /
+    powershell_exec_failed 等降级原因。"""
+    if sys.platform.startswith("win"):
+        return _query_renderer_processes_windows()
+    return _query_renderer_processes_posix()
+
+
+@mcp.tool()
+def monitor_render(ctx: Context) -> dict:
+    """在 bridge 进程 best-effort 观察 husk / mantra OS 进程。
+
+    不读 hou、不发 TCP；通过 stdlib ``subprocess`` 调 PowerShell CIM
+    （Windows）或 ``ps``（POSIX），按 executable basename
+    （``husk`` / ``husk.exe`` / ``mantra`` / ``mantra.exe`` /
+    ``mantra-bin`` / ``mantra-bin.exe``）过滤；不把命令行任意
+    substring 当 renderer。PID / name 必填；CPU / memory 可得为
+    float，不可得为 ``null`` 并在 ``_warning`` 列明
+    ``cpu_unavailable`` / ``memory_unavailable``。命令缺失、权限
+    不足或解析失败返 ``status=success``、空 / 部分结果与 warning，
+    不抛异常。响应整体过 ``apply_response_cap``。
+
+    本工具 **bridge-only**，不进入 server registry 或三个 server
+    分类集合。
+    """
+    entries, warnings = _monitor_render_renderer_processes()
+    cpu_unavailable = any(entry.get("cpu") is None for entry in entries)
+    memory_unavailable = any(entry.get("memory_mb") is None
+                              for entry in entries)
+    if cpu_unavailable:
+        warnings.append("cpu_unavailable")
+    if memory_unavailable and entries:
+        warnings.append("memory_unavailable")
+    payload = {
+        "status": "success",
+        "count": len(entries),
+        "processes": entries,
+    }
+    if warnings:
+        payload["_warning"] = warnings
+    return cmn.apply_response_cap(payload)
+
+
+@mcp.tool()
+def start_render(ctx: Context, node_path: str, policy_renderer: str,
+                  frame_range: List[float] = None,
+                  consent_token: str = None) -> dict:
+    """同步启动一次 ROP 渲染；四层防御见 ``_render_jobs.start_render``。
+
+    Args:
+        node_path: 真实 ROP 节点路径（如 ``/out/mantra1``）。
+        policy_renderer: 必填提示，bridge Layer 1 用其初筛（``mantra`` /
+            ``opengl`` / ``karma_cpu`` / ``karma_xpu``）；不替换真实
+            node 推断。
+        frame_range: 可选 2 或 3 元 ``[start, end[, inc]]``，缺省走
+            ROP 自身设置。
+        consent_token: 可选，karma 路径重调时携带。
+
+    Returns:
+        dict: 直接 relay server 响应；blocked 时为 redirect / interrupt /
+        error 字典；正常完成时为 ``status=success`` 含
+        ``state / elapsed / frame_range``。
+    """
+    preflight = _rp.evaluate_render_policy_command(
+        "start_render", {
+            "policy_renderer": policy_renderer,
+            "consent_token": consent_token,
+        })
+    if preflight is not None:
+        return cmn.apply_response_cap(preflight)
+    params = {"node_path": node_path}
+    if frame_range is not None:
+        params["frame_range"] = list(frame_range)
+    if consent_token is not None:
+        params["consent_token"] = consent_token
+    return _houdini_call("start_render", params)
+
+
+@mcp.tool()
+def list_render_nodes(ctx: Context, parent_path: str = "/out") -> dict:
+    """枚举 ``parent_path`` 下可分类 ROP 节点（ifd / opengl / karmarender）。
+
+    响应字段：``parent_path / count / nodes``，每节点含
+    ``name / path / type / renderer``。未知 ROP type 仍列出但
+    ``renderer=""``。整体过 ``apply_response_cap``。
+    """
+    return _houdini_call("list_render_nodes", {"parent_path": parent_path})
+
+
+@mcp.tool()
+def get_render_settings(ctx: Context, node_path: str) -> dict:
+    """读取 ``node_path`` 的白名单 parm 值（design.md §"设置白名单"）。
+
+    仅返回 ``ifd`` / ``opengl`` / ``karmarender`` 实际存在且数据安全的
+    parm；script / callback / command / executable 类型拒绝。整体
+    过 ``apply_response_cap``。
+    """
+    return _houdini_call("get_render_settings", {"node_path": node_path})
+
+
+@mcp.tool()
+def set_render_settings(ctx: Context, node_path: str,
+                         parameters: Dict[str, Any]) -> dict:
+    """受限可撤销写入（design.md §"set_render_settings"）。
+
+    完整预校验所有 key/value/parm 可写性/prospective engine 后快
+    照旧值；应用失败显式恢复快照旧值，**不**依赖 undo 自动 rollback。
+    全部成功 -> ``status=success``；恢复成功 ->
+    ``status=error, error_code=render_settings_apply_failed,
+    restored=true``；任一恢复失败 ->
+    ``status=error, error_code=render_settings_restore_failed,
+    restored=false`` + ``restore_errors``。响应过
+    ``apply_response_cap``。
+    """
+    return _houdini_call("set_render_settings", {
+        "node_path": node_path, "parameters": parameters})
+
+
+@mcp.tool()
+def create_render_node(ctx: Context, node_type: str,
+                        parent_path: str = "/out",
+                        name: str = None,
+                        parameters: Dict[str, Any] = None) -> dict:
+    """受限创建可分类 ROP 节点（design.md §"create_render_node"）。
+
+    仅允许 ``ifd`` / ``opengl`` / ``karmarender``；创建后通过同一
+    白名单设置参数并校验 renderer 可识别。未知 node type 整体
+    error。响应过 ``apply_response_cap``。
+    """
+    params = {"node_type": node_type, "parent_path": parent_path}
+    if name is not None:
+        params["name"] = name
+    if parameters is not None:
+        params["parameters"] = parameters
+    return _houdini_call("create_render_node", params)
+
+
+# -------------------------------------------------------------------
 # PR 16 Connection Diagnostic Tools (placed before PR 15 / PR 7 sections
 # so existing test_bridge_style (PR 7) and test_help PR 15 probes — which
 # scan @mcp.tool() strictly after their own header lines — do not pick it
@@ -2435,6 +2865,7 @@ def get_material_info(ctx, material_path):
     .tiff / .rat / .tex）的 parm。
     """
     return _houdini_call("get_material_info", {"material_path": material_path})
+
 
 
 def main():
