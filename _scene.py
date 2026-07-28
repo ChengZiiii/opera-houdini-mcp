@@ -670,3 +670,394 @@ def explain_node(hou, node_path, include_params=False,
         result["max_params"] = max_params
 
     return _success(result)
+
+
+# ---------------------------------------------------------------------------
+# add-takes-and-cache-tools: 4 个 Takes 工具
+# ---------------------------------------------------------------------------
+#
+# 设计契约（design.md §Takes + spec Requirement: Takes 工具）：
+# - 全部走 hou.takes.takes / hou.takes.findTake / hou.takes.setCurrentTake /
+#   hou.Take.addChildTake / hou.Take.addParmTuple 真实 surface。
+# - list_takes / get_current_take 走只读 hou API。
+# - set_current_take 必须把 hou.Take 对象传给 setCurrentTake（**绝不传字符串**）。
+# - create_take 在任何写入前完成 parent / parm 预校验；预校验失败不留下部分 take。
+# - include 阶段：临时把新 hou.Take 设为 current、调用 addParmTuple、finally 恢复。
+# - hou 通过参数注入；本模块顶层不 import hou，零新依赖。
+# - 所有成功 / 错误返回统一过 cmn.apply_response_cap。
+# ---------------------------------------------------------------------------
+
+_DEFAULT_TAKES_LIMIT = 256
+
+
+def _take_attr_str(take, name):
+    """安全取 take.name()/path() 字符串，缺失/异常返空串。"""
+    getter = getattr(take, name, None)
+    if not callable(getter):
+        return ""
+    try:
+        return str(getter())
+    except Exception:
+        return ""
+
+
+def _take_current(take):
+    """take.isCurrent() 安全布尔，缺失返 False。"""
+    getter = getattr(take, "isCurrent", None)
+    if not callable(getter):
+        return False
+    try:
+        return bool(getter())
+    except Exception:
+        return False
+
+
+def _take_parent_path(take):
+    """take.parent() 安全的 path；parent is None（root take）返 None。"""
+    getter = getattr(take, "parent", None)
+    if not callable(getter):
+        return None
+    try:
+        parent = getter()
+    except Exception:
+        return None
+    if parent is None:
+        return None
+    parent_path = _take_attr_str(parent, "path")
+    return parent_path or None
+
+
+def list_takes(hou):
+    """枚举全部 hou.takes.takes()，返回 name / path / parent / current。
+
+    受 ``_DEFAULT_TAKES_LIMIT`` 上限约束；超限返 truncated=True。
+    """
+    takes_fn = getattr(getattr(hou, "takes", None), "takes", None)
+    if not callable(takes_fn):
+        return cmn.apply_response_cap(_error(
+            "takes_unavailable",
+            "hou.takes.takes() is not available on this Houdini",
+            details={"houdini_version": cmn._json_safe_hou_value(
+                hou, getattr(hou, "applicationVersionString", lambda: "")(), max_depth=1)}))
+    try:
+        takes = list(takes_fn() or [])
+    except Exception as exc:
+        return cmn.apply_response_cap(_error("takes_query_failed", exc))
+    entries = []
+    total = len(takes)
+    for take in takes[:_DEFAULT_TAKES_LIMIT]:
+        try:
+            entries.append({
+                "name": _take_attr_str(take, "name"),
+                "path": _take_attr_str(take, "path"),
+                "parent": _take_parent_path(take),
+                "current": _take_current(take),
+            })
+        except Exception:
+            continue
+    return cmn.apply_response_cap(_success({
+        "takes": entries,
+        "count": len(entries),
+        "total": total,
+        "truncated": total > _DEFAULT_TAKES_LIMIT,
+    }))
+
+
+def get_current_take(hou):
+    """返回 hou.takes.currentTake() 的 name / path / parent。"""
+    takes_mod = getattr(hou, "takes", None)
+    current_fn = getattr(takes_mod, "currentTake", None)
+    if not callable(current_fn):
+        return cmn.apply_response_cap(_error(
+            "takes_unavailable",
+            "hou.takes.currentTake() is not available on this Houdini"))
+    try:
+        current = current_fn()
+    except Exception as exc:
+        return cmn.apply_response_cap(_error("current_take_query_failed", exc))
+    if current is None:
+        return cmn.apply_response_cap(_success(
+            {"name": "", "path": "", "parent": None, "current": False}))
+    return cmn.apply_response_cap(_success({
+        "name": _take_attr_str(current, "name"),
+        "path": _take_attr_str(current, "path"),
+        "parent": _take_parent_path(current),
+        "current": True,
+    }))
+
+
+def _resolve_take(hou, identifier):
+    """用 hou.takes.findTake 解析 identifier → hou.Take。
+
+    - identifier 必须是非空字符串。
+    - 找不到 / hou.takes.findTake 不可用时返 (None, error_dict)。
+    - findTake 只接受 name 或 path（不接受 hou.Take 对象），本 helper
+      对两端都尝试：先用原值，再用 path。
+    """
+    if not isinstance(identifier, str) or not identifier.strip():
+        return None, _error("invalid_take_identifier",
+                             "take identifier must be a non-empty string")
+    find_take = getattr(getattr(hou, "takes", None), "findTake", None)
+    if not callable(find_take):
+        return None, _error("find_take_unavailable",
+                             "hou.takes.findTake() is not available on this Houdini")
+    trimmed = identifier.strip()
+    for candidate in (trimmed, trimmed.lstrip("/")):
+        try:
+            take = find_take(candidate)
+        except Exception:
+            take = None
+        if take is not None:
+            return take, None
+    return None, _error("take_not_found",
+                        "No take found for identifier: " + trimmed,
+                        details={"identifier": trimmed})
+
+
+def set_current_take(hou, name_or_path):
+    """用 hou.takes.findTake 解析真实 hou.Take 后传给 setCurrentTake。
+
+    - 永不传字符串给 setCurrentTake。
+    - identifier 解析失败 / 歧义时拒绝。
+    """
+    take, error = _resolve_take(hou, name_or_path)
+    if error is not None:
+        return cmn.apply_response_cap(error)
+    set_current = getattr(getattr(hou, "takes", None), "setCurrentTake", None)
+    if not callable(set_current):
+        return cmn.apply_response_cap(_error(
+            "set_current_take_unavailable",
+            "hou.takes.setCurrentTake() is not available on this Houdini"))
+    try:
+        set_current(take)
+    except Exception as exc:
+        return cmn.apply_response_cap(_error(
+            "set_current_take_failed", exc,
+            details={"identifier": str(name_or_path),
+                     "take_path": _take_attr_str(take, "path")}))
+    return cmn.apply_response_cap(_success({
+        "name": _take_attr_str(take, "name"),
+        "path": _take_attr_str(take, "path"),
+        "parent": _take_parent_path(take),
+        "current": True,
+    }))
+
+
+def _resolve_parm_tuple(hou, parm_path):
+    """把 parm path 解析为 hou.ParmTuple。
+
+    - 先用 hou.parmTuple(path) 解析为 tuple path。
+    - 若失败，视为 component parm path：hou.parm(path).tuple()。
+    - 仍找不到 / 不可调用 / 不可编辑时返 (None, error_dict)。
+    """
+    if not isinstance(parm_path, str) or not parm_path.strip():
+        return None, _error("invalid_parm_path",
+                             "parm path must be a non-empty string")
+    path = parm_path.strip()
+    parm_tuple_fn = getattr(hou, "parmTuple", None)
+    if callable(parm_tuple_fn):
+        try:
+            pt = parm_tuple_fn(path)
+        except Exception:
+            pt = None
+        if pt is not None:
+            return pt, None
+    parm_fn = getattr(hou, "parm", None)
+    if callable(parm_fn):
+        try:
+            parm = parm_fn(path)
+        except Exception:
+            parm = None
+        if parm is not None:
+            tuple_fn = getattr(parm, "tuple", None)
+            if callable(tuple_fn):
+                try:
+                    pt = tuple_fn()
+                except Exception:
+                    pt = None
+                if pt is not None:
+                    return pt, None
+    return None, _error("parm_not_found",
+                        "No parm tuple found for path: " + path,
+                        details={"parm_path": path})
+
+
+def create_take(hou, name, include_parms=None, parent_take=None):
+    """创建 child take，预校验 parent / parm 后再调 addChildTake / addParmTuple。
+
+    - name 必填；重复 name 拒绝。
+    - parent_take 缺省时使用当前 take；非字符串 / 字符串走 findTake 解析。
+    - include_parms（list of parm path）全部解析成功后才创建 take；任一
+      失败 → 整次拒绝（**不**留部分 take）。
+    - 创建后若 include_parms 非空：保存原 current，临时切到新 hou.Take，
+      逐个调 addParmTuple，finally 恢复原 take。
+    """
+    if not isinstance(name, str) or not name.strip():
+        return cmn.apply_response_cap(_error(
+            "invalid_take_name",
+            "take name must be a non-empty string"))
+    if "/" in name:
+        return cmn.apply_response_cap(_error(
+            "invalid_take_name",
+            "take name must not contain '/' (use a single segment)",
+            details={"field": "name", "value": name}))
+    trimmed_name = name.strip()
+
+    # parent resolve
+    if parent_take is None or parent_take == "":
+        # use currentTake
+        current_fn = getattr(getattr(hou, "takes", None), "currentTake", None)
+        if not callable(current_fn):
+            return cmn.apply_response_cap(_error(
+                "current_take_unavailable",
+                "hou.takes.currentTake() is not available for parent fallback"))
+        try:
+            parent = current_fn()
+        except Exception as exc:
+            return cmn.apply_response_cap(_error(
+                "parent_take_query_failed", exc))
+    else:
+        if isinstance(parent_take, str):
+            parent, parent_error = _resolve_take(hou, parent_take)
+            if parent_error is not None:
+                return cmn.apply_response_cap(parent_error)
+        else:
+            # hou.Take 对象（兼容）
+            parent = parent_take
+    if parent is None:
+        return cmn.apply_response_cap(_error(
+            "parent_take_unavailable",
+            "Resolved parent take is None"))
+
+    # duplicate-name check
+    find_take = getattr(getattr(hou, "takes", None), "findTake", None)
+    if callable(find_take):
+        try:
+            existing = find_take(trimmed_name)
+        except Exception:
+            existing = None
+        if existing is not None:
+            return cmn.apply_response_cap(_error(
+                "take_name_conflict",
+                "A take with this name already exists: " + trimmed_name,
+                details={"name": trimmed_name,
+                         "existing_path": _take_attr_str(existing, "path")}))
+
+    # pre-validate include_parms (atomic pre-check, no writes)
+    resolved_tuples = []
+    if include_parms is not None:
+        if isinstance(include_parms, str):
+            include_list = [include_parms]
+        else:
+            try:
+                include_list = [str(item) for item in list(include_parms)]
+            except Exception:
+                return cmn.apply_response_cap(_error(
+                    "invalid_include_parms",
+                    "include_parms must be a path string or list of paths"))
+        for parm_path in include_list:
+            if not parm_path.strip():
+                return cmn.apply_response_cap(_error(
+                    "invalid_include_parms",
+                    "include_parms entries must be non-empty strings",
+                    details={"parm_path": parm_path}))
+            pt, pt_error = _resolve_parm_tuple(hou, parm_path)
+            if pt_error is not None:
+                return cmn.apply_response_cap(pt_error)
+            # 重复 tuple path 检测
+            try:
+                pt_name = pt.name()
+                pt_node = pt.node()
+                node_path = pt_node.path() if pt_node is not None else ""
+            except Exception:
+                pt_name = ""
+                node_path = ""
+            key = (node_path, pt_name)
+            if key in [t["_key"] for t in resolved_tuples]:
+                return cmn.apply_response_cap(_error(
+                    "duplicate_parm_tuple",
+                    "include_parms contains duplicate parm tuple: " + parm_path,
+                    details={"parm_path": parm_path}))
+            resolved_tuples.append({
+                "_key": key,
+                "node_path": node_path,
+                "parm_tuple": pt_name,
+                "_tuple": pt,  # keep reference for later addParmTuple
+            })
+
+    # create the take (single addChildTake call)
+    add_child = getattr(parent, "addChildTake", None)
+    if not callable(add_child):
+        return cmn.apply_response_cap(_error(
+            "add_child_take_unavailable",
+            "parent take does not expose addChildTake()"))
+    try:
+        new_take = add_child(trimmed_name)
+    except Exception as exc:
+        return cmn.apply_response_cap(_error(
+            "add_child_take_failed", exc,
+            details={"parent": _take_attr_str(parent, "path"),
+                     "name": trimmed_name}))
+    if new_take is None:
+        return cmn.apply_response_cap(_error(
+            "add_child_take_failed",
+            "parent.addChildTake returned None",
+            details={"parent": _take_attr_str(parent, "path"),
+                     "name": trimmed_name}))
+
+    # if include: save current, switch, addParmTuple, restore
+    applied = []
+    if resolved_tuples:
+        takes_mod = getattr(hou, "takes", None)
+        current_fn = getattr(takes_mod, "currentTake", None)
+        set_current = getattr(takes_mod, "setCurrentTake", None)
+        if not callable(set_current):
+            try:
+                new_take.destroy()
+            except Exception:
+                pass
+            return cmn.apply_response_cap(_error(
+                "set_current_take_unavailable",
+                "hou.takes.setCurrentTake() is required for include_parms"))
+        previous = current_fn() if callable(current_fn) else None
+        try:
+            set_current(new_take)
+            for entry in resolved_tuples:
+                node_path = entry["node_path"]
+                parm_tuple_name = entry["parm_tuple"]
+                tup = entry.get("_tuple")
+                if tup is None:
+                    return cmn.apply_response_cap(_error(
+                        "include_parm_resolve_failed",
+                        "Pre-resolved parm tuple no longer available",
+                        details={"node_path": node_path,
+                                 "parm_tuple": parm_tuple_name}))
+                add_pt = getattr(new_take, "addParmTuple", None)
+                if not callable(add_pt):
+                    return cmn.apply_response_cap(_error(
+                        "add_parm_tuple_unavailable",
+                        "new take does not expose addParmTuple()"))
+                try:
+                    add_pt(tup)
+                except Exception as exc:
+                    return cmn.apply_response_cap(_error(
+                        "add_parm_tuple_failed", exc,
+                        details={"node_path": node_path,
+                                 "parm_tuple": parm_tuple_name}))
+                applied.append({
+                    "node_path": node_path,
+                    "parm_tuple": parm_tuple_name,
+                })
+        finally:
+            try:
+                if previous is not None and callable(set_current):
+                    set_current(previous)
+            except Exception:
+                pass
+
+    return cmn.apply_response_cap(_success({
+        "name": _take_attr_str(new_take, "name"),
+        "path": _take_attr_str(new_take, "path"),
+        "parent": _take_parent_path(new_take),
+        "include_parms": applied,
+    }))

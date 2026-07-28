@@ -3434,6 +3434,682 @@ def set_current_network(ctx, path):
 
 
 # -------------------------------------------------------------------
+# add-dops-tools: 8 个 DOP 查询/控制 bridge tool
+# -------------------------------------------------------------------
+# 6 查询只归 server READ_ONLY；step/reset 只归 NO_UNDO。后二者改变
+# 全局时间线、强制 cook 并生成/清空 DOP cache，HIP undo 不能恢复；
+# server batch dispatcher 会在调用前关闭 mutating undo segment。
+# force-reset 可选路径由 server 的真实签名探针 + 逐版本 live gate 决定，
+# bridge 不提供 override/bypass 参数，mock capability 不能放行。
+# -------------------------------------------------------------------
+@mcp.tool()
+def get_simulation_info(ctx, dop_path):
+    """读取 DOP simulation 元数据（add-dops-tools，READ_ONLY）。
+
+    返回 frame/time/timestep/object_count；只使用有界 DopSimulation
+    查询。响应经过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("get_simulation_info", {"dop_path": dop_path})
+
+
+@mcp.tool()
+def list_dop_objects(ctx, dop_path, offset=0, limit=100):
+    """分页列出 DOP objects（add-dops-tools，READ_ONLY）。
+
+    每项仅返回 name/object_id 与有界 data/record type 摘要；不展开
+    模拟数据。响应经过 ``apply_response_cap``。
+    """
+    return _houdini_call("list_dop_objects", {
+        "dop_path": dop_path, "offset": offset, "limit": limit})
+
+
+@mcp.tool()
+def get_dop_object(ctx, dop_path, object_name, max_data=64):
+    """通过 findObject 查询单个 DOP object（add-dops-tools，READ_ONLY）。
+
+    ``max_data`` 限制 data 摘要数量；不返回无界 record 内容。
+    """
+    return _houdini_call("get_dop_object", {
+        "dop_path": dop_path, "object_name": object_name,
+        "max_data": max_data})
+
+
+@mcp.tool()
+def get_dop_field(ctx, dop_path, object_name, data_name, field_name,
+                  record_type="Options", record_index=0):
+    """读取 DOP data/record 字段（add-dops-tools，READ_ONLY）。
+
+    volume/VDB 字段不返回原始体素，只返回可廉价取得的 resolution /
+    bbox/min/max/average；不可得值标记 ``unavailable``。
+    """
+    return _houdini_call("get_dop_field", {
+        "dop_path": dop_path, "object_name": object_name,
+        "data_name": data_name, "field_name": field_name,
+        "record_type": record_type, "record_index": record_index})
+
+
+@mcp.tool()
+def get_dop_relationships(ctx, dop_path, offset=0, limit=100,
+                          max_objects=100):
+    """分页读取 DOP relationships（add-dops-tools，READ_ONLY）。
+
+    每个关系的对象名受 ``max_objects`` 硬上限约束；响应经过
+    ``apply_response_cap``。
+    """
+    return _houdini_call("get_dop_relationships", {
+        "dop_path": dop_path, "offset": offset, "limit": limit,
+        "max_objects": max_objects})
+
+
+@mcp.tool()
+def step_simulation(ctx, dop_path, frames=1):
+    """推进 DOP 模拟（add-dops-tools，NO_UNDO）。
+
+    通过 ``hou.setTime(frameToTime(current + frames))`` 后
+    ``dop_node.cook(force=True)``；拒绝 ``frames <= 0``，不恢复旧帧。
+    会触发依赖图 cook 与 DOP cache 生成/替换，**不**进入 undo group。
+    """
+    return _houdini_call("step_simulation", {
+        "dop_path": dop_path, "frames": frames})
+
+
+@mcp.tool()
+def reset_simulation(ctx, dop_path, reset_frame=None):
+    """时间线优先重置 DOP 模拟（add-dops-tools，NO_UNDO）。
+
+    先移动到 reset frame 并 force cook；可选 force-reset 仅在真实签名
+    探针和对应 Houdini 版本 live gate 同时允许时执行。cache 清空/重建
+    不可由 HIP undo 恢复，owned simulation 权限失败返回结构化 warning。
+    """
+    params = {"dop_path": dop_path}
+    if reset_frame is not None:
+        params["reset_frame"] = reset_frame
+    return _houdini_call("reset_simulation", params)
+
+
+@mcp.tool()
+def get_sim_memory_usage(ctx, dop_path):
+    """读取 DOP simulation 内存（add-dops-tools，READ_ONLY）。
+
+    使用 ``DopSimulation.memoryUsage()``，返回值明确标记 bytes；响应
+    经过 ``apply_response_cap``。
+    """
+    return _houdini_call("get_sim_memory_usage", {"dop_path": dop_path})
+
+
+# -------------------------------------------------------------------
+# add-pdg-tops-tools: 5 个 PDG/TOPs 工具。
+# 控制面一律走 hou.TopNode（cookWorkItems/getCookState/workItemStates/
+# dirtyWorkItems/cancelCook）；cook/dirty/cancel 改变 scheduler 与运行
+# 态结果，HIP undo 不能恢复，server dispatcher 在调用前关闭 mutating
+# undo segment。cook handle registry 为进程内、有界、重启失效。
+# pdg_status / pdg_workitems 只读；pdg_cook / pdg_dirty / pdg_cancel 不
+# 进 undo group。响应经过 server 端 ``apply_response_cap``。
+# -------------------------------------------------------------------
+@mcp.tool()
+def pdg_cook(ctx, node_path, blocking=False, timeout_seconds=300):
+    """启动 PDG/TOPs cook 并返回进程内 handle（add-pdg-tops-tools，NO_UNDO）。
+
+    通过 ``hou.TopNode.cookWorkItems(block=False)`` 启动 cook（仅当实机探针
+    证明该方法不可用时才 fallback 到 deprecated ``executeGraph``，并在响应
+    中披露）。同一节点已有 active cook 时返回同一 ``cook_id`` 与
+    ``already_running``，不启动第二个 cook；terminal 后的新调用生成新 ID。
+    ``blocking=True`` 轮询 ``getCookState(force=True)`` 至终态或
+    ``timeout_seconds``；超时返回 ``timed_out`` 且 handle 保持可用，不自动
+    cancel。handle 进程内有效（``scope: process``），server 重启后失效。
+    """
+    return _houdini_call("pdg_cook", {
+        "node_path": node_path, "blocking": blocking,
+        "timeout_seconds": timeout_seconds})
+
+
+@mcp.tool()
+def pdg_status(ctx, node_path, cook_id=None):
+    """查询 TOP cook 状态、work item 计数与 handle（add-pdg-tops-tools，READ_ONLY）。
+
+    使用 ``getCookState(force=True)`` 与 ``workItemStates()``，结合进程内
+    cook handle registry 返回 cook_state、各状态计数、是否终态与 handle 摘
+    要。``cook_id`` 给出时校验其属于该节点；未知/过期/属他节点返回结构化
+    错误。响应经过 ``apply_response_cap``。
+    """
+    params = {"node_path": node_path}
+    if cook_id is not None:
+        params["cook_id"] = cook_id
+    return _houdini_call("pdg_status", params)
+
+
+@mcp.tool()
+def pdg_workitems(ctx, node_path, status_filter=None, max_items=1000):
+    """读取已生成 work item 摘要（add-pdg-tops-tools，READ_ONLY）。
+
+    从 ``getPDGNode()`` 的已生成 work items 读取有界摘要（index/name/state）。
+    PDG graph 未生成时返回空列表与明确状态。受 ``status_filter`` 与
+    ``max_items`` 限制；响应经过 ``apply_response_cap``。
+    """
+    params = {"node_path": node_path, "max_items": max_items}
+    if status_filter is not None:
+        params["status_filter"] = status_filter
+    return _houdini_call("pdg_workitems", params)
+
+
+@mcp.tool()
+def pdg_dirty(ctx, node_path):
+    """dirty work items（add-pdg-tops-tools，NO_UNDO）。
+
+    调用 ``dirtyWorkItems(remove_outputs=False)``，默认**不**删除磁盘输出。
+    dirty 改变 scheduler 运行态，不可由 HIP undo 恢复，不进入 undo group。
+    """
+    return _houdini_call("pdg_dirty", {"node_path": node_path})
+
+
+@mcp.tool()
+def pdg_cancel(ctx, node_path, cook_id=None):
+    """cancel cook（add-pdg-tops-tools，NO_UNDO）。
+
+    调用 ``cancelCook()`` 并验证 handle 属于该节点；对已 terminal/cancelled
+    的 handle 返回稳定 cancelled 状态（幂等）。cancel 不可由 HIP undo 恢复，
+    不进入 undo group。
+    """
+    params = {"node_path": node_path}
+    if cook_id is not None:
+        params["cook_id"] = cook_id
+    return _houdini_call("pdg_cancel", params)
+
+
+# -------------------------------------------------------------------
+# add-usd-solaris-tools: 15 个 USD/Solaris bridge tool（薄封装到 server 端
+# 同名命令）。三分类见 server.py：
+# - MUTATING：lop_import / set_usd_attribute / create_lop_node
+#   （创建 / 连接 / 配置 LOP authoring 节点，单 undo group；
+#   pxr mutation 不直接调用，adapter 不可用时返回 unsupported）
+# - NO_UNDO：12 个 composed stage 查询（lop_stage_info / lop_prim_get /
+#   lop_prim_search / lop_layer_info / list_usd_prims / get_usd_attribute /
+#   get_usd_prim_stats / get_last_modified_prims / get_usd_composition /
+#   get_usd_variants / inspect_usd_layer / list_lights；获取
+#   ``LopNode.stage()`` 可能触发 LOP cook，不可由 HIP undo 恢复）
+# 本 change READ_ONLY 为空。composed stage 仅经 ``LopNode.stage()`` 只读读取。
+# -------------------------------------------------------------------
+@mcp.tool()
+def lop_stage_info(ctx, node_path, max_prims=500):
+    """composed stage 级元数据（add-usd-solaris-tools，NO_UNDO）。
+
+    从 ``LopNode.stage()`` 读取 upAxis / metersPerUnit /
+    framesPerSecond / defaultPrim 与有界 prim 计数。响应携带 capability
+    探针（Houdini 版本 / USD 版本 / feature flags）并过 server 端
+    ``apply_response_cap``。
+    """
+    return _houdini_call("lop_stage_info", {
+        "node_path": node_path, "max_prims": max_prims})
+
+
+@mcp.tool()
+def lop_prim_get(ctx, node_path, prim_path, max_attributes=100):
+    """单个 prim 的 type / active / loaded / kind + 有界属性
+    （add-usd-solaris-tools，NO_UNDO）。
+
+    ``prim_path`` 必填（USD path，如 ``/Asset``）。响应过 server 端
+    ``apply_response_cap``。
+    """
+    return _houdini_call("lop_prim_get", {
+        "node_path": node_path, "prim_path": prim_path,
+        "max_attributes": max_attributes})
+
+
+@mcp.tool()
+def lop_prim_search(ctx, node_path, name=None, type_name=None,
+                    max_prims=500, max_depth=5):
+    """按 name 子串 / type_name 精确匹配搜索 prim
+    （add-usd-solaris-tools，NO_UNDO）。
+
+    两者都省略时等价于 ``list_usd_prims``（受 cap 限制）。响应过 server
+    端 ``apply_response_cap``。
+    """
+    params = {"node_path": node_path, "max_prims": max_prims,
+              "max_depth": max_depth}
+    if name is not None:
+        params["name"] = name
+    if type_name is not None:
+        params["type_name"] = type_name
+    return _houdini_call("lop_prim_search", params)
+
+
+@mcp.tool()
+def lop_layer_info(ctx, node_path, max_layers=20):
+    """layer stack 摘要（add-usd-solaris-tools，NO_UNDO）。
+
+    读取 root / session / sublayer 的 identifier / real path / sublayer
+    数，受 ``max_layers`` 限制。响应过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("lop_layer_info", {
+        "node_path": node_path, "max_layers": max_layers})
+
+
+@mcp.tool()
+def list_usd_prims(ctx, node_path, max_depth=5, max_prims=500):
+    """受 max_depth / max_prims 限制的 prim 遍历
+    （add-usd-solaris-tools，NO_UNDO）。
+
+    返回 prim 路径 / 名称 / 类型 / 深度列表。响应过 server 端
+    ``apply_response_cap``。
+    """
+    return _houdini_call("list_usd_prims", {
+        "node_path": node_path, "max_depth": max_depth,
+        "max_prims": max_prims})
+
+
+@mcp.tool()
+def get_usd_attribute(ctx, node_path, prim_path, attribute, time=0):
+    """单个属性值 + 类型名（add-usd-solaris-tools，NO_UNDO）。
+
+    从 composed stage 读取 attribute 在 ``time`` 的值。响应过 server 端
+    ``apply_response_cap``。
+    """
+    return _houdini_call("get_usd_attribute", {
+        "node_path": node_path, "prim_path": prim_path,
+        "attribute": attribute, "time": time})
+
+
+@mcp.tool()
+def get_usd_prim_stats(ctx, node_path, prim_path):
+    """prim active / loaded / defined / abstract / instance + 属性计数
+    （add-usd-solaris-tools，NO_UNDO）。
+
+    响应过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("get_usd_prim_stats", {
+        "node_path": node_path, "prim_path": prim_path})
+
+
+@mcp.tool()
+def get_last_modified_prims(ctx, node_path):
+    """最近修改信息不可证明时返回 unsupported
+    （add-usd-solaris-tools，NO_UNDO）。
+
+    USD composed stage 无法提供可证明的 last-modified 排序；不伪造。响应
+    过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("get_last_modified_prims", {"node_path": node_path})
+
+
+@mcp.tool()
+def get_usd_composition(ctx, node_path, prim_path, max_arcs=50):
+    """composition arc 摘要（add-usd-solaris-tools，NO_UNDO）。
+
+    使用 ``Usd.PrimCompositionQuery`` 若可用；否则返回 unsupported。响应
+    过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("get_usd_composition", {
+        "node_path": node_path, "prim_path": prim_path,
+        "max_arcs": max_arcs})
+
+
+@mcp.tool()
+def get_usd_variants(ctx, node_path, prim_path):
+    """variant set 名称与当前选择（add-usd-solaris-tools，NO_UNDO）。
+
+    响应过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("get_usd_variants", {
+        "node_path": node_path, "prim_path": prim_path})
+
+
+@mcp.tool()
+def inspect_usd_layer(ctx, node_path, max_layers=20):
+    """layer 自定义元数据 / sublayer 路径（add-usd-solaris-tools，NO_UNDO）。
+
+    响应过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("inspect_usd_layer", {
+        "node_path": node_path, "max_layers": max_layers})
+
+
+@mcp.tool()
+def list_lights(ctx, node_path, max_lights=200):
+    """灯光识别：优先 UsdLux.LightAPI，再具体 schema IsA
+    （add-usd-solaris-tools，NO_UNDO）。
+
+    不依赖 ``UsdLux.Light`` 基类；缺少 API 时返回 capability warning。响应
+    过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("list_lights", {
+        "node_path": node_path, "max_lights": max_lights})
+
+
+@mcp.tool()
+def lop_import(ctx, parent_path, file_path, import_type="reference",
+               prim_path="/", node_name=None):
+    """创建 Reference 或 Sublayer LOP（add-usd-solaris-tools，MUTATING）。
+
+    创建 / 连接 / 配置是单 undo group 的连续步骤；失败 destroy 半成品。
+    **不**直接修改 stage layer stack；adapter 不可用时返回 unsupported。
+    ``import_type`` 接受 ``reference`` / ``sublayer``。响应过 server 端
+    ``apply_response_cap``。
+    """
+    params = {"parent_path": parent_path, "file_path": file_path,
+              "import_type": import_type, "prim_path": prim_path}
+    if node_name is not None:
+        params["node_name"] = node_name
+    return _houdini_call("lop_import", params)
+
+
+@mcp.tool()
+def set_usd_attribute(ctx, parent_path, prim_path, attribute, value,
+                      attribute_type="float", node_name=None):
+    """创建白名单属性 authoring LOP（add-usd-solaris-tools，MUTATING）。
+
+    按其真实参数 schema author；adapter 或 value 无法无损映射时返回
+    ``unsupported``，**禁止** fallback 到 composed stage mutation。
+    ``attribute_type`` 接受 ``float / int / string / vector``。响应过
+    server 端 ``apply_response_cap``。
+    """
+    params = {"parent_path": parent_path, "prim_path": prim_path,
+              "attribute": attribute, "value": value,
+              "attribute_type": attribute_type}
+    if node_name is not None:
+        params["node_name"] = node_name
+    return _houdini_call("set_usd_attribute", params)
+
+
+@mcp.tool()
+def create_lop_node(ctx, parent_path, node_type, node_name=None):
+    """在可编辑 LOP parent 下创建节点（add-usd-solaris-tools，MUTATING）。
+
+    ``node_type`` 必须在 ``hou.lopNodeTypeCategory().nodeTypes()`` 探针中
+    存在；单 undo group；失败 destroy 半成品。响应过 server 端
+    ``apply_response_cap``。
+    """
+    params = {"parent_path": parent_path, "node_type": node_type}
+    if node_name is not None:
+        params["node_name"] = node_name
+    return _houdini_call("create_lop_node", params)
+
+
+# -------------------------------------------------------------------
+# add-cops-tools: 7 个 Copernicus (COP) 工具（H21+）。
+# 仅面向 H21+ ``hou.CopNode``；旧 COP2 返回 unsupported_legacy_cop2，不调
+# copInfo/imagePlaneInfo/passThrough 等旧/虚构 API。output 读取
+# （geometry/cable/layer/vdb）可能触发 COP cook，server dispatcher 在调用
+# 前关闭 mutating undo segment，因此归 NO_UNDO_COMMANDS；list_cop_node_types
+# 只枚举 registry，归 READ_ONLY；create/set_cop_flags 归 MUTATING，单 undo
+# group。响应经过 server 端 ``apply_response_cap``。
+# 放在 PR 16 / PR 15 / PR 18 / PR 7 section header 之前以避免被
+# test_bridge_style (PR 7) / test_help (PR 15) / test_verify_hou_api
+# (PR 18) / test_connection (PR 16) 四套 AST 探针误识别。
+# -------------------------------------------------------------------
+@mcp.tool()
+def get_cop_info(ctx, node_path):
+    """读取 Copernicus 节点信息（add-cops-tools，NO_UNDO）。
+
+    返回 input/output data types、outputCableStructure 与每个 output 的
+    cable metadata（反射探针如实汇报 wire surface）。可能触发 COP cook；
+    响应经过 ``apply_response_cap``。
+    """
+    return _houdini_call("get_cop_info", {"node_path": node_path})
+
+
+@mcp.tool()
+def get_cop_geometry(ctx, node_path, output_index=0, frame=None):
+    """读取 Copernicus output geometry 摘要（add-cops-tools，NO_UNDO）。
+
+    调 ``geometry``/``geometryAtFrame``，只返回 point/prim/vertex counts、
+    bbox、有界 attrib 摘要；不序列化完整几何。``frame`` 可选，指定时走
+    AtFrame 变体。
+    """
+    params = {"node_path": node_path, "output_index": output_index}
+    if frame is not None:
+        params["frame"] = frame
+    return _houdini_call("get_cop_geometry", params)
+
+
+@mcp.tool()
+def get_cop_layer(ctx, node_path, output_index=0, frame=None):
+    """读取 Copernicus ImageLayer metadata（add-cops-tools，NO_UNDO）。
+
+    先调 ``layer``/``layerAtFrame``；不可得时从 ``cable`` 反射 wire 选择
+    ImageLayer（响应披露 ``cable_fallback_used``）。只返回 resolution/
+    storage/bounds，不返回原始像素。
+    """
+    params = {"node_path": node_path, "output_index": output_index}
+    if frame is not None:
+        params["frame"] = frame
+    return _houdini_call("get_cop_layer", params)
+
+
+@mcp.tool()
+def get_cop_vdb(ctx, node_path, output_index=0, frame=None):
+    """读取 Copernicus NanoVDB/grid metadata（add-cops-tools，NO_UNDO）。
+
+    先调 ``vdb``/``vdbAtFrame``；不可得时从 ``cable`` 反射 wire 选择
+    NanoVDB。只返回 grid_name/storage/bounds 等有界 metadata，不返回体素。
+    """
+    params = {"node_path": node_path, "output_index": output_index}
+    if frame is not None:
+        params["frame"] = frame
+    return _houdini_call("get_cop_vdb", params)
+
+
+@mcp.tool()
+def create_cop_node(ctx, parent_path, node_type, node_name=None):
+    """在 Copernicus parent 下创建节点（add-cops-tools，MUTATING）。
+
+    校验 parent 可编辑且 child category 为 "Cop"，node_type 必须在 Cop
+    registry 中存在；单 undo group。``node_name`` 可选。
+    """
+    params = {"parent_path": parent_path, "node_type": node_type}
+    if node_name is not None:
+        params["node_name"] = node_name
+    return _houdini_call("create_cop_node", params)
+
+
+@mcp.tool()
+def set_cop_flags(ctx, node_path, flags):
+    """原子设置 Copernicus 白名单 flags（add-cops-tools，MUTATING）。
+
+    ``flags`` 键只能是 display/export/template/selectable_template/
+    compress/bypass，值为 bool；未知键在任何写入前拒绝整次请求。单 undo group。
+    """
+    return _houdini_call("set_cop_flags", {
+        "node_path": node_path, "flags": flags})
+
+
+@mcp.tool()
+def list_cop_node_types(ctx, category="Cop"):
+    """枚举 Copernicus node type registry（add-cops-tools，READ_ONLY）。
+
+    默认枚举 "Cop" category（H21+ Copernicus）；``"Cop2"`` 显式拒绝为
+    legacy。只查询 registry，不触发 COP cook 或写入。
+    """
+    return _houdini_call("list_cop_node_types", {"category": category})
+
+
+@mcp.tool()
+def list_chop_channels(ctx, node_path, output_index=0):
+    """枚举 CHOP channel（track）名与 sample 范围（add-chops-tools，NO_UNDO）。
+
+    数据入口 ``ChopNode.clip()`` → ``Clip.tracks()``；返回每个 track 的
+    name、sample range/rate/count。读取可能触发 CHOP cook；响应经过
+    ``apply_response_cap``。
+    """
+    return _houdini_call("list_chop_channels", {
+        "node_path": node_path, "output_index": output_index})
+
+
+@mcp.tool()
+def get_chop_data(ctx, node_path, channels=None, output_index=0,
+                  sample=None, frame=None, time=None, start=None, end=None):
+    """有界读取 CHOP track 的 sample 数据（add-chops-tools，NO_UNDO）。
+
+    查询模式（优先级）：``sample``/``frame``/``time`` 单点（对应
+    ``evalAtSample``/``evalAtFrame``/``evalAtTime``）；``start``/``end``
+    sample index 闭区间（``evalAtSampleRange``，夹取到 clip range）；都不
+    给则完整 track（``numSamples<=上限`` 时 ``allSamples``）。多 track 受
+    max_channels / max_samples_per_channel / 响应 cap 三层限制。
+    """
+    params = {"node_path": node_path, "output_index": output_index}
+    if channels is not None:
+        params["channels"] = channels
+    if sample is not None:
+        params["sample"] = sample
+    if frame is not None:
+        params["frame"] = frame
+    if time is not None:
+        params["time"] = time
+    if start is not None:
+        params["start"] = start
+    if end is not None:
+        params["end"] = end
+    return _houdini_call("get_chop_data", params)
+
+
+@mcp.tool()
+def create_chop_node(ctx, parent_path, node_type, node_name=None):
+    """在 CHOP parent 下创建节点（add-chops-tools，MUTATING）。
+
+    校验 parent 可编辑且 child category 为 "Chop"，node_type 必须在 Chop
+    registry 中存在；单 undo group。``node_name`` 可选。
+    """
+    params = {"parent_path": parent_path, "node_type": node_type}
+    if node_name is not None:
+        params["node_name"] = node_name
+    return _houdini_call("create_chop_node", params)
+
+
+@mcp.tool()
+def export_chop_to_parm(ctx, chop_path, channel, target_path, target_parm,
+                        output_index=0, replace_existing=False):
+    """在目标参数建立 HScript chop() channel reference（add-chops-tools，MUTATING）。
+
+    预校验 source track + scalar numeric target parm；以
+    ``chop("<channel_path>")`` 表达式建立实时引用。不设 CHOP export flag、
+    不创 Export CHOP、不烘焙 keyframe。目标已有表达式/关键帧时默认拒绝，
+    ``replace_existing=True`` 时替换并披露。单 undo group。
+    """
+    params = {
+        "chop_path": chop_path, "channel": channel,
+        "target_path": target_path, "target_parm": target_parm,
+        "output_index": output_index,
+        "replace_existing": replace_existing,
+    }
+    return _houdini_call("export_chop_to_parm", params)
+
+
+# -------------------------------------------------------------------
+# add-takes-and-cache-tools: 8 个 bridge tool。
+# 全部透传 server 端同名命令；不引入隐藏 override / 授权参数。
+# 三分类见 server.py：
+# - READ_ONLY：list_takes / get_current_take / list_caches /
+#   get_cache_status
+# - MUTATING：set_current_take / create_take（单 undo group）
+# - NO_UNDO：clear_cache / write_cache（运行态 / 磁盘副作用，不
+#   进 undo group）
+# 风格：与 add-chops-tools / add-cops-tools 保持一致（无类型注解
+# + 中文 docstring）。
+# -------------------------------------------------------------------
+@mcp.tool()
+def list_takes(ctx):
+    """枚举全部 takes（add-takes-and-cache-tools，READ_ONLY）。
+
+    走 ``hou.takes.takes()`` 返回 name / path / parent / current 列表。
+    只读取，不修改场景。响应经过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("list_takes", {})
+
+
+@mcp.tool()
+def get_current_take(ctx):
+    """读取当前 take（add-takes-and-cache-tools，READ_ONLY）。
+
+    走 ``hou.takes.currentTake()`` 返回 name / path / parent。
+    响应经过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("get_current_take", {})
+
+
+@mcp.tool()
+def set_current_take(ctx, name_or_path):
+    """切换当前 take（add-takes-and-cache-tools，MUTATING）。
+
+    走 ``hou.takes.findTake`` 解析真实 ``hou.Take`` 对象后传给
+    ``hou.takes.setCurrentTake``，**不**传字符串。找不到 / 歧义时拒
+    绝。属于 take 编辑，单 undo group。响应过 server 端
+    ``apply_response_cap``。
+    """
+    return _houdini_call("set_current_take", {
+        "name_or_path": name_or_path,
+    })
+
+
+@mcp.tool()
+def create_take(ctx, name, include_parms=None, parent_take=None):
+    """创建 child take（add-takes-and-cache-tools，MUTATING）。
+
+    走 ``parent.addChildTake(name)``；先解析 parent 与每个 parm
+    路径为真实 ``hou.ParmTuple``，预校验全部成功后才写入。包含
+    parm 时临时切到新 take 调 ``addParmTuple``、finally 恢复原
+    current。预校验失败零部分残留。响应过 server 端
+    ``apply_response_cap``。
+    """
+    params = {"name": name}
+    if include_parms is not None:
+        params["include_parms"] = list(include_parms)
+    if parent_take is not None:
+        params["parent_take"] = parent_take
+    return _houdini_call("create_take", params)
+
+
+@mcp.tool()
+def list_caches(ctx, parent_path="/", max_nodes=256):
+    """枚举白名单 cache 节点（add-takes-and-cache-tools，READ_ONLY）。
+
+    走 ``_cache_nodes.list_caches`` 按 BFS 走 children，节点数受
+    ``max_nodes`` 限制；只匹配在 H21.0 / H22 实测通过的 File Cache
+    adapter 白名单，普通 ``Sop/file`` 等绝不出现。响应过 server 端
+    ``apply_response_cap``。
+    """
+    return _houdini_call("list_caches", {
+        "parent_path": parent_path, "max_nodes": max_nodes,
+    })
+
+
+@mcp.tool()
+def get_cache_status(ctx, node_path):
+    """读取 cache 节点 status 摘要（add-takes-and-cache-tools，READ_ONLY）。
+
+    走 ``_cache_nodes.get_cache_status``；未知 type 返回
+    ``unsupported_cache_type``。响应过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("get_cache_status", {"node_path": node_path})
+
+
+@mcp.tool()
+def clear_cache(ctx, node_path, remove_disk_file=False):
+    """清运行态 cache（add-takes-and-cache-tools，NO_UNDO）。
+
+    走 ``_cache_nodes.clear_cache``；改 ``loadfromdisk`` 并 cook；
+    ``remove_disk_file=True`` 才同步删磁盘文件。运行态 / 磁盘副作
+    用不可由 HIP undo 恢复，server dispatcher 在调用前关闭 mutating
+    undo segment。响应过 server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("clear_cache", {
+        "node_path": node_path,
+        "remove_disk_file": remove_disk_file,
+    })
+
+
+@mcp.tool()
+def write_cache(ctx, node_path):
+    """真实落盘 cache（add-takes-and-cache-tools，NO_UNDO）。
+
+    走 ``_cache_nodes.write_cache``；adapter.write 调
+    ``node.geometry().saveToFile(file)`` 写磁盘（H21 实测一致路
+    径）。返回 adapter、目标路径、文件操作、cook errors 与最终
+    状态。HIP undo 不能恢复磁盘结果，不进 undo group。响应过
+    server 端 ``apply_response_cap``。
+    """
+    return _houdini_call("write_cache", {"node_path": node_path})
+
+
+# -------------------------------------------------------------------
 # PR 16 Connection Diagnostic Tools (placed before PR 15 / PR 7 sections
 # so existing test_bridge_style (PR 7) and test_help PR 15 probes — which
 # scan @mcp.tool() strictly after their own header lines — do not pick it

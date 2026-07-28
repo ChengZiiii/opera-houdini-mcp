@@ -54,6 +54,13 @@ from . import _geo_measure as gme
 from . import _parameters as parm
 from . import _selection as sel
 from . import _viewport as vp
+from . import _dops as dops
+from . import _pdg as pdg
+from . import _usd as usd
+from . import _cops as cops
+from . import _chops as chops
+from . import _cache_nodes as caches
+
 
 RENDER_POLICY_COMMANDS = getattr(_rp, "RENDER_POLICY_COMMANDS", {})
 register_render_policy_command = getattr(
@@ -217,6 +224,28 @@ class HoudiniMCPServer:
         "create_material_network",
         # R10: capture_pane_screenshot, capture_multiple_panes and
         # render_node_network are intentionally classified in NO_UNDO_COMMANDS.
+        # add-usd-solaris-tools: 3 个 LOP 网络写命令 — 创建 / 连接 /
+        # 配置 Reference|Sublayer LOP（lop_import）、属性 authoring LOP
+        # （set_usd_attribute）、通用 LOP 节点（create_lop_node）。
+        # 均为可由 Houdini undo 恢复的 hip 网络编辑，单 undo group；
+        # **不**直接调用 composed stage / pxr mutation。
+        "lop_import", "set_usd_attribute", "create_lop_node",
+        # add-cops-tools: 2 个 Copernicus 写命令 — 创建节点与设置白名单
+        # flags。均为可由 Houdini undo 恢复的 hip 网络编辑，单 undo group；
+        # flags 走原子预校验白名单 + 官方 setter。
+        "create_cop_node", "set_cop_flags",
+        # add-chops-tools: 2 个 CHOP 写命令 — 创建节点与在目标参数建立
+        # HScript chop() channel reference。create_chop_node 是可由 Houdini
+        # undo 恢复的 hip 网络编辑；export_chop_to_parm 是参数表达式写
+        # （可 undo）。两者均单 undo group；不设 CHOP export flag、不创
+        # Export CHOP、不烘焙 keyframe。
+        "create_chop_node", "export_chop_to_parm",
+        # add-takes-and-cache-tools: 2 个 Takes 写命令 — set_current_take
+        # / create_take 是 hip take 编辑，Houdini undo 可恢复（单 undo
+        # group）；list_takes / get_current_take 只读，list_caches /
+        # get_cache_status 只读，clear_cache / write_cache 改运行态/磁盘
+        # 不可 undo，归 NO_UNDO_COMMANDS。
+        "set_current_take", "create_take",
     })
 
     READ_ONLY_COMMANDS = frozenset({
@@ -250,6 +279,25 @@ class HoudiniMCPServer:
         # hou.selectedNodes()，只查询不写，归 READ_ONLY_COMMANDS。
         # set_selection 写 UI/viewport 运行态，归 NO_UNDO_COMMANDS。
         "get_selection",
+        # add-dops-tools: 6 个有界 DOP 查询只读命令。它们只读取
+        # DopSimulation objects/findObject/relationships/time/timestep/
+        # memoryUsage 与 DOP data/record 摘要，不改变时间线或场景。
+        "get_simulation_info", "list_dop_objects", "get_dop_object",
+        "get_dop_field", "get_dop_relationships", "get_sim_memory_usage",
+        # add-pdg-tops-tools: 2 个 PDG/TOPs 只读查询命令。pdg_status 用
+        # getCookState(force=True)/workItemStates() + registry 返回 cook
+        # 状态与计数；pdg_workitems 从 getPDGNode() 读已生成 work item 摘
+        # 要。只查询 scheduler/graph 运行态，不 cook/dirty/cancel。
+        "pdg_status", "pdg_workitems",
+        # add-cops-tools: 1 个 Copernicus 只读命令。list_cop_node_types 只
+        # 枚举 node type registry，不触发 COP cook 或写入。
+        "list_cop_node_types",
+        # add-takes-and-cache-tools: 4 个查询命令。list_takes /
+        # get_current_take 只枚举 take 树，list_caches 走 children 遍历
+        # 不修改场景，get_cache_status 仅读取 adapter status — 均归
+        # READ_ONLY_COMMANDS。set_current_take / create_take 写 take 归
+        # MUTATING，clear_cache / write_cache 改运行态/磁盘归 NO_UNDO。
+        "list_takes", "get_current_take", "list_caches", "get_cache_status",
     })
 
     NO_UNDO_COMMANDS = frozenset({
@@ -300,6 +348,46 @@ class HoudiniMCPServer:
         "get_viewport_info", "set_viewport_camera", "set_viewport_display",
         "set_viewport_renderer", "frame_selection", "frame_all",
         "set_viewport_direction", "set_current_network",
+        # add-dops-tools: timeline + force cook/cache 运行态副作用。
+        # step/reset 改当前帧并生成、替换、清空或重建 DOP cache，HIP
+        # undo 不能恢复；batch 必须在执行前关闭 mutating undo segment。
+        # 二者只归 NO_UNDO，不得进 MUTATING_COMMANDS。
+        "step_simulation", "reset_simulation",
+        # add-pdg-tops-tools: 3 个 PDG/TOPs 调度/运行态命令。cook/dirty/
+        # cancel 改变 scheduler、work item 或运行态结果，HIP undo 不能恢
+        # 复，必须 no-undo 且**不**进 MUTATING_COMMANDS。唯一穷尽互斥断言
+        # 见 _validate_handler_classification。统一走 _pdg（hou 注入）+
+        # apply_response_cap；scheduler running-state 不进 hou.undos.group。
+        "pdg_cook", "pdg_dirty", "pdg_cancel",
+        # add-usd-solaris-tools: 12 个 USD/Solaris 查询命令。获取 composed
+        # stage（``LopNode.stage()``）可能触发 LOP cook / 运行态缓存变化，
+        # 不能由 HIP undo 恢复，只归 NO_UNDO_COMMANDS，**不**进 MUTATING。
+        # 唯一穷尽互斥断言见 _validate_handler_classification。统一走
+        # _usd（hou 注入 + pxr 惰性导入）+ apply_response_cap + capability
+        # 探针。pxr mutation 一律不直接调用（R10）。
+        "lop_stage_info", "lop_prim_get", "lop_prim_search",
+        "lop_layer_info", "list_usd_prims", "get_usd_attribute",
+        "get_usd_prim_stats", "get_last_modified_prims",
+        "get_usd_composition", "get_usd_variants", "inspect_usd_layer",
+        "list_lights",
+        # add-cops-tools: 4 个 Copernicus 查询命令。读取 output
+        # （geometry/cable/layer/vdb）可能触发 COP cook 与运行态缓存变化，
+        # 不能由 HIP undo 恢复，只归 NO_UNDO_COMMANDS，**不**进 MUTATING。
+        # 唯一穷尽互斥断言见 _validate_handler_classification。统一走
+        # _cops（hou 注入）+ apply_response_cap；cable wire surface 反射探针。
+        "get_cop_info", "get_cop_geometry", "get_cop_layer", "get_cop_vdb",
+        # add-chops-tools: 2 个 CHOP 查询命令。clip()/track 数据访问可能触
+        # 发 CHOP cook 与运行态缓存变化，不能由 HIP undo 恢复，只归
+        # NO_UNDO_COMMANDS，**不**进 MUTATING。唯一穷尽互斥断言见
+        # _validate_handler_classification。统一走 _chops（hou 注入）
+        # + apply_response_cap；本 change 的 READ_ONLY_COMMANDS 为空。
+        "get_chop_data", "list_chop_channels",
+        # add-takes-and-cache-tools: 2 个磁盘/运行态副作用命令。clear
+        # cache 改 loadfromdisk 并 cook，write_cache 真实写磁盘文件；
+        # HIP undo 不能恢复运行态 / 磁盘结果。两者只归 NO_UNDO_COMMANDS
+        # 不得进 MUTATING_COMMANDS。统一走 _cache_nodes（hou 注入 +
+        # adapter registry）+ apply_response_cap。
+        "clear_cache", "write_cache",
     })
 
     OPTIONAL_ASSET_COMMANDS = frozenset({
@@ -694,6 +782,86 @@ class HoudiniMCPServer:
             "frame_all": self.handle_frame_all,
             "set_viewport_direction": self.handle_set_viewport_direction,
             "set_current_network": self.handle_set_current_network,
+            # add-dops-tools: 8 个 DOP 查询/控制 handler。6 查询归
+            # READ_ONLY；step/reset 归 NO_UNDO。统一走 _dops（hou
+            # 注入）+ apply_response_cap；simulation/cook/cache 不进入
+            # hou.undos.group。
+            "get_simulation_info": self.handle_get_simulation_info,
+            "list_dop_objects": self.handle_list_dop_objects,
+            "get_dop_object": self.handle_get_dop_object,
+            "get_dop_field": self.handle_get_dop_field,
+            "get_dop_relationships": self.handle_get_dop_relationships,
+            "step_simulation": self.handle_step_simulation,
+            "reset_simulation": self.handle_reset_simulation,
+            "get_sim_memory_usage": self.handle_get_sim_memory_usage,
+            # add-pdg-tops-tools: 5 个 PDG/TOPs handler。2 查询（pdg_status
+            # / pdg_workitems）归 READ_ONLY；cook/dirty/cancel 归 NO_UNDO。
+            # 统一走 _pdg（hou 注入）+ apply_response_cap；cook handle
+            # registry 与 scheduler running-state 不进入 hou.undos.group。
+            "pdg_cook": self.handle_pdg_cook,
+            "pdg_status": self.handle_pdg_status,
+            "pdg_workitems": self.handle_pdg_workitems,
+            "pdg_dirty": self.handle_pdg_dirty,
+            "pdg_cancel": self.handle_pdg_cancel,
+            # add-usd-solaris-tools：15 个 USD/Solaris handler。
+            # 三分类见上方 MUTATING（lop_import / set_usd_attribute /
+            # create_lop_node）+ NO_UNDO（12 个 composed stage 查询）；
+            # 本 change 的 READ_ONLY 为空。唯一穷尽互斥断言见
+            # _validate_handler_classification。统一走 _usd
+            # （hou 注入 + pxr 惰性导入）+ apply_response_cap。
+            "lop_stage_info": self.handle_lop_stage_info,
+            "lop_prim_get": self.handle_lop_prim_get,
+            "lop_prim_search": self.handle_lop_prim_search,
+            "lop_layer_info": self.handle_lop_layer_info,
+            "list_usd_prims": self.handle_list_usd_prims,
+            "get_usd_attribute": self.handle_get_usd_attribute,
+            "get_usd_prim_stats": self.handle_get_usd_prim_stats,
+            "get_last_modified_prims": self.handle_get_last_modified_prims,
+            "get_usd_composition": self.handle_get_usd_composition,
+            "get_usd_variants": self.handle_get_usd_variants,
+            "inspect_usd_layer": self.handle_inspect_usd_layer,
+            "list_lights": self.handle_list_lights,
+            "lop_import": self.handle_lop_import,
+            "set_usd_attribute": self.handle_set_usd_attribute,
+            "create_lop_node": self.handle_create_lop_node,
+            # add-cops-tools：7 个 Copernicus (COP) handler。三分类见
+            # 上方 MUTATING（create_cop_node / set_cop_flags）+ NO_UNDO（4
+            # 个 output 查询）+ READ_ONLY（list_cop_node_types）；唯一穷尽
+            # 互斥断言见 _validate_handler_classification。统一走 _cops
+            # （hou 注入）+ apply_response_cap；仅 H21+ hou.CopNode，旧 COP2
+            # 返回 unsupported_legacy_cop2。
+            "get_cop_info": self.handle_get_cop_info,
+            "get_cop_geometry": self.handle_get_cop_geometry,
+            "get_cop_layer": self.handle_get_cop_layer,
+            "get_cop_vdb": self.handle_get_cop_vdb,
+            "create_cop_node": self.handle_create_cop_node,
+            "set_cop_flags": self.handle_set_cop_flags,
+            "list_cop_node_types": self.handle_list_cop_node_types,
+            # add-chops-tools：4 个 CHOP handler。三分类见上方
+            # MUTATING（create_chop_node / export_chop_to_parm）+ NO_UNDO
+            # （2 个 clip/track 查询）；本 change 的 READ_ONLY 为空。唯一
+            # 穷尽互斥断言见 _validate_handler_classification。统一走
+            # _chops（hou 注入）+ apply_response_cap；数据入口
+            # ChopNode.clip。
+            "get_chop_data": self.handle_get_chop_data,
+            "list_chop_channels": self.handle_list_chop_channels,
+            "create_chop_node": self.handle_create_chop_node,
+            "export_chop_to_parm": self.handle_export_chop_to_parm,
+            # add-takes-and-cache-tools：8 个新增 handler。三分类见上方
+            # 注释：4 READ_ONLY（list_takes / get_current_take /
+            # list_caches / get_cache_status）+ 2 MUTATING（set_current_take
+            # / create_take）+ 2 NO_UNDO（clear_cache / write_cache）；
+            # 唯一穷尽互斥断言见 _validate_handler_classification。统一
+            # 走 _scene（takes）+ _cache_nodes（adapter registry，
+            # hou 注入）+ apply_response_cap。
+            "list_takes": self.handle_list_takes,
+            "get_current_take": self.handle_get_current_take,
+            "set_current_take": self.handle_set_current_take,
+            "create_take": self.handle_create_take,
+            "list_caches": self.handle_list_caches,
+            "get_cache_status": self.handle_get_cache_status,
+            "clear_cache": self.handle_clear_cache,
+            "write_cache": self.handle_write_cache,
         }
 
         if getattr(getattr(hou, "session", None),
@@ -3317,3 +3485,358 @@ class HoudiniMCPServer:
         """
         return cmn.apply_response_cap(
             vp.set_current_network(hou, path=path))
+
+    # -----------------------------------------------------------------
+    # add-dops-tools: 8 个 DOP 查询/控制 handler
+    # -----------------------------------------------------------------
+    def handle_get_simulation_info(self, dop_path):
+        """读取 DOP simulation frame/time/timestep/object_count。"""
+        return cmn.apply_response_cap(
+            dops.get_simulation_info(hou, dop_path))
+
+    def handle_list_dop_objects(self, dop_path, offset=0, limit=100):
+        """分页列出 DOP objects；只返回有界 data 摘要。"""
+        return cmn.apply_response_cap(dops.list_dop_objects(
+            hou, dop_path, offset=offset, limit=limit))
+
+    def handle_get_dop_object(self, dop_path, object_name, max_data=64):
+        """通过 findObject 返回单个 DOP object 的有界摘要。"""
+        return cmn.apply_response_cap(dops.get_dop_object(
+            hou, dop_path, object_name, max_data=max_data))
+
+    def handle_get_dop_field(self, dop_path, object_name, data_name,
+                             field_name, record_type="Options",
+                             record_index=0):
+        """读取 DOP data/record 字段；volume/VDB 不返回原始体素。"""
+        return cmn.apply_response_cap(dops.get_dop_field(
+            hou, dop_path, object_name, data_name, field_name,
+            record_type=record_type, record_index=record_index))
+
+    def handle_get_dop_relationships(self, dop_path, offset=0, limit=100,
+                                     max_objects=100):
+        """分页读取 DOP relationships 与有界对象名。"""
+        return cmn.apply_response_cap(dops.get_dop_relationships(
+            hou, dop_path, offset=offset, limit=limit,
+            max_objects=max_objects))
+
+    def handle_step_simulation(self, dop_path, frames=1):
+        """时间线推进 + force cook；运行态 cache 副作用，不进 undo。"""
+        return cmn.apply_response_cap(dops.step_simulation(
+            hou, dop_path, frames=frames))
+
+    def handle_reset_simulation(self, dop_path, reset_frame=None):
+        """时间线优先 reset；force-reset 受签名/live 双门禁，不进 undo。"""
+        return cmn.apply_response_cap(dops.reset_simulation(
+            hou, dop_path, reset_frame=reset_frame))
+
+    def handle_get_sim_memory_usage(self, dop_path):
+        """读取 DopSimulation.memoryUsage 并标明 bytes。"""
+        return cmn.apply_response_cap(
+            dops.get_sim_memory_usage(hou, dop_path))
+
+    # -----------------------------------------------------------------
+    # add-pdg-tops-tools: 5 个 PDG/TOPs handler（透传 _pdg + cap）。
+    # cook/dirty/cancel 归 NO_UNDO_COMMANDS，scheduler running-state 不进
+    # undo group；status/workitems 归 READ_ONLY_COMMANDS。所有路径经过
+    # apply_response_cap。
+    # -----------------------------------------------------------------
+    def handle_pdg_cook(self, node_path, blocking=False,
+                        timeout_seconds=300):
+        """启动 PDG/TOPs cook 并返回进程内 handle（NO_UNDO）。"""
+        return cmn.apply_response_cap(pdg.pdg_cook(
+            hou, node_path, blocking=blocking,
+            timeout_seconds=timeout_seconds))
+
+    def handle_pdg_status(self, node_path, cook_id=None):
+        """查询 TOP cook 状态、work item 计数与 handle（READ_ONLY）。"""
+        return cmn.apply_response_cap(pdg.pdg_status(
+            hou, node_path, cook_id=cook_id))
+
+    def handle_pdg_workitems(self, node_path, status_filter=None,
+                             max_items=1000):
+        """读取已生成 work item 摘要（READ_ONLY）。"""
+        return cmn.apply_response_cap(pdg.pdg_workitems(
+            hou, node_path, status_filter=status_filter,
+            max_items=max_items))
+
+    def handle_pdg_dirty(self, node_path):
+        """dirty work items，不删除磁盘输出（NO_UNDO）。"""
+        return cmn.apply_response_cap(pdg.pdg_dirty(hou, node_path))
+
+    def handle_pdg_cancel(self, node_path, cook_id=None):
+        """cancel cook，对已 terminal handle 幂等（NO_UNDO）。"""
+        return cmn.apply_response_cap(pdg.pdg_cancel(
+            hou, node_path, cook_id=cook_id))
+
+    # -----------------------------------------------------------------
+    # add-usd-solaris-tools: 15 个 USD/Solaris handler（薄封装 _usd +
+    # apply_response_cap）。三分类：3 MUTATING（lop_import /
+    # set_usd_attribute / create_lop_node）+ 12 NO_UNDO（composed stage
+    # 查询，可能触发 LOP cook）；本 change READ_ONLY 为空。composed stage
+    # 仅经 ``LopNode.stage()`` 只读读取；pxr mutation 不直接调用（R10）。
+    # -----------------------------------------------------------------
+    def handle_lop_stage_info(self, node_path, max_prims=500):
+        """composed stage 级元数据（NO_UNDO）。"""
+        return cmn.apply_response_cap(usd.lop_stage_info(
+            hou, node_path, max_prims=max_prims))
+
+    def handle_lop_prim_get(self, node_path, prim_path,
+                            max_attributes=100):
+        """单个 prim 的 type / active / loaded / kind + 有界属性（NO_UNDO）。"""
+        return cmn.apply_response_cap(usd.lop_prim_get(
+            hou, node_path, prim_path, max_attributes=max_attributes))
+
+    def handle_lop_prim_search(self, node_path, name=None, type_name=None,
+                               max_prims=500, max_depth=5):
+        """按 name / type_name 搜索 prim（NO_UNDO）。"""
+        return cmn.apply_response_cap(usd.lop_prim_search(
+            hou, node_path, name=name, type_name=type_name,
+            max_prims=max_prims, max_depth=max_depth))
+
+    def handle_lop_layer_info(self, node_path, max_layers=20):
+        """layer stack 摘要（NO_UNDO）。"""
+        return cmn.apply_response_cap(usd.lop_layer_info(
+            hou, node_path, max_layers=max_layers))
+
+    def handle_list_usd_prims(self, node_path, max_depth=5, max_prims=500):
+        """受 max_depth / max_prims 限制的 prim 遍历（NO_UNDO）。"""
+        return cmn.apply_response_cap(usd.list_usd_prims(
+            hou, node_path, max_depth=max_depth, max_prims=max_prims))
+
+    def handle_get_usd_attribute(self, node_path, prim_path, attribute,
+                                 time=0):
+        """单个属性值 + 类型名（NO_UNDO）。"""
+        return cmn.apply_response_cap(usd.get_usd_attribute(
+            hou, node_path, prim_path, attribute, time=time))
+
+    def handle_get_usd_prim_stats(self, node_path, prim_path):
+        """prim active / loaded / defined / abstract / instance（NO_UNDO）。"""
+        return cmn.apply_response_cap(usd.get_usd_prim_stats(
+            hou, node_path, prim_path))
+
+    def handle_get_last_modified_prims(self, node_path):
+        """最近修改不可证明时返回 unsupported（NO_UNDO）。"""
+        return cmn.apply_response_cap(usd.get_last_modified_prims(
+            hou, node_path))
+
+    def handle_get_usd_composition(self, node_path, prim_path, max_arcs=50):
+        """composition arc 摘要（NO_UNDO）。"""
+        return cmn.apply_response_cap(usd.get_usd_composition(
+            hou, node_path, prim_path, max_arcs=max_arcs))
+
+    def handle_get_usd_variants(self, node_path, prim_path):
+        """variant set 名称与选择（NO_UNDO）。"""
+        return cmn.apply_response_cap(usd.get_usd_variants(
+            hou, node_path, prim_path))
+
+    def handle_inspect_usd_layer(self, node_path, max_layers=20):
+        """layer 自定义元数据 / sublayer 路径（NO_UNDO）。"""
+        return cmn.apply_response_cap(usd.inspect_usd_layer(
+            hou, node_path, max_layers=max_layers))
+
+    def handle_list_lights(self, node_path, max_lights=200):
+        """灯光识别：LightAPI 优先，再具体 schema IsA（NO_UNDO）。"""
+        return cmn.apply_response_cap(usd.list_lights(
+            hou, node_path, max_lights=max_lights))
+
+    def handle_lop_import(self, parent_path, file_path,
+                          import_type="reference", prim_path="/",
+                          node_name=None):
+        """创建 Reference 或 Sublayer LOP（MUTATING，单 undo group）。"""
+        return cmn.apply_response_cap(usd.lop_import(
+            hou, parent_path, file_path, import_type=import_type,
+            prim_path=prim_path, node_name=node_name))
+
+    def handle_set_usd_attribute(self, parent_path, prim_path, attribute,
+                                 value, attribute_type="float",
+                                 node_name=None):
+        """创建白名单属性 authoring LOP（MUTATING）。
+
+        adapter 或 value 不可无损映射时返回 unsupported，**不** fallback
+        到 composed stage / pxr mutation（R10）。
+        """
+        return cmn.apply_response_cap(usd.set_usd_attribute(
+            hou, parent_path, prim_path, attribute, value,
+            attribute_type=attribute_type, node_name=node_name))
+
+    def handle_create_lop_node(self, parent_path, node_type,
+                               node_name=None):
+        """在可编辑 LOP parent 下创建节点（MUTATING，单 undo group）。"""
+        return cmn.apply_response_cap(usd.create_lop_node(
+            hou, parent_path, node_type, node_name=node_name))
+
+    # -----------------------------------------------------------------
+    # add-cops-tools: 7 个 Copernicus (COP) handler（薄封装 _cops +
+    # apply_response_cap）。三分类：2 MUTATING（create_cop_node /
+    # set_cop_flags）+ 4 NO_UNDO（output 查询，可能触发 COP cook）+ 1
+    # READ_ONLY（list_cop_node_types）；仅 H21+ hou.CopNode，旧 COP2 返
+    # unsupported_legacy_cop2。create/set_cop_flags 由 server `_undo_group`
+    # 上下文管理入 hou.undos.group。
+    # -----------------------------------------------------------------
+    def handle_get_cop_info(self, node_path):
+        """Copernicus 节点 input/output types + cable structure（NO_UNDO）。"""
+        return cmn.apply_response_cap(cops.get_cop_info(hou, node_path))
+
+    def handle_get_cop_geometry(self, node_path, output_index=0, frame=None):
+        """Copernicus output 有界 geometry 摘要（NO_UNDO）。"""
+        return cmn.apply_response_cap(cops.get_cop_geometry(
+            hou, node_path, output_index=output_index, frame=frame))
+
+    def handle_get_cop_layer(self, node_path, output_index=0, frame=None):
+        """Copernicus ImageLayer metadata（NO_UNDO）。"""
+        return cmn.apply_response_cap(cops.get_cop_layer(
+            hou, node_path, output_index=output_index, frame=frame))
+
+    def handle_get_cop_vdb(self, node_path, output_index=0, frame=None):
+        """Copernicus NanoVDB/grid metadata（NO_UNDO）。"""
+        return cmn.apply_response_cap(cops.get_cop_vdb(
+            hou, node_path, output_index=output_index, frame=frame))
+
+    def handle_create_cop_node(self, parent_path, node_type, node_name=None):
+        """在 Copernicus parent 下创建节点（MUTATING，单 undo group）。"""
+        return cmn.apply_response_cap(cops.create_cop_node(
+            hou, parent_path, node_type, node_name=node_name))
+
+    def handle_set_cop_flags(self, node_path, flags):
+        """原子设置 Copernicus 白名单 flags（MUTATING）。"""
+        return cmn.apply_response_cap(cops.set_cop_flags(
+            hou, node_path, flags))
+
+    def handle_list_cop_node_types(self, category="Cop"):
+        """枚举 Copernicus node type registry（READ_ONLY）。"""
+        return cmn.apply_response_cap(cops.list_cop_node_types(
+            hou, category=category))
+
+    # -----------------------------------------------------------------
+    # add-chops-tools: 4 个 CHOP handler（薄封装 _chops + apply_response_cap）。
+    # 三分类：2 MUTATING（create_chop_node / export_chop_to_parm）+ 2 NO_UNDO
+    # （get_chop_data / list_chop_channels，clip()/track 访问可能触发 CHOP
+    # cook）；本 change 的 READ_ONLY 为空。create/export 由 server
+    # `_undo_group` 上下文管理入 hou.undos.group；读取不进 undo group。
+    # -----------------------------------------------------------------
+    def handle_list_chop_channels(self, node_path, output_index=0):
+        """枚举 CHOP clip channel（track）名/range/rate/count（NO_UNDO）。"""
+        return cmn.apply_response_cap(chops.list_chop_channels(
+            hou, node_path, output_index=output_index))
+
+    def handle_get_chop_data(self, node_path, channels=None,
+                             output_index=0, sample=None, frame=None,
+                             time=None, start=None, end=None):
+        """有界读取 CHOP track sample 数据（NO_UNDO）。"""
+        return cmn.apply_response_cap(chops.get_chop_data(
+            hou, node_path, channels=channels, output_index=output_index,
+            sample=sample, frame=frame, time=time, start=start, end=end))
+
+    def handle_create_chop_node(self, parent_path, node_type,
+                                node_name=None):
+        """在 CHOP parent 下创建节点（MUTATING，单 undo group）。"""
+        return cmn.apply_response_cap(chops.create_chop_node(
+            hou, parent_path, node_type, node_name=node_name))
+
+    def handle_export_chop_to_parm(self, chop_path, channel, target_path,
+                                   target_parm, output_index=0,
+                                   replace_existing=False):
+        """在目标参数建立 HScript chop() channel reference（MUTATING）。"""
+        return cmn.apply_response_cap(chops.export_chop_to_parm(
+            hou, chop_path, channel, target_path, target_parm,
+            output_index=output_index, replace_existing=replace_existing))
+
+    # -----------------------------------------------------------------
+    # add-takes-and-cache-tools: 8 个新增 handler
+    # - READ_ONLY：list_takes / get_current_take / list_caches /
+    #   get_cache_status
+    # - MUTATING：set_current_take / create_take（单 undo group）
+    # - NO_UNDO：clear_cache / write_cache（运行态 / 磁盘副作用，不
+    #   进 undo group）
+    # Takes 走 ``_scene.list_takes / get_current_take / set_current_take
+    # / create_take``，cache 走 ``_cache_nodes`` 统一 adapter registry；
+    # 所有响应过 ``apply_response_cap``。set_current_take 把 hou.Take 对
+    # 象（**不**是字符串）传给 ``hou.takes.setCurrentTake``；create_take
+    # 在任何写入前完成 parent / parm 原子预校验 + include 时临时切换
+    # current + finally 恢复。cache adapter 仅匹配白名单 File Cache 系
+    # 列，普通 ``Sop/file`` 永远不在白名单内。clear / write 不进
+    # ``hou.undos.group``，文档明确披露磁盘副作用不可由 Houdini undo 恢
+    # 复。
+    # -----------------------------------------------------------------
+    def handle_list_takes(self):
+        """add-takes-and-cache-tools：枚举 hou.takes.takes()。
+
+        走 ``_scene.list_takes``；返回 ``takes / count / total /
+        truncated``。响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(scn.list_takes(hou))
+
+    def handle_get_current_take(self):
+        """add-takes-and-cache-tools：当前 take。
+
+        走 ``_scene.get_current_take``；返回 ``name / path / parent /
+        current``。响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(scn.get_current_take(hou))
+
+    def handle_set_current_take(self, name_or_path):
+        """add-takes-and-cache-tools：把 hou.Take 对象传给 setCurrentTake。
+
+        走 ``_scene.set_current_take``；先 ``hou.takes.findTake`` 解析
+        真实 Take 对象，**不**传字符串；找不到 / 歧义时拒绝。响应过
+        ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            scn.set_current_take(hou, name_or_path))
+
+    def handle_create_take(self, name, include_parms=None,
+                           parent_take=None):
+        """add-takes-and-cache-tools：创建 child take + include parms。
+
+        走 ``_scene.create_take``；先解析 parent / parm 全部成功后才
+        调 ``parent.addChildTake``；include 阶段临时切到新 Take 调
+        ``addParmTuple``、finally 恢复原 take。预校验失败零部分 take
+        残留。响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            scn.create_take(hou, name,
+                            include_parms=include_parms,
+                            parent_take=parent_take))
+
+    def handle_list_caches(self, parent_path="/", max_nodes=256):
+        """add-takes-and-cache-tools：白名单 cache 节点枚举（READ_ONLY）。
+
+        走 ``_cache_nodes.list_caches``；按 BFS 走 children，节点数受
+        ``max_nodes`` 限制；不在 adapter 白名单（含普通 ``Sop/file``）
+        的节点不出现。响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            caches.list_caches(hou, parent_path=parent_path,
+                               max_nodes=max_nodes))
+
+    def handle_get_cache_status(self, node_path):
+        """add-takes-and-cache-tools：单 cache 节点 status 摘要（READ_ONLY）。
+
+        走 ``_cache_nodes.get_cache_status``；未知 type 返回
+        ``unsupported_cache_type``。响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            caches.get_cache_status(hou, node_path))
+
+    def handle_clear_cache(self, node_path, remove_disk_file=False):
+        """add-takes-and-cache-tools：清运行态 cache（NO_UNDO）。
+
+        走 ``_cache_nodes.clear_cache``；改 ``loadfromdisk`` + cook；
+        ``remove_disk_file=True`` 才会同步删磁盘文件，**仍**不可由
+        HIP undo 恢复。响应过 ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            caches.clear_cache(hou, node_path,
+                               remove_disk_file=remove_disk_file))
+
+    def handle_write_cache(self, node_path):
+        """add-takes-and-cache-tools：真实落盘 cache（NO_UNDO）。
+
+        走 ``_cache_nodes.write_cache``；adapter.write 调
+        ``node.geometry().saveToFile(file)`` 写磁盘；返回 adapter、
+        目标路径、文件操作、cook errors 与最终状态。HIP undo 不能恢复
+        磁盘结果，工具不进 ``hou.undos.group``。响应过
+        ``apply_response_cap``。
+        """
+        return cmn.apply_response_cap(
+            caches.write_cache(hou, node_path))
