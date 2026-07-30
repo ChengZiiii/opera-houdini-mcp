@@ -41,8 +41,16 @@ _CLEANED = False
 
 
 def _env_dir():
-    """返回与 embedded environment 并列的 houdinimcp-env 根目录。"""
-    return os.path.join(_PACKAGE_ROOT, "houdinimcp-env")
+    """返回与 embedded environment 并列的 ``<package>-env`` 根目录。
+
+    默认从当前 ``__file__`` 所在目录名派生；可由 ``HOUDINI_MCP_ENV_DIR``
+    环境变量覆盖（绝对路径）。相对路径 override 会被忽略。
+    """
+    override = os.environ.get("HOUDINI_MCP_ENV_DIR", "").strip()
+    if override and os.path.isabs(override):
+        return override
+    pkg_dir = _MODULE_DIR
+    return os.path.join(pkg_dir, "..", f"{os.path.basename(pkg_dir)}-env")
 
 
 def _headless_dir():

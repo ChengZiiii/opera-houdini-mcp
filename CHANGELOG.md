@@ -75,6 +75,26 @@
 
 ---
 
+## 0.1.1-opera · 2026-07-21 · F-C bug 复盘 + AI 调 hou API 硬约束
+
+> **状态**：已合入。补强 `execute_code` 安全护栏 + 桥接 `verify_hou_api` 工具。
+
+### F-C bug 案例（2026-07-21）
+
+orchestrator 在 `execute_code` 中尝试 `obj.setInput(0, sop, 0)`，假定 `ObjNode.setInput` 与 `SopNode.setInput` 签名等价。实际调用触发 hou 内部 type-check，在 MCP worker thread 同步执行，Houdini **整进程 hang 30s+**，最终返 `timed_out=True`，且 `serialize_scene_state` 在同一 worker thread 排队导致 scene 状态无法快照。
+
+**根因**：AI agent 假定跨版本 / 跨类的 hou API 签名等价，未先 verify 直接写进 `execute_code` 的 `code` 参数。
+
+**修复**：
+
+- README 新增「AI 调用 hou API 的硬约束」章节，明确 verify-first 工作流
+- 新增桥接工具 `verify_hou_api(item_name, help_type="python_hou")`（AI-friendly wrapper over `get_houdini_help`），返 `_ai_hint` 字段提示 thread 安全 caveat
+- 测试覆盖：`tests/test_verify_hou_api.py` + `tests/test_three_tier_fallback.py`
+
+**教训**：不在 doc 里假设签名 = 直接踩雷。`hou` 是 C 扩展，跨 major version 间会重命名 / 废弃 / 新增方法。
+
+---
+
 ## 0.1.0-opera · 2026-07-17 · Fork 初始化
 
 ### 已合入

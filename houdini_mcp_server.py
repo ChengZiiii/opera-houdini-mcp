@@ -301,9 +301,25 @@ def _env_truthy(name):
         "1", "true", "yes", "on")
 
 
+def _default_env_dir():
+    """Derive env dir from package dirname: <package_parent>/<package_basename>-env.
+
+    Fresh clone: package at opera-houdini-mcp/ → env at opera-houdini-mcp-env/.
+    Embedded: package at external/houdinimcp/ → env at external/houdinimcp-env/.
+    """
+    return os.path.join(_HERE, "..", f"{os.path.basename(_HERE)}-env")
+
+
 def _env_dir():
-    """返回 embedded env 根目录；不创建依赖目录。"""
-    return os.path.join(os.path.dirname(_HERE), "houdinimcp-env")
+    """返回 embedded env 根目录；不创建依赖目录。
+
+    优先级：HOUDINI_MCP_ENV_DIR（绝对路径）> 默认派生。相对路径的 override
+    会被忽略（fallback 到默认派生），避免 bridge 进程 cwd 不可靠。
+    """
+    override = os.environ.get("HOUDINI_MCP_ENV_DIR", "").strip()
+    if override and os.path.isabs(override):
+        return override
+    return _default_env_dir()
 
 
 def _headless_dir():

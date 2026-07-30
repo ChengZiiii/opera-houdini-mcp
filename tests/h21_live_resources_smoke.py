@@ -19,8 +19,19 @@ HYTHON = r"C:\Program Files\Side Effects Software\Houdini 21.0.596\bin\hython.ex
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 BRIDGE = os.path.join(ROOT, "houdini_mcp_server.py")
-PYLIBS = os.path.join(ROOT, "..", "..", "external", "houdinimcp-env", "python", "Lib", "site-packages")
-ENV_PYTHON = os.path.normpath(os.path.join(ROOT, "..", "..", "external", "houdinimcp-env", "python", "python.exe"))
+
+
+def _env_dir():
+    """Derive env dir from package dirname: <package_parent>/<package_basename>-env."""
+    override = os.environ.get("HOUDINI_MCP_ENV_DIR", "").strip()
+    if override and os.path.isabs(override):
+        return override
+    return os.path.join(ROOT, "..", f"{os.path.basename(ROOT)}-env")
+
+
+_ENV_DIR = _env_dir()
+PYLIBS = os.path.join(_ENV_DIR, "python", "Lib", "site-packages")
+ENV_PYTHON = os.path.join(_ENV_DIR, "python", "python.exe")
 
 
 def _check(condition, label, failures):
@@ -34,8 +45,8 @@ def _check(condition, label, failures):
 async def main():
     """直接 import bridge 的 mcp 实例，跑 MCP protocol 资源 list/read。"""
     failures = []
-    # 把 houdinimcp-env 的 pylibs 加进去以拿到真实 mcp 1.12.2
-    sys.path.insert(0, os.path.normpath(os.path.join(ROOT, "..", "houdinimcp-env", "pylibs")))
+    # 把 env 的 pylibs 加进去以拿到真实 mcp 1.12.2
+    sys.path.insert(0, os.path.join(_ENV_DIR, "pylibs"))
 
     # 重新 import houdini_mcp_server
     for k in list(sys.modules):

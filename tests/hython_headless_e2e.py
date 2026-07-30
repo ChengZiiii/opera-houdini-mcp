@@ -22,6 +22,14 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 
+def _env_dir():
+    """Derive env dir from package dirname: <package_parent>/<package_basename>-env."""
+    override = os.environ.get("HOUDINI_MCP_ENV_DIR", "").strip()
+    if override and os.path.isabs(override):
+        return override
+    return os.path.join(ROOT, "..", f"{os.path.basename(ROOT)}-env")
+
+
 def _find_hython(explicit=None):
     candidates = []
     if explicit:
@@ -53,8 +61,7 @@ def _find_bridge_python():
     configured = os.environ.get("HOUDINI_MCP_BRIDGE_PYTHON")
     if configured:
         candidates.append(configured)
-    candidates.append(os.path.join(
-        ROOT, "..", "houdinimcp-env", "python", "python.exe"))
+    candidates.append(os.path.join(_env_dir(), "python", "python.exe"))
     for candidate in candidates:
         if os.path.isfile(candidate):
             return os.path.abspath(candidate)

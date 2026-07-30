@@ -13,8 +13,9 @@
 
 设计原则：
 - hou 通过参数注入 / 不顶层 import hou，便于纯 Python 单测。
-- 复用 fork 已有 ``external/houdinimcp-env/`` 目录作为 sentinel 文件
-  落盘位置（与 ``houdini-mcp-env`` 嵌入式 env 同根），不引入新路径。
+- 复用 fork 派生的 ``<module_parent>/<module_basename>-env/`` 目录作为
+  sentinel 文件落盘位置（与嵌入式 env 同根），不引入新路径。env 名由
+  ``_env_dir()`` 从 module 目录名派生（或 ``HOUDINI_MCP_ENV_DIR`` 覆盖）。
 - 通用机制 = MCP 协议通用的结构化 dict 字段（``_redirect`` / ``_interrupt``），
   由 bridge 层透传到任何 AI 客户端（Kilo / Cursor / Claude Desktop / Cline
   / ZCode / OpenCode）。**不**依赖 ``hou.ui.displayMessage`` 弹窗（H21 主
@@ -34,8 +35,9 @@ API：
     _interrupt_dict(renderer, token, prompt, expires_in_seconds) -> dict:
         构造标准 interrupt dict。
     _consent_dir() -> str:
-        返回 ``<fork_root>/../houdinimcp-env/.karma_consent/`` 绝对路径，
-        ``os.makedirs(exist_ok=True)`` 确保存在。
+        返回 ``<module_parent>/<module_basename>-env/.karma_consent/`` 绝对
+        路径（env 名由 ``_env_dir()`` 派生），``os.makedirs(exist_ok=True)``
+        确保存在。
     register_render_policy_command(command, adapter) -> callable:
         注册公开 render command 的 Layer 1 adapter；重复同值注册幂等，
         冲突注册拒绝。
@@ -48,13 +50,13 @@ import time
 import uuid
 
 
-# fork 模块所在目录的父目录即为 ``external/houdinimcp-env/`` 的同级兄弟
-# （与 ``houdinimcp-env`` 嵌入式 env 共享根）。绝对化以便 sentinel 文件
-# 落盘路径在 fork 进程内一致；测试可通过 monkeypatch ``_env_dir`` 切到
-# tmp_path 隔离。
+# Module dir 的兄弟（即 ``<module_parent>/<module_basename>-env/``）即
+# embedded env 根。绝对化以便 sentinel 文件落盘路径在 fork 进程内一致；
+# 测试可通过 monkeypatch ``_env_dir`` 切到 tmp_path 隔离。
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
-_FORK_PARENT = os.path.dirname(_MODULE_DIR)
-_DEFAULT_ENV_DIR = os.path.join(_FORK_PARENT, "houdinimcp-env")
+_DEFAULT_ENV_DIR = os.path.join(
+    _MODULE_DIR, "..", f"{os.path.basename(_MODULE_DIR)}-env"
+)
 _DEFAULT_CONSENT_SUBDIR = ".karma_consent"
 _DEFAULT_RENDER_ENGINE = "opengl"
 _DEFAULT_KARMA_ENGINE = "cpu"
@@ -97,19 +99,27 @@ def register_render_policy_command(command, adapter):
 
 
 def _env_dir():
-    """返回 ``external/houdinimcp-env/`` 绝对路径（fork 嵌入式 env 根）。
+    """返回 embedded env 绝对路径（与 module 同级的 ``<name>-env/``）。
 
-    设计上为函数而非常量，便于测试 monkeypatch 切换到 tmp_path。
-    生产路径下 ``houdinimcp-env/`` 由 MCP Install 按钮下载（见
-    ``AGENTS.md``），存在性由 ``_consent_dir`` 的 ``os.makedirs`` 兜底。
+    默认从 module 所在目录名派生；可由 ``HOUDINI_MCP_ENV_DIR`` 环境变量
+    覆盖（绝对路径）。相对路径 override 会被忽略（fallback 到默认派生），
+    避免进程 cwd 差异影响路径解析。
+
+    设为函数而非常量，便于测试 monkeypatch 切换到 tmp_path 隔离。
+    生产路径下 env 由 MCP Install 流程下载，存在性由 ``_consent_dir``
+    的 ``os.makedirs`` 兜底。
     """
+    override = os.environ.get("HOUDINI_MCP_ENV_DIR", "").strip()
+    if override and os.path.isabs(override):
+        return override
     return _DEFAULT_ENV_DIR
 
 
 def _consent_dir():
     """返回 consent sentinel 文件目录，绝对路径，自动 ``os.makedirs``。
 
-    路径：``<fork 模块父目录>/houdinimcp-env/.karma_consent/``。
+    路径：``<module_parent>/<module_basename>-env/.karma_consent/``
+    （env 名由 ``_env_dir()`` 派生或 ``HOUDINI_MCP_ENV_DIR`` 覆盖）。
     父目录不存在时 ``os.makedirs(exist_ok=True)`` 兜底创建，避免上层
     入口在 MCP Install 尚未跑过的环境里崩。
     """
