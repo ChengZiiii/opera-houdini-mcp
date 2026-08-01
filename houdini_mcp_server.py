@@ -1197,9 +1197,11 @@ def get_last_scene_diff(ctx: Context) -> str:
 
 
 @mcp.tool()
-def save_scene(ctx: Context, file_path: str) -> str:
+def save_scene(ctx: Context, file_path: str | None = None) -> str:
     """Save the current Houdini scene to file_path.
 
+    file_path 省略（None/""）时保存到当前 hip 路径（hou.hipFile.path()）；
+    会话 untitled（无 hip 路径）时返回错误而非弹出模态保存对话框。
     Returns JSON like {"saved": true, "file_path": "..."} or an error string.
     """
     return _houdini_call("save_scene", {"file_path": file_path})
@@ -1219,6 +1221,9 @@ def load_scene(ctx: Context, file_path: str) -> str:
 def new_scene(ctx: Context) -> str:
     """Reset Houdini to an empty scene (suppress_save_prompt=True).
 
+    默认禁用：未设置 HOUDINI_MCP_ALLOW_NEW_SCENE（或非 truthy）时返回错误，
+    禁止 AI 自主清空用户场景；需显式放行时由用户设置
+    HOUDINI_MCP_ALLOW_NEW_SCENE=1。
     Server-side also calls cmn.invalidate_all_caches().
     """
     return _houdini_call("new_scene", {})

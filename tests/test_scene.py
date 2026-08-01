@@ -118,11 +118,13 @@ class _FakeHipFile(object):
         self.saved = []
         self.loaded = []
         self.cleared = 0
+        # 当前 hip 路径；"" 表示 untitled（未保存会话）
+        self._path = "/tmp/scene.hip"
 
     def save(self, *args, **kwargs):
-        # hou.hipFile.save(file_path=..., save_as_revert=False)
-        # 也支持位置参数。统一记录。
-        path = kwargs.get("file_path")
+        # H21 实测签名：save(file_name=None, save_to_recent_files=True)。
+        # 也支持位置参数。统一记录 (path, kwargs)。
+        path = kwargs.get("file_name")
         if path is None and args:
             path = args[0]
         self.saved.append((path, kwargs))
@@ -137,7 +139,10 @@ class _FakeHipFile(object):
         return True
 
     def name(self):
-        return "/tmp/scene.hip"
+        return self._path
+
+    def path(self):
+        return self._path
 
 
 class _FakeHou(object):
@@ -301,6 +306,44 @@ class SaveSceneTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             scn.save_scene(hou, "/tmp/out.hip")
 
+    # ------------------------------------------------------------------
+    # fix-save-scene-untitled-dialog-hang：untitled 守卫 + H21 file_name=
+    # ------------------------------------------------------------------
+    def test_save_uses_h21_file_name_kwarg(self):
+        """用例 A：显式 file_path → 以 file_name=<path> 调用 save。"""
+        hou = _make_hou()
+        result = scn.save_scene(hou, "/tmp/out.hip")
+        self.assertEqual(len(hou.hipFile.saved), 1)
+        path, kwargs = hou.hipFile.saved[0]
+        self.assertEqual(path, "/tmp/out.hip")
+        self.assertEqual(kwargs.get("file_name"), "/tmp/out.hip",
+                         "save must be called with H21 file_name= keyword")
+        self.assertEqual(result, {"saved": True, "file_path": "/tmp/out.hip"})
+
+    def test_empty_path_uses_current_hip_path(self):
+        """用例 B：file_path 空 + hou.hipFile.path() 非空 → 以当前路径保存。"""
+        for empty in ("", None):
+            hou = _make_hou()
+            result = scn.save_scene(hou, empty)
+            self.assertEqual(len(hou.hipFile.saved), 1)
+            path, kwargs = hou.hipFile.saved[0]
+            self.assertEqual(path, "/tmp/scene.hip")
+            self.assertEqual(kwargs.get("file_name"), "/tmp/scene.hip")
+            self.assertEqual(result,
+                             {"saved": True, "file_path": "/tmp/scene.hip"})
+
+    def test_untitled_raises_and_never_calls_save(self):
+        """用例 C：file_path 空 + untitled（path 为空）→ ValueError，save 未被调用。"""
+        hou = _make_hou()
+        hou.hipFile._path = ""  # 会话 untitled
+        with self.assertRaises(ValueError) as ctx:
+            scn.save_scene(hou, "")
+        self.assertIn("untitled", str(ctx.exception))
+        self.assertIn("file_path", str(ctx.exception),
+                      "error message must point the caller to pass file_path")
+        self.assertEqual(len(hou.hipFile.saved), 0,
+                         "hou.hipFile.save must NOT be called on untitled")
+
 
 # ===========================================================================
 # Section C: _scene.load_scene
@@ -336,6 +379,22 @@ class LoadSceneTests(unittest.TestCase):
 # Section D: _scene.new_scene
 # ===========================================================================
 class NewSceneTests(unittest.TestCase):
+    """放行后的行为（env 显式置 truthy；未放行用例见 NewSceneGateTests）。
+
+    fix-save-scene-untitled-dialog-hang 起 new_scene 默认禁用（env 闸），
+    既有用例验证"放行后"行为，因此 setUp 显式放行。
+    """
+
+    def setUp(self):
+        self._saved_env = os.environ.get("HOUDINI_MCP_ALLOW_NEW_SCENE")
+        os.environ["HOUDINI_MCP_ALLOW_NEW_SCENE"] = "1"
+
+    def tearDown(self):
+        if self._saved_env is None:
+            os.environ.pop("HOUDINI_MCP_ALLOW_NEW_SCENE", None)
+        else:
+            os.environ["HOUDINI_MCP_ALLOW_NEW_SCENE"] = self._saved_env
+
     def test_calls_hipFile_clear(self):
         hou = _make_hou()
         scn.new_scene(hou)
@@ -371,6 +430,57 @@ class NewSceneTests(unittest.TestCase):
         result = scn.new_scene(hou)
         self.assertIsInstance(result, dict)
         self.assertTrue(result.get("cleared"))
+
+
+class NewSceneGateTests(unittest.TestCase):
+    """new_scene env 闸（设计 D4）：未放行快速失败，绝不调用 hipFile.clear。
+
+    env 保存 / 恢复模式参考 tests/test_execute_code_safety.py:134-141。
+    """
+
+    def setUp(self):
+        self._saved_env = os.environ.get("HOUDINI_MCP_ALLOW_NEW_SCENE")
+        os.environ.pop("HOUDINI_MCP_ALLOW_NEW_SCENE", None)
+
+    def tearDown(self):
+        if self._saved_env is None:
+            os.environ.pop("HOUDINI_MCP_ALLOW_NEW_SCENE", None)
+        else:
+            os.environ["HOUDINI_MCP_ALLOW_NEW_SCENE"] = self._saved_env
+
+    def test_unset_env_raises_and_never_calls_clear(self):
+        """用例 D：env 未设置 → ValueError（含 "new_scene is disabled"），clear 未被调用。"""
+        hou = _make_hou()
+        with self.assertRaises(ValueError) as ctx:
+            scn.new_scene(hou)
+        self.assertIn("new_scene is disabled", str(ctx.exception))
+        self.assertIn("save_scene", str(ctx.exception),
+                      "error message must recommend save_scene(file_path=...)")
+        self.assertIn("HOUDINI_MCP_ALLOW_NEW_SCENE", str(ctx.exception),
+                      "error message must mention the env opt-in")
+        self.assertEqual(hou.hipFile.cleared, 0,
+                         "hou.hipFile.clear must NOT be called when disabled")
+
+    def test_non_truthy_env_raises_and_never_calls_clear(self):
+        """用例 D 变体：env 非 truthy（0 / false / 缺失 / 其他值）→ 拒绝。"""
+        for value in ("0", "false", "no", "maybe", "off"):
+            os.environ["HOUDINI_MCP_ALLOW_NEW_SCENE"] = value
+            hou = _make_hou()
+            with self.assertRaises(ValueError) as ctx:
+                scn.new_scene(hou)
+            self.assertIn("new_scene is disabled", str(ctx.exception))
+            self.assertEqual(hou.hipFile.cleared, 0,
+                             "clear must NOT be called for env=%r" % value)
+
+    def test_truthy_env_allows_clear(self):
+        """用例 E：env 为 1 / TRUE / yes（含大小写）→ 正常 clear 返回 {"cleared": True}。"""
+        for value in ("1", "TRUE", "yes", "on", "Yes", " true "):
+            os.environ["HOUDINI_MCP_ALLOW_NEW_SCENE"] = value
+            hou = _make_hou()
+            result = scn.new_scene(hou)
+            self.assertEqual(hou.hipFile.cleared, 1,
+                             "clear must be called for env=%r" % value)
+            self.assertEqual(result, {"cleared": True})
 
 
 # ===========================================================================

@@ -2,9 +2,12 @@
 
 模块职责：
 - get_scene_info: 场景元信息（含 houdini_version / node_count / file_path）
-- save_scene: hou.hipFile.save 包装
+- save_scene: hou.hipFile.save 包装（untitled 守卫：file_path 为空时取
+  hou.hipFile.path()，仍为空则抛 ValueError 快速失败——**绝不**以空路径
+  调用 save 触发模态"Choose File"对话框）
 - load_scene: hou.hipFile.load 包装 + 缓存失效
-- new_scene: hou.hipFile.clear 包装 + 缓存失效
+- new_scene: hou.hipFile.clear 包装 + 缓存失效（**默认禁用**：需
+  HOUDINI_MCP_ALLOW_NEW_SCENE 显式放行，禁止 AI 自主清空用户场景）
 - serialize_scene: 全场景递归序列化（thin wrapper around cmn.serialize_scene_state）
 - get_network_overview: 有界 BFS 节点 / 边遍历，预设 ``max_depth`` /
   ``max_nodes`` 预算，返回 ``visited_count / truncated /
@@ -25,6 +28,8 @@
   ``max_nodes`` 截断 HOM 遍历；``apply_response_cap`` 仅作为最终 R6
   防线（add-scene-context-selection-materials D1）。
 """
+import os
+
 from . import _common as cmn
 
 
@@ -76,8 +81,22 @@ def get_scene_info(hou):
 
 
 def save_scene(hou, file_path):
-    """保存当前 .hip 文件到 file_path，返回成功 dict。异常向上传播。"""
-    hou.hipFile.save(file_path=file_path)
+    """保存当前 .hip 文件到 file_path，返回成功 dict。异常向上传播。
+
+    - ``file_path`` 为空（None/""）→ 取 ``hou.hipFile.path()`` 作为目标路径。
+    - 取到后仍为空（会话 untitled / 未保存）→ 抛 ``ValueError`` 快速失败，
+      **绝不**调用 ``hou.hipFile.save()``（空路径会触发 Houdini 主线程模态
+      "Choose File" 对话框，导致 MCP 命令循环挂死），错误信息提示调用方
+      显式传 ``file_path``。
+    - 非空路径走 H21 实测签名 ``hou.hipFile.save(file_name=...)``。
+    """
+    if not file_path:
+        file_path = hou.hipFile.path() or ""
+        if not file_path:
+            raise ValueError(
+                "Scene is untitled (no hip file path); save_scene requires "
+                "an explicit file_path")
+    hou.hipFile.save(file_name=file_path)
     return {
         "saved": True,
         "file_path": file_path,
@@ -98,12 +117,38 @@ def load_scene(hou, file_path):
     }
 
 
+_NEW_SCENE_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _new_scene_allowed():
+    """读环境变量 HOUDINI_MCP_ALLOW_NEW_SCENE 判定放行。
+
+    truthy 语义与 ``_common._bypass_config_enabled``（HOUDINI_MCP_ALLOW_BYPASS）
+    一致：strip + lowercase 后 ∈ {"1","true","yes","on"}；未设置 / 其他值
+    一律视为未放行。
+    """
+    raw = os.environ.get("HOUDINI_MCP_ALLOW_NEW_SCENE")
+    if raw is None:
+        return False
+    return raw.strip().lower() in _NEW_SCENE_TRUTHY
+
+
 def new_scene(hou):
     """新建空白场景（hou.hipFile.clear），返回成功 dict。
 
-    suppress_save_prompt=True 避免在 MCP 流程中触发交互式保存提示。
-    完成后调用 cmn.invalidate_all_caches()。
+    默认**禁用**（设计 D4）：未设置 ``HOUDINI_MCP_ALLOW_NEW_SCENE``（或
+    非 truthy）时抛 ``ValueError`` 快速失败，**不**调用
+    ``hou.hipFile.clear()``，避免 AI 自主清空用户已保存的会话；错误信息
+    引导改用 ``save_scene(file_path=...)`` 另存为新 hip，或由用户设置
+    ``HOUDINI_MCP_ALLOW_NEW_SCENE=1`` 显式放行。
+    放行后行为与现状一致：``suppress_save_prompt=True`` 避免交互式保存
+    提示，完成后调用 ``cmn.invalidate_all_caches()``。
     """
+    if not _new_scene_allowed():
+        raise ValueError(
+            "new_scene is disabled: 禁止 AI 自主清空场景。"
+            "请用 save_scene(file_path=...) 另存为新 hip；"
+            "或由用户设置 HOUDINI_MCP_ALLOW_NEW_SCENE=1 显式放行")
     hou.hipFile.clear(suppress_save_prompt=True)
     cmn.invalidate_all_caches()
     return {

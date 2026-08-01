@@ -26,6 +26,22 @@ SERVER_PATH = os.path.join(ROOT, "server.py")
 BRIDGE_PATH = os.path.join(ROOT, "houdini_mcp_server.py")
 
 
+def _is_stdlib_top_level(name):
+    """顶层模块名是否标准库（3.10+ 用 sys.stdlib_module_names）。"""
+    stdlib_names = getattr(sys, "stdlib_module_names", None)
+    if stdlib_names is not None:
+        return name in stdlib_names
+    # 旧解释器回退：site-packages 之外的模块视为标准库
+    try:
+        spec = importlib.util.find_spec(name)
+    except (ImportError, AttributeError, ValueError):
+        return False
+    if spec is None:
+        return False
+    origin = spec.origin or ""
+    return "site-packages" not in origin and "dist-packages" not in origin
+
+
 # ---------------------------------------------------------------------------
 # Mock objects — Takes / FileCache / 普通 Sop/file。
 # ---------------------------------------------------------------------------
@@ -460,6 +476,13 @@ class TakesQueryTests(unittest.TestCase):
         cls.scene = _load_scene()
 
     def test_module_does_not_import_hou_or_new_dependencies(self):
+        """_scene.py 不得 import hou 或任何第三方新依赖。
+
+        fix-save-scene-untitled-dialog-hang 起允许顶层标准库模块
+        （new_scene env 闸需要 os.environ）；第三方便用
+        sys.stdlib_module_names（3.10+）排除，旧解释器按 origin
+        是否位于 site-packages 判定。
+        """
         source = open(SCENE_PATH, "r", encoding="utf-8").read()
         tree = ast.parse(source)
         imports = set()
@@ -469,8 +492,15 @@ class TakesQueryTests(unittest.TestCase):
             elif isinstance(node, ast.ImportFrom):
                 imports.add(node.module or "")
         self.assertNotIn("hou", imports)
-        self.assertTrue(imports <= {"", "_common"} or
-                        imports <= {"_common"})
+        non_stdlib = set()
+        for name in imports:
+            if name in ("", "_common"):
+                continue  # 内部相对导入
+            if _is_stdlib_top_level(name):
+                continue  # 标准库（如 os）
+            non_stdlib.add(name)
+        self.assertFalse(non_stdlib,
+                         "unexpected non-stdlib import(s): %r" % sorted(non_stdlib))
 
     def test_forbidden_fictional_apis_absent(self):
         source = open(SCENE_PATH, "r", encoding="utf-8").read()
