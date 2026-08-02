@@ -1830,7 +1830,7 @@ def render_specific_camera(ctx: Context,
 # NEW OPUS API Tools
 # -------------------------------------------------------------------
 
-@mcp.tool()
+# @mcp.tool()  # slim-mcp-toolset: 已注销注册（恢复 = 取消注释本行）
 def opus_get_model_names(ctx: Context) -> List[str]:
     """
     Returns a list of available OPUS component/structure names.
@@ -1841,7 +1841,7 @@ def opus_get_model_names(ctx: Context) -> List[str]:
         return []
     return _opus.get_all_component_names()
 
-@mcp.tool()
+# @mcp.tool()  # slim-mcp-toolset: 已注销注册（恢复 = 取消注释本行）
 def opus_get_model_params_schema(ctx: Context, structure: str) -> dict:
     """
     Retrieves the parameter schema or format instructions for a given OPUS model structure.
@@ -1855,7 +1855,7 @@ def opus_get_model_params_schema(ctx: Context, structure: str) -> dict:
     # 委托 _opus；配置不全时返回稳定 disabled error（不 import requests/langchain）。
     return _opus.get_formatted_opus_params(structure)
 
-@mcp.tool()
+# @mcp.tool()  # slim-mcp-toolset: 已注销注册（恢复 = 取消注释本行）
 def opus_create_model(ctx: Context, structure: str, parameters: Dict[str, Any], count: int = 1) -> dict:
     """
     Starts a batch job to create one or more 3D models using the OPUS API.
@@ -1874,7 +1874,7 @@ def opus_create_model(ctx: Context, structure: str, parameters: Dict[str, Any], 
     # 委托 _opus；配置不全时返回稳定 disabled error。
     return _opus.create_opus_component(structure, parameters, count)
 
-@mcp.tool()
+# @mcp.tool()  # slim-mcp-toolset: 已注销注册（恢复 = 取消注释本行）
 def opus_variate_model(ctx: Context, result_id: str, count: int = 12) -> dict:
     """
     Starts a batch job to create variations of an existing OPUS model result.
@@ -1895,7 +1895,7 @@ def opus_variate_model(ctx: Context, result_id: str, count: int = 12) -> dict:
 # NEW Tools Forwarding to Houdini for OPUS Job Handling
 # -------------------------------------------------------------------
 
-@mcp.tool()
+# @mcp.tool()  # slim-mcp-toolset: 已注销注册（恢复 = 取消注释本行）
 def opus_check_job_status(ctx: Context, batch_id: str) -> dict:
     """
     Checks the status of an OPUS batch job directly via the API.
@@ -1909,7 +1909,7 @@ def opus_check_job_status(ctx: Context, batch_id: str) -> dict:
     # 委托 _opus；配置不全时返回稳定 disabled error。
     return _opus.get_opus_job_result(batch_job_id=batch_id)
 
-@mcp.tool()
+# @mcp.tool()  # slim-mcp-toolset: 已注销注册（恢复 = 取消注释本行）
 def opus_import_model_url(ctx: Context, download_url: str, node_name: str = None) -> str:
     """
     Asks Houdini to download a model (zip containing USD) from a URL and import it into the scene.
@@ -2222,7 +2222,7 @@ def capture_sceneviewer_flipbook_views(ctx, views=None, save_dir=None,
 # PR 7 section probe does not pick them up — the probe scans all
 # @mcp.tool() after the PR 7 header without an explicit upper bound)
 # -------------------------------------------------------------------
-@mcp.tool(name="render_viewport_base64")
+# @mcp.tool(name="render_viewport_base64")  # slim-mcp-toolset: 已注销注册（恢复 = 取消注释本行）
 def render_viewport_base64(ctx, camera_path=None, geometry_path=None,
                            renderer="opengl", resolution=(640, 480),
                            format="PNG", consent_token=None):
@@ -2256,7 +2256,7 @@ def render_viewport_base64(ctx, camera_path=None, geometry_path=None,
     })
 
 
-@mcp.tool(name="render_quad_views_base64")
+# @mcp.tool(name="render_quad_views_base64")  # slim-mcp-toolset: 已注销注册（恢复 = 取消注释本行）
 def render_quad_views_base64(ctx, geometry_path=None, renderer="opengl",
                               resolution=(480, 360), format="PNG",
                               consent_token=None):
@@ -2287,7 +2287,7 @@ def render_quad_views_base64(ctx, geometry_path=None, renderer="opengl",
     })
 
 
-@mcp.tool(name="render_specific_camera_base64")
+# @mcp.tool(name="render_specific_camera_base64")  # slim-mcp-toolset: 已注销注册（恢复 = 取消注释本行）
 def render_specific_camera_base64(ctx, camera_path, resolution=(640, 480),
                                    format="PNG", renderer="opengl",
                                    consent_token=None):
@@ -3570,16 +3570,7 @@ def get_sim_memory_usage(ctx, dop_path):
 # -------------------------------------------------------------------
 @mcp.tool()
 def pdg_cook(ctx, node_path, blocking=False, timeout_seconds=300):
-    """启动 PDG/TOPs cook 并返回进程内 handle（add-pdg-tops-tools，NO_UNDO）。
-
-    通过 ``hou.TopNode.cookWorkItems(block=False)`` 启动 cook（仅当实机探针
-    证明该方法不可用时才 fallback 到 deprecated ``executeGraph``，并在响应
-    中披露）。同一节点已有 active cook 时返回同一 ``cook_id`` 与
-    ``already_running``，不启动第二个 cook；terminal 后的新调用生成新 ID。
-    ``blocking=True`` 轮询 ``getCookState(force=True)`` 至终态或
-    ``timeout_seconds``；超时返回 ``timed_out`` 且 handle 保持可用，不自动
-    cancel。handle 进程内有效（``scope: process``），server 重启后失效。
-    """
+    """启动 PDG/TOPs cook 并返回进程内 handle。blocking=True 时阻塞轮询至终态或超时；handle 进程内有效，server 重启失效。"""
     return _houdini_call("pdg_cook", {
         "node_path": node_path, "blocking": blocking,
         "timeout_seconds": timeout_seconds})
@@ -3587,13 +3578,7 @@ def pdg_cook(ctx, node_path, blocking=False, timeout_seconds=300):
 
 @mcp.tool()
 def pdg_status(ctx, node_path, cook_id=None):
-    """查询 TOP cook 状态、work item 计数与 handle（add-pdg-tops-tools，READ_ONLY）。
-
-    使用 ``getCookState(force=True)`` 与 ``workItemStates()``，结合进程内
-    cook handle registry 返回 cook_state、各状态计数、是否终态与 handle 摘
-    要。``cook_id`` 给出时校验其属于该节点；未知/过期/属他节点返回结构化
-    错误。响应经过 ``apply_response_cap``。
-    """
+    """查询 TOP cook 状态与 work item 计数。可选 cook_id 校验其归属；未知/过期返回结构化错误。"""
     params = {"node_path": node_path}
     if cook_id is not None:
         params["cook_id"] = cook_id
@@ -3602,12 +3587,7 @@ def pdg_status(ctx, node_path, cook_id=None):
 
 @mcp.tool()
 def pdg_workitems(ctx, node_path, status_filter=None, max_items=1000):
-    """读取已生成 work item 摘要（add-pdg-tops-tools，READ_ONLY）。
-
-    从 ``getPDGNode()`` 的已生成 work items 读取有界摘要（index/name/state）。
-    PDG graph 未生成时返回空列表与明确状态。受 ``status_filter`` 与
-    ``max_items`` 限制；响应经过 ``apply_response_cap``。
-    """
+    """读取已生成 work item 摘要（index/name/state）。PDG 未生成时返回空列表；受 status_filter 与 max_items 限制。"""
     params = {"node_path": node_path, "max_items": max_items}
     if status_filter is not None:
         params["status_filter"] = status_filter
@@ -3616,22 +3596,13 @@ def pdg_workitems(ctx, node_path, status_filter=None, max_items=1000):
 
 @mcp.tool()
 def pdg_dirty(ctx, node_path):
-    """dirty work items（add-pdg-tops-tools，NO_UNDO）。
-
-    调用 ``dirtyWorkItems(remove_outputs=False)``，默认**不**删除磁盘输出。
-    dirty 改变 scheduler 运行态，不可由 HIP undo 恢复，不进入 undo group。
-    """
+    """dirty work items，默认不删除磁盘输出。改变 scheduler 运行态，不可 undo。"""
     return _houdini_call("pdg_dirty", {"node_path": node_path})
 
 
 @mcp.tool()
 def pdg_cancel(ctx, node_path, cook_id=None):
-    """cancel cook（add-pdg-tops-tools，NO_UNDO）。
-
-    调用 ``cancelCook()`` 并验证 handle 属于该节点；对已 terminal/cancelled
-    的 handle 返回稳定 cancelled 状态（幂等）。cancel 不可由 HIP undo 恢复，
-    不进入 undo group。
-    """
+    """cancel 正在运行的 cook；对已终态 handle 幂等返回 cancelled。cancel 不可 undo。"""
     params = {"node_path": node_path}
     if cook_id is not None:
         params["cook_id"] = cook_id
@@ -3946,12 +3917,7 @@ def list_cop_node_types(ctx, category="Cop"):
 
 @mcp.tool()
 def list_chop_channels(ctx, node_path, output_index=0):
-    """枚举 CHOP channel（track）名与 sample 范围（add-chops-tools，NO_UNDO）。
-
-    数据入口 ``ChopNode.clip()`` → ``Clip.tracks()``；返回每个 track 的
-    name、sample range/rate/count。读取可能触发 CHOP cook；响应经过
-    ``apply_response_cap``。
-    """
+    """枚举 CHOP 通道（track）名与采样范围。参数：node_path，output_index 可选。"""
     return _houdini_call("list_chop_channels", {
         "node_path": node_path, "output_index": output_index})
 
@@ -3959,14 +3925,7 @@ def list_chop_channels(ctx, node_path, output_index=0):
 @mcp.tool()
 def get_chop_data(ctx, node_path, channels=None, output_index=0,
                   sample=None, frame=None, time=None, start=None, end=None):
-    """有界读取 CHOP track 的 sample 数据（add-chops-tools，NO_UNDO）。
-
-    查询模式（优先级）：``sample``/``frame``/``time`` 单点（对应
-    ``evalAtSample``/``evalAtFrame``/``evalAtTime``）；``start``/``end``
-    sample index 闭区间（``evalAtSampleRange``，夹取到 clip range）；都不
-    给则完整 track（``numSamples<=上限`` 时 ``allSamples``）。多 track 受
-    max_channels / max_samples_per_channel / 响应 cap 三层限制。
-    """
+    """有界读取 CHOP 采样。参数：node_path，sample/frame/time/start/end 选一。"""
     params = {"node_path": node_path, "output_index": output_index}
     if channels is not None:
         params["channels"] = channels
@@ -3985,11 +3944,7 @@ def get_chop_data(ctx, node_path, channels=None, output_index=0,
 
 @mcp.tool()
 def create_chop_node(ctx, parent_path, node_type, node_name=None):
-    """在 CHOP parent 下创建节点（add-chops-tools，MUTATING）。
-
-    校验 parent 可编辑且 child category 为 "Chop"，node_type 必须在 Chop
-    registry 中存在；单 undo group。``node_name`` 可选。
-    """
+    """CHOP parent 下创建节点。参数：parent_path/node_type 必填，node_name 可选。"""
     params = {"parent_path": parent_path, "node_type": node_type}
     if node_name is not None:
         params["node_name"] = node_name
@@ -3999,13 +3954,7 @@ def create_chop_node(ctx, parent_path, node_type, node_name=None):
 @mcp.tool()
 def export_chop_to_parm(ctx, chop_path, channel, target_path, target_parm,
                         output_index=0, replace_existing=False):
-    """在目标参数建立 HScript chop() channel reference（add-chops-tools，MUTATING）。
-
-    预校验 source track + scalar numeric target parm；以
-    ``chop("<channel_path>")`` 表达式建立实时引用。不设 CHOP export flag、
-    不创 Export CHOP、不烘焙 keyframe。目标已有表达式/关键帧时默认拒绝，
-    ``replace_existing=True`` 时替换并披露。单 undo group。
-    """
+    """建立 chop() 通道引用。参数：chop_path/channel/target_path/target_parm。"""
     params = {
         "chop_path": chop_path, "channel": channel,
         "target_path": target_path, "target_parm": target_parm,
@@ -4029,33 +3978,19 @@ def export_chop_to_parm(ctx, chop_path, channel, target_path, target_parm,
 # -------------------------------------------------------------------
 @mcp.tool()
 def list_takes(ctx):
-    """枚举全部 takes（add-takes-and-cache-tools，READ_ONLY）。
-
-    走 ``hou.takes.takes()`` 返回 name / path / parent / current 列表。
-    只读取，不修改场景。响应经过 server 端 ``apply_response_cap``。
-    """
+    """枚举全部 takes，返回 name/path/parent/current 列表。只读不改场景。"""
     return _houdini_call("list_takes", {})
 
 
 @mcp.tool()
 def get_current_take(ctx):
-    """读取当前 take（add-takes-and-cache-tools，READ_ONLY）。
-
-    走 ``hou.takes.currentTake()`` 返回 name / path / parent。
-    响应经过 server 端 ``apply_response_cap``。
-    """
+    """读取当前 take，返回 name/path/parent。只读。"""
     return _houdini_call("get_current_take", {})
 
 
 @mcp.tool()
 def set_current_take(ctx, name_or_path):
-    """切换当前 take（add-takes-and-cache-tools，MUTATING）。
-
-    走 ``hou.takes.findTake`` 解析真实 ``hou.Take`` 对象后传给
-    ``hou.takes.setCurrentTake``，**不**传字符串。找不到 / 歧义时拒
-    绝。属于 take 编辑，单 undo group。响应过 server 端
-    ``apply_response_cap``。
-    """
+    """切换当前 take。参数：name_or_path: take 名或路径，找不到/歧义时拒绝。"""
     return _houdini_call("set_current_take", {
         "name_or_path": name_or_path,
     })
@@ -4063,14 +3998,7 @@ def set_current_take(ctx, name_or_path):
 
 @mcp.tool()
 def create_take(ctx, name, include_parms=None, parent_take=None):
-    """创建 child take（add-takes-and-cache-tools，MUTATING）。
-
-    走 ``parent.addChildTake(name)``；先解析 parent 与每个 parm
-    路径为真实 ``hou.ParmTuple``，预校验全部成功后才写入。包含
-    parm 时临时切到新 take 调 ``addParmTuple``、finally 恢复原
-    current。预校验失败零部分残留。响应过 server 端
-    ``apply_response_cap``。
-    """
+    """创建 child take。参数：name: take 名；include_parms/parent_take 可选。"""
     params = {"name": name}
     if include_parms is not None:
         params["include_parms"] = list(include_parms)
@@ -4081,13 +4009,7 @@ def create_take(ctx, name, include_parms=None, parent_take=None):
 
 @mcp.tool()
 def list_caches(ctx, parent_path="/", max_nodes=256):
-    """枚举白名单 cache 节点（add-takes-and-cache-tools，READ_ONLY）。
-
-    走 ``_cache_nodes.list_caches`` 按 BFS 走 children，节点数受
-    ``max_nodes`` 限制；只匹配在 H21.0 / H22 实测通过的 File Cache
-    adapter 白名单，普通 ``Sop/file`` 等绝不出现。响应过 server 端
-    ``apply_response_cap``。
-    """
+    """枚举白名单 File Cache 节点（BFS，受 max_nodes 限制）。只读。"""
     return _houdini_call("list_caches", {
         "parent_path": parent_path, "max_nodes": max_nodes,
     })
@@ -4095,23 +4017,13 @@ def list_caches(ctx, parent_path="/", max_nodes=256):
 
 @mcp.tool()
 def get_cache_status(ctx, node_path):
-    """读取 cache 节点 status 摘要（add-takes-and-cache-tools，READ_ONLY）。
-
-    走 ``_cache_nodes.get_cache_status``；未知 type 返回
-    ``unsupported_cache_type``。响应过 server 端 ``apply_response_cap``。
-    """
+    """读取 cache 节点 status 摘要；未知类型返回 unsupported_cache_type。只读。"""
     return _houdini_call("get_cache_status", {"node_path": node_path})
 
 
 @mcp.tool()
 def clear_cache(ctx, node_path, remove_disk_file=False):
-    """清运行态 cache（add-takes-and-cache-tools，NO_UNDO）。
-
-    走 ``_cache_nodes.clear_cache``；改 ``loadfromdisk`` 并 cook；
-    ``remove_disk_file=True`` 才同步删磁盘文件。运行态 / 磁盘副作
-    用不可由 HIP undo 恢复，server dispatcher 在调用前关闭 mutating
-    undo segment。响应过 server 端 ``apply_response_cap``。
-    """
+    """清运行态 cache（remove_disk_file=True 时同步删磁盘文件）。副作用不可 undo。"""
     return _houdini_call("clear_cache", {
         "node_path": node_path,
         "remove_disk_file": remove_disk_file,
@@ -4120,14 +4032,7 @@ def clear_cache(ctx, node_path, remove_disk_file=False):
 
 @mcp.tool()
 def write_cache(ctx, node_path):
-    """真实落盘 cache（add-takes-and-cache-tools，NO_UNDO）。
-
-    走 ``_cache_nodes.write_cache``；adapter.write 调
-    ``node.geometry().saveToFile(file)`` 写磁盘（H21 实测一致路
-    径）。返回 adapter、目标路径、文件操作、cook errors 与最终
-    状态。HIP undo 不能恢复磁盘结果，不进 undo group。响应过
-    server 端 ``apply_response_cap``。
-    """
+    """真实落盘 cache 并返回结果。磁盘副作用不可 undo。"""
     return _houdini_call("write_cache", {"node_path": node_path})
 
 
