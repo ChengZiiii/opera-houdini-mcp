@@ -36,8 +36,10 @@ BM25 检索与 bridge 工具注册由后续 agent 基于本模块的公开 API �
 - writability 门禁：registry 声明 ``writable=false`` 的 root 上
   ``save_lesson`` 返回结构化错误 ``root_not_writable``，零写入。
 - recipes（``recipes/BEST_PRACTICES.md``）：``save_recipe`` 以 ``### BP-NNN``
-  块追加写用法/流程知识（id 自增、9 字段校验、advisory 固定 true、source 系统
-  标注），写入即被检索（无 draft 门槛）；团队 root 写入附 ``@<用户名>`` 归属。
+  块写用法/流程知识——默认追加（id 自增、9 字段校验、advisory 固定 true、
+  source 系统标注），传 ``recipe_id`` 则**原地替换**既有块 9 字段（不新增块，
+  未知 id → ``ls_recipe_not_found`` 附既有 id 列表），写入即被检索（无 draft
+  门槛）；团队 root 写入附 ``@<用户名>`` 归属。
   title 可选，仅用于校验、首块 ``> title`` 注释行渲染（title 仅供调用方
   自行使用/汇报）；追加写入因
   strict parser 限制（块间仅允许 ``- field`` 行与空行）不落盘；9 字段 schema
@@ -121,6 +123,8 @@ RECIPES_HEADER = (
 # 正文行禁止以这些前缀起始（否则会被误读为 field / heading / blockquote）
 _RECIPE_BAD_LINE_PREFIXES = ("- ", "#", ">", "###")
 _RECIPE_HEADING_RE = re.compile(r"^###\s+BP-(\d{3})\s*$", re.MULTILINE)
+# save_recipe 的 recipe_id（引用既有块，非自定义新 id）格式
+_RECIPE_ID_RE = re.compile(r"^BP-\d{3}$")
 
 # front matter 必填（9 个内容字段中的 6 个 + 6 个元数据）
 REQUIRED_FRONTMATTER = (
@@ -159,7 +163,8 @@ class LessonsError(Exception):
     """把 parse / write / root 解析错误归一为稳定 code/message/details。
 
     code 稳定区分：ls_parse_error / ls_write_error / ls_unknown_root /
-    root_not_writable。bridge 层据此构造完全相同 shape 的 error envelope。
+    root_not_writable / ls_recipe_not_found（save_recipe 按 id 原地更新时
+    引用不存在的块）。bridge 层据此构造完全相同 shape 的 error envelope。
     """
 
     def __init__(self, code, message, details=None):
@@ -1031,23 +1036,135 @@ def _render_recipe_block(recipe, render_title=True):
     return "\n".join(lines) + "\n"
 
 
-def save_recipe(root_path, fields):
-    """把一条用法/流程知识以 ``### BP-NNN`` 块追加写入 root 的 recipes 文件。
+def _existing_recipe_ids(text):
+    """扫描全文 heading 行，按出现顺序去重返回既有 ``BP-NNN`` id 列表。
 
-    写入即被 ``search_lessons`` 检索（recipes 通道无 draft 门槛）。id 自动
-    生成（扫描既有块最大序号 + 1，撞号重试），MUST NOT 接受用户自定义 id。
-    source 由系统标注：个人库 ``"agent"``，团队 root ``"agent@<用户名>"``；
-    advisory 固定 true；verified_versions 缺省 ``"unknown"``。title 可选：
-    仅用于校验、首块 ``> title`` 注释行渲染（title 仅供调用方自行使用/
-    汇报）；追加到已有块的文件
-    时 title 不落盘（strict parser 只允许首个 heading 前的 ``>`` 行，块间
-    仅允许 ``- field`` 行与空行；9 字段 schema 无 title 字段）。文件缺失/为
-    空 → 写 header 再追加；写前全文过 ``_best_practices.parse_best_practices``
+    供 ``ls_recipe_not_found`` 错误消息附既有 id（可行动）；空文本返回 []。
+    """
+    ids = []
+    seen = set()
+    for match in _RECIPE_HEADING_RE.finditer(text):
+        bid = "BP-" + match.group(1)
+        if bid not in seen:
+            seen.add(bid)
+            ids.append(bid)
+    return ids
+
+
+def _sync_first_block_title(lines, heading_idx, title):
+    """首块原地更新：把 heading 上方最近的 ``> `` 行替换为新 title；无则插入。
+
+    仅当 title 非空时由调用方调用；title 缺失时既有 ``> title`` 行保持
+    原样（title 仅供调用方使用/汇报，与追加语义一致）。插入位置为 heading
+    正上方：``> title`` + 空行（strict parser 允许首个 heading 前的
+    ``>`` 行与空行）。返回新 lines。
+    """
+    if not title:
+        return lines
+    # 向上跳过空行找最近的 `> ` 行（首块渲染格式为 `> title` / 空行 / heading）
+    j = heading_idx - 1
+    while j >= 0 and lines[j].strip() == "":
+        j -= 1
+    if j >= 0 and lines[j].startswith("> "):
+        lines[j] = "> " + title
+        return lines
+    lines.insert(heading_idx, "> " + title)
+    lines.insert(heading_idx + 1, "")
+    return lines
+
+
+def _update_recipe_block(existing, recipe_id, recipe):
+    """按 recipe_id 原地替换既有块的 9 字段（D3）。
+
+    定位 ``### <recipe_id>`` heading 与其后连续 ``- key: value`` 字段行
+    区间，用新 9 字段行原位替换——区间外（header / 其他块 / 块间空行 /
+    ``> title`` 行）逐字节不变。被更新块为文件首块时，上方 ``> title`` 行
+    同步替换/插入（title 缺失则不动既有行）；非首块 title 不持久化（与
+    追加语义一致）。返回 ``(新全文, recipe_id)``。未知 id →
+    ``LessonsError('ls_recipe_not_found')``，message 附该 root 既有 id
+    列表（可行动）。
+    """
+    lines = existing.split("\n")
+    heading_idx = None
+    for idx, line in enumerate(lines):
+        if line.strip() == "### " + recipe_id:
+            heading_idx = idx
+            break
+    if heading_idx is None:
+        ids = _existing_recipe_ids(existing)
+        if ids:
+            message = ("未找到 recipe {0}，无法原地更新；该 root 既有 id: "
+                       "{1}".format(recipe_id, ", ".join(ids)))
+        else:
+            message = ("未找到 recipe {0}，无法原地更新；该 root 尚无任何 "
+                       "recipe 块".format(recipe_id))
+        raise LessonsError(
+            "ls_recipe_not_found", message,
+            {"recipe_id": recipe_id, "existing_ids": ids})
+
+    # 字段区间：heading 之后连续的 `- key: value` 行（save_recipe 自身
+    # 产出的规范布局；手工编辑造成的非常规间距由全文自校验兜底拒绝）
+    field_end = heading_idx + 1
+    while field_end < len(lines) and lines[field_end].startswith("- "):
+        field_end += 1
+
+    new_block = ["### " + recipe_id]
+    for key in RECIPE_FIELDS:
+        value = recipe[key]
+        if key == "advisory":
+            value = "true"
+        new_block.append("- {0}: {1}".format(key, value))
+
+    lines = lines[:heading_idx] + new_block + lines[field_end:]
+
+    # 首块判定：heading 之前无任何 `### BP-NNN` 行
+    is_first = True
+    for line in lines[:heading_idx]:
+        if _RECIPE_HEADING_RE.match(line):
+            is_first = False
+            break
+    if is_first:
+        lines = _sync_first_block_title(lines, heading_idx, recipe.get("title"))
+
+    return "\n".join(lines), recipe_id
+
+
+def save_recipe(root_path, fields, recipe_id=None):
+    """把一条用法/流程知识写入 root 的 recipes 文件（追加或按 id 原地更新）。
+
+    ``recipe_id=None``（默认）：以 ``### BP-NNN`` 块**追加**写入——id 自动
+    生成（扫描既有块最大序号 + 1，撞号重试），MUST NOT 接受用户自定义 id，
+    返回 ``action='created'``（零改动既有语义）。
+
+    ``recipe_id`` 给定：引用**既有** ``### BP-NNN`` 块（格式 ``^BP-\\d{3}$``
+    校验）原地替换该块的 9 个字段，**不新增块**，返回 ``action='updated'``；
+    引用不存在的 id → ``LessonsError('ls_recipe_not_found')``，message 附
+    该 root 既有 id 列表（可行动）。被更新块为文件首块时其上方 ``> title``
+    行同步替换/插入；非首块 title 不持久化（与追加语义一致）。root 闸门与
+    ``_agent_source`` 归属标注对更新路径同样生效。
+
+    两条路径共用：source 由系统标注（个人库 ``"agent"``，团队 root
+    ``"agent@<用户名>"``）；advisory 固定 true；verified_versions 缺省
+    ``"unknown"``。title 可选：仅用于校验、首块 ``> title`` 注释行渲染
+    （title 仅供调用方自行使用/汇报）；追加到已有块的文件时 title 不落盘
+    （strict parser 只允许首个 heading 前的 ``>`` 行，块间仅允许
+    ``- field`` 行与空行；9 字段 schema 无 title 字段）。文件缺失/为空 →
+    写 header 再追加；写前全文过 ``_best_practices.parse_best_practices``
     自校验保证 round-trip；``_atomic_write_text`` 原子写，失败保留旧文件。
     registry 声明 writable=false / state!=ok → ``root_not_writable``（零写入）。
     成功返回完整 recipe dict（{id, root, category, severity,
     affected_versions, verified_versions, source, advisory, problem, symptom,
-    fix}）。
+    fix, action}）。
+
+    方法论沉淀协议（advisory，非强制）：
+    - 沉淀内容是工作流的**原理 / 设计意图 / 方法论**（为什么这么搭），
+      不是节点名与参数的复制粘贴；参数仅在用户要求或直接影响复现时收录。
+    - 正文索引用资产级标识（capture_workflow_snapshot 的 type_full / hda
+      资产全名 + 版本），实例名仅辅助。
+    - **禁止本机路径入正文**：不写 HDA 库路径 / hip 完整路径（团队知识库
+      跨机器误导源）；资产只用全名 + 版本索引。
+    - 改造 / 加深既有知识时传 ``recipe_id`` **原地更新**，不得新增一条
+      重复知识；先 ``search_lessons`` 定位既有 id 再更新。
     """
     root_path = _normalize_root_path(root_path)
     root_name = _root_name_for_path(root_path)
@@ -1062,16 +1179,29 @@ def save_recipe(root_path, fields):
     if os.path.isfile(path):
         existing = _read_text(path)
 
-    recipe["id"] = _next_recipe_id(existing)
-    # title 只在「文件尚无任何 BP 块」的首块场景落盘：strict parser 只允许
-    # 首个 heading 之前的 `>` 行，块间 `> title` 会被判为前一块的非法正文，
-    # 因此追加写入时 title 不落盘（仍做校验、仍随响应汇报）。
-    render_title = _RECIPE_HEADING_RE.search(existing) is None
-    block_text = _render_recipe_block(recipe, render_title)
-    if existing.strip():
-        full_text = existing.rstrip("\n") + "\n\n" + block_text
+    if recipe_id is None:
+        recipe["id"] = _next_recipe_id(existing)
+        # title 只在「文件尚无任何 BP 块」的首块场景落盘：strict parser 只
+        # 允许首个 heading 之前的 `>` 行，块间 `> title` 会被判为前一块的
+        # 非法正文，因此追加写入时 title 不落盘（仍做校验、仍随响应汇报）。
+        render_title = _RECIPE_HEADING_RE.search(existing) is None
+        block_text = _render_recipe_block(recipe, render_title)
+        if existing.strip():
+            full_text = existing.rstrip("\n") + "\n\n" + block_text
+        else:
+            full_text = RECIPES_HEADER + "\n" + block_text
+        action = "created"
     else:
-        full_text = RECIPES_HEADER + "\n" + block_text
+        if not isinstance(recipe_id, str) or not _RECIPE_ID_RE.match(recipe_id):
+            raise LessonsError(
+                "ls_write_error",
+                "recipe_id 格式必须是 BP-NNN（如 BP-002），得到 {0!r}".format(
+                    recipe_id),
+                {"field": "recipe_id", "value": recipe_id,
+                 "format": "^BP-\\d{3}$"})
+        full_text, recipe_id = _update_recipe_block(existing, recipe_id, recipe)
+        recipe["id"] = recipe_id
+        action = "updated"
 
     if _best_practices is not None:
         try:
@@ -1094,6 +1224,7 @@ def save_recipe(root_path, fields):
         "problem": recipe["problem"],
         "symptom": recipe["symptom"],
         "fix": recipe["fix"],
+        "action": action,
     }
 
 

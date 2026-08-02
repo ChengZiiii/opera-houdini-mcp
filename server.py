@@ -209,8 +209,13 @@ def _snapshot_parent(node):
         return None
 
 
-def _snapshot_neighbors(node):
-    """inputs() + outputs() 合并；异常 / 缺 API 降级为 []。"""
+def _snapshot_neighbors(node, include_hda_internals=False):
+    """inputs() + outputs() 合并；异常 / 缺 API 降级为 []。
+
+    ``include_hda_internals=True`` 时，HDA 节点（``type().definition()``
+    非 None）额外展开 ``children()``（内部子网）；嵌套 HDA 由其 children
+    再次触发同一展开，自然递归。children 读取异常降级为 []。
+    """
     neighbors = []
     for getter in ("inputs", "outputs"):
         try:
@@ -221,7 +226,73 @@ def _snapshot_neighbors(node):
             if item is None:
                 continue
             neighbors.append(item)
+    if include_hda_internals:
+        try:
+            is_hda = node.type().definition() is not None
+        except Exception:
+            is_hda = False
+        if is_hda:
+            try:
+                children = node.children() or []
+            except Exception:
+                children = []
+            for child in children:
+                if child is None:
+                    continue
+                neighbors.append(child)
     return neighbors
+
+
+def _snapshot_normalize_path(path):
+    """路径归一（仅内部判定用）：realpath 展开 8.3 短名（PROGRA~1 → Program
+    Files，Windows 上 GetFinalPathNameByHandle 解析）+ 统一斜杠 + 小写。
+
+    库路径来自 Houdini 时可能是短名形式（如 ``C:/PROGRA~1/.../OPlibSop.hda``），
+    ``$HFS`` 是长名，直接前缀比较会漏判内建库。异常降级原样返回。
+    """
+    try:
+        resolved = os.path.realpath(path)
+    except Exception:
+        resolved = path
+    return resolved.replace("\\", "/").lower()
+
+
+def _snapshot_user_asset_definition(definition):
+    """判定 definition 是否属于**用户数字资产**（非 Houdini 内建库）。
+
+    H21 实测：box / geo 等内建类型 ``definition()`` 为 None，但
+    attribwrangle 等 HDA 化内建类型有 definition（挂
+    ``$HFS/houdini/otls/OPlibSop.hda``）——仅 ``definition() is not None``
+    会把内建节点误标为用户 HDA。判定规则：
+    - ``libraryFilePath()`` 不可得 → False（保守不标资产，不 crash）
+    - 指向 .hip/.hipnc（embedded，hip 内嵌用户资产）→ True
+    - 位于 ``$HFS/houdini/otls`` 下（内建库，含 8.3 短名归一）→ False
+    - 其他外部路径（用户 .hda/.otl）→ True
+    仅内部读取路径做判定，**响应绝不输出路径**。任何异常降级 False。
+    """
+    try:
+        library_path = definition.libraryFilePath()
+    except Exception:
+        return False
+    if not isinstance(library_path, str) or not library_path.strip():
+        return False
+    normalized = _snapshot_normalize_path(library_path)
+    if normalized.endswith((".hip", ".hipnc")):
+        return True
+    hfs = ""
+    try:
+        hfs = hou.text.expandString("$HFS")
+    except Exception:
+        hfs = ""
+    if not hfs:
+        try:
+            hfs = os.environ.get("HFS", "")
+        except Exception:
+            hfs = ""
+    if hfs and normalized.startswith(
+            _snapshot_normalize_path(os.path.join(hfs, "houdini", "otls"))):
+        return False
+    return True
 
 
 def _snapshot_value_parm_types():
@@ -3493,7 +3564,8 @@ class HoudiniMCPServer:
     # LLM/外部服务，**不**修改场景、**不**进 undo group（归
     # READ_ONLY_COMMANDS）。响应整体过 apply_response_cap。
     def handle_capture_workflow_snapshot(self, node_path=None,
-                                         include_vex=True, max_nodes=50):
+                                         include_vex=True, max_nodes=50,
+                                         include_hda_internals=False):
         """add-workflow-knowledge-capture：工作流知识主动捕获快照。
 
         定位：``node_path`` 省略 → ``hou.selectedNodes()``（空 → 结构化
@@ -3501,19 +3573,40 @@ class HoudiniMCPServer:
         解析 → ``invalid_node_path``）。多个选中节点全部作为 BFS seeds。
 
         闭包：以 seeds 为根沿 ``inputs()`` + ``outputs()`` 双向 BFS，
-        ``max_nodes`` 硬上限（int 化，<1 视为 1），超限截断 +
-        ``truncated: true``；输出按 path 排序稳定。
+        ``include_hda_internals=True`` 时 HDA 节点额外展开 ``children()``
+        （内部子网，嵌套 HDA 递归），同一 ``max_nodes`` 硬上限（int 化，
+        <1 视为 1），超限截断 + ``truncated: true``；输出按 path 排序稳定。
 
-        节点表每项：``path / name / type / comment / params（非默认参数，
-        ≤40 条 + params_truncated）/ vex（attribwrangle snippet）/
-        hda（definition 引用）/ errors / warnings``；API 缺失一律降级
-        并记 ``_warning``，绝不 crash。sticky note 对闭包内节点所属父
-        网络去重 ``iterStickyNotes()``。连线为 ``{from, to, input_index}``
-        平铺列表。**不**包含几何数据 / 完整参数表。
+        节点表每项：``path / name / type / type_full / is_hda / comment /
+        params（非默认参数，≤40 条 + params_truncated）/ vex（attribwrangle
+        snippet）/ hda（资产级引用，见下）/ errors / warnings``；API 缺失
+        一律降级并记 ``_warning``，绝不 crash。``type_full`` =
+        ``type().nameWithCategory()``（如 ``Sop/box``，API 缺失降级为
+        type 短名）；``is_hda`` = ``definition() is not None``（H21 无
+        isDigitalAsset API）。``hda`` 字段含 ``type_name``（资产全名）/
+        ``version``（``definition().version()``，空串省略）/
+        ``definition_source``（``embedded``/``external``，内部用
+        libraryFilePath 后缀判定 .hip/.hipnc）——**绝不输出 library_path
+        或任何本机路径**（每台机器 HDA 安装目录不同，路径进团队知识库会
+        误导跨机器复现）。快照顶层附 ``hip_file``（``hou.hipFile.basename()``，
+        隐私安全，异常降级空串）。sticky note 对闭包内节点所属父网络去重
+        ``iterStickyNotes()``。连线为 ``{from, to, input_index}`` 平铺列表。
+        **不**包含几何数据 / 完整参数表。
 
         触发时机（advisory）：用户完成 HDA / 节点流 / VEX 工作流后说
         "沉淀这些知识"时，agent 先 ``get_selection`` 定位，再调本工具取
         快照组织为 recipe / lesson。响应过 ``apply_response_cap``。
+
+        方法论沉淀协议（advisory，非强制）：
+        - 沉淀目标是工作流的**原理 / 设计意图 / 为什么这么搭**，不是节点
+          名与参数的复制粘贴；参数仅在用户要求或直接影响复现时收录。
+        - 知识正文索引用 ``type_full`` / ``hda`` 资产级标识（资产全名
+          + 版本）定位节点，实例名（``name``）仅作辅助说明。
+        - 知识正文 MUST NOT 写本机绝对路径（HDA 库路径 / hip 完整路径）；
+          资产只用全名 + 版本索引（跨机器复现时路径会误导）。
+        - 研究用户自制 HDA 的原理（内部 VEX / 约束 / 子网结构）时传
+          ``include_hda_internals=True``，并可视需要上调 ``max_nodes``
+          （大资产内部节点多，如 500）。
         """
         warnings_list = []
 
@@ -3581,7 +3674,7 @@ class HoudiniMCPServer:
             visited[key] = node
             # 先展开邻居完成可达性发现；预算用尽后发现的节点不再入队
             # 访问（被截断的节点不展开），但计入 truncated。
-            for neighbor in _snapshot_neighbors(node):
+            for neighbor in _snapshot_neighbors(node, include_hda_internals):
                 neighbor_path = _snapshot_node_path(neighbor)
                 if neighbor_path not in discovered:
                     discovered.add(neighbor_path)
@@ -3652,11 +3745,19 @@ class HoudiniMCPServer:
                     "input_index": index,
                 })
 
+        # hip_file：只取 basename（隐私安全，绝不取完整路径）；异常降级空串
+        hip_file = ""
+        try:
+            hip_file = hou.hipFile.basename()
+        except Exception:
+            hip_file = ""
+
         result = {
             "status": "success",
             "root": root_label,
             "node_count": len(nodes),
             "truncated": truncated,
+            "hip_file": hip_file,
             "nodes": nodes,
             "sticky_notes": sticky_notes,
             "connections": connections,
@@ -3677,6 +3778,16 @@ class HoudiniMCPServer:
             type_name = node.type().name()
         except Exception:
             pass
+
+        # type_full：资产级标识 = type().nameWithCategory()（如 Sop/box、
+        # Sop/csr_voronoi_advanced）；API 缺失/空 → 降级为 type 短名。
+        type_full = type_name
+        try:
+            type_full = node.type().nameWithCategory()
+        except Exception:
+            pass
+        if not isinstance(type_full, str) or not type_full.strip():
+            type_full = type_name
 
         # comment：API 缺失/异常 → None + _warning
         comment = None
@@ -3753,24 +3864,47 @@ class HoudiniMCPServer:
                     "VEX snippet 读取失败: %s (%s: %s)"
                     % (path, err.__class__.__name__, err))
 
-        # hda：type().definition() 非 None → 完整 type 名 + 库路径
+        # is_hda：**用户数字资产实例**判定（实施修正，见
+        # _snapshot_user_asset_definition）。H21 实测 attribwrangle 等
+        # HDA 化内建类型 definition() 也非 None（挂 OPlibSop.hda），纯
+        # definition 判定会把内建节点误标为 HDA；须排除 $HFS/houdini/otls
+        # 内建库。hda 字段仅用户资产实例填充（资产级引用 type_name /
+        # version / definition_source），内建节点 hda 恒为 None。
+        # **绝不输出 library_path 或任何本机路径**——本机 HDA 安装目录随
+        # 机器不同，路径写入团队知识库会误导跨机器复现；资产全名 + 版本
+        # 才是稳定索引。definition_source 仅内部用 libraryFilePath() 后缀
+        # 判定 embedded（指向 .hip/.hipnc 即 hip 内嵌）；判定过程允许读
+        # 路径，响应与知识正文不输出。
+        is_hda = False
         hda = None
+        definition = None
         try:
             definition = node.type().definition()
-            if definition is not None:
-                type_name_full = type_name
-                try:
-                    type_name_full = node.type().nameWithCategory()
-                except Exception:
-                    pass
-                try:
-                    library_path = definition.libraryFilePath()
-                except Exception:
-                    library_path = ""
-                hda = {"type_name": type_name_full,
-                       "library_path": library_path}
+            if definition is not None and _snapshot_user_asset_definition(
+                    definition):
+                is_hda = True
         except Exception:
-            hda = None
+            is_hda = False
+        if is_hda:
+            hda = {"type_name": type_full}
+            try:
+                version = definition.version()
+            except Exception:
+                version = ""
+            if isinstance(version, str) and version:
+                hda["version"] = version
+            try:
+                library_path = definition.libraryFilePath()
+            except Exception:
+                library_path = ""
+            if isinstance(library_path, str) and library_path:
+                lower = library_path.lower()
+                hda["definition_source"] = (
+                    "embedded" if lower.endswith((".hip", ".hipnc"))
+                    else "external")
+            else:
+                # 库路径不可得 → 无法判定，降级空串（不 crash）
+                hda["definition_source"] = ""
 
         # errors / warnings：异常降级 []
         errors = []
@@ -3790,6 +3924,8 @@ class HoudiniMCPServer:
             "path": path,
             "name": name,
             "type": type_name,
+            "type_full": type_full,
+            "is_hda": is_hda,
             "comment": comment,
             "params": params,
             "vex": vex,

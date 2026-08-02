@@ -5,10 +5,18 @@
   无效 → ``invalid_node_path``。
 - 闭包遍历：seeds BFS（inputs + outputs），max_nodes 硬上限 + truncated
   标记 + 按 path 稳定排序；默认 max_nodes=50。
-- 节点表：path / name / type / comment / 非默认参数（parmTemplates，
-  仅收录非默认、菜单与命令类跳过）/ vex（attribwrangle snippet）/
-  hda（definition 引用）/ errors / warnings；comment / VEX 读取异常
+- 节点表：path / name / type / type_full / is_hda / comment / 非默认参数
+  （parmTemplates，仅收录非默认、菜单与命令类跳过）/ vex（attribwrangle
+  snippet）/ hda（资产级引用）/ errors / warnings；comment / VEX 读取异常
   降级 + ``_warning``，绝不 crash。
+- 资产级标识（improve-knowledge-capture）：type_full =
+  nameWithCategory（API 缺失降级 type）；is_hda = definition() 非 None；
+  hda 字段 = {type_name, version(空串省略), definition_source
+  (embedded/external)}，**绝不输出 library_path 或本机路径**；顶层
+  hip_file = basename（隐私安全，异常降级空串）。
+- HDA 内部研究：include_hda_internals=True → children() 并入 BFS（嵌套
+  HDA 递归，内部 wrangle VEX 可见）；默认 False 不展开；同一 max_nodes
+  预算与 truncated 语义。
 - sticky note：父网络去重 ``iterStickyNotes`` 提取 text/position；API
   缺失（AttributeError）降级跳过 + ``_warning``。
 - 连线：每节点每个已连接 input → ``{from, to, input_index}``。
@@ -67,11 +75,15 @@ def _import_server_module():
 # fake hou.Node 基建
 # ---------------------------------------------------------------------------
 class _FakeDefinition(object):
-    def __init__(self, library_path):
+    def __init__(self, library_path, version=""):
         self._library_path = library_path
+        self._version = version
 
     def libraryFilePath(self):
         return self._library_path
+
+    def version(self):
+        return self._version
 
 
 class _FakeNodeType(object):
@@ -133,12 +145,12 @@ class _FakeStickyNote(object):
 class _FakeNode(object):
     """fake hou.Node：支持 path / type / comment / parmTemplates / parm /
     evalParm / inputs / outputs / parent / errors / warnings /
-    iterStickyNotes。"""
+    iterStickyNotes / children。"""
 
     def __init__(self, name, type_name="geo", parent=None, comment="",
                  templates=None, parm_values=None, inputs=None,
                  outputs=None, errors=None, warnings=None,
-                 definition=None, sticky_notes=None):
+                 definition=None, sticky_notes=None, children=None):
         self._name = name
         self._type = _FakeNodeType(type_name, "Sop", definition)
         self._parent = parent
@@ -150,6 +162,7 @@ class _FakeNode(object):
         self._errors = list(errors) if errors else []
         self._warnings = list(warnings) if warnings else []
         self._sticky_notes = list(sticky_notes) if sticky_notes else []
+        self._children = list(children) if children else []
 
     def name(self):
         return self._name
@@ -194,6 +207,9 @@ class _FakeNode(object):
     def iterStickyNotes(self):
         return list(self._sticky_notes)
 
+    def children(self):
+        return list(self._children)
+
 
 class _FakeNodeNoNotes(_FakeNode):
     """父网络缺失 iterStickyNotes API 的退化场景。"""
@@ -227,6 +243,9 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
                 Float=101, Int=102, String=103, Toggle=104,
                 Menu=105, Button=106, Data=107, Folder=108,
                 Label=109, Separator=110)
+        # conftest stub 自带 hipFile（basename 返回 "untitled"）；统一覆写为
+        # 确定性值，个别用例再单独改（如路径降级测试）
+        hou.hipFile = types.SimpleNamespace(basename=lambda: "scene.hip")
         hou.selectedNodes = lambda: []
         hou.node = lambda path: None
 
@@ -278,20 +297,23 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
         self.assertEqual(result["root"], "selection")
         self.assertEqual(result["node_count"], 3)
         self.assertFalse(result["truncated"])
-        # 无降级 → 不出现 _warning；顶层键集合精确
+        # 无降级 → 不出现 _warning；顶层键集合精确（含 hip_file）
         self.assertEqual(set(result.keys()), {
             "status", "root", "node_count", "truncated",
-            "nodes", "sticky_notes", "connections"})
+            "hip_file", "nodes", "sticky_notes", "connections"})
+        self.assertEqual(result["hip_file"], "scene.hip")
 
         by_path = {n["path"]: n for n in result["nodes"]}
         self.assertEqual(set(by_path.keys()),
                          {"/net/A", "/net/B", "/net/C"})
         node_a = by_path["/net/A"]
         self.assertEqual(set(node_a.keys()), {
-            "path", "name", "type", "comment", "params", "vex",
-            "hda", "errors", "warnings"})
+            "path", "name", "type", "type_full", "is_hda", "comment",
+            "params", "vex", "hda", "errors", "warnings"})
         self.assertEqual(node_a["name"], "A")
         self.assertEqual(node_a["type"], "geo")
+        self.assertEqual(node_a["type_full"], "Sop/geo")
+        self.assertIs(node_a["is_hda"], False)
         self.assertEqual(node_a["comment"], "A 节点注释")
         # 仅非默认参数；Menu 与默认值参数被排除
         self.assertEqual(node_a["params"], {"scale": 2.5, "label": "A 标签"})
@@ -403,20 +425,254 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
         self.assertIsNone(result["nodes"][0]["comment"])
         self.assertTrue(any("comment" in w for w in result["_warning"]))
 
-    # ---- HDA 引用 ----
+    # ---- 资产级标识降级 ----
 
-    def test_hda_reference_extracted(self):
+    def test_type_full_falls_back_to_type_when_api_missing(self):
         net = _FakeNode("net")
-        definition = _FakeDefinition("C:/otls/mytool.hda")
+
+        class _NoCategoryType(object):
+            def name(self):
+                return "weird"
+
+            def nameWithCategory(self):
+                raise AttributeError("no nameWithCategory API")
+
+            def definition(self):
+                return None
+
+        node = _FakeNode("A", parent=net)
+        node._type = _NoCategoryType()
+        self._select([node])
+        result = self._handler().handle_capture_workflow_snapshot()
+        self.assertEqual(result["status"], "success")
+        entry = result["nodes"][0]
+        self.assertEqual(entry["type"], "weird")
+        self.assertEqual(entry["type_full"], "weird")
+        self.assertIs(entry["is_hda"], False)
+
+    # ---- HDA 资产级引用（improve-knowledge-capture）----
+
+    def test_hda_asset_reference_with_version_and_source(self):
+        net = _FakeNode("net")
+        definition = _FakeDefinition("C:/otls/mytool.hda", version="1.2.3")
         hda_node = _FakeNode("HDA1", type_name="mysop", parent=net,
                              definition=definition)
         self._select([hda_node])
         result = self._handler().handle_capture_workflow_snapshot()
         self.assertEqual(result["status"], "success")
+        entry = result["nodes"][0]
+        self.assertEqual(entry["type_full"], "Sop/mysop")
+        self.assertIs(entry["is_hda"], True)
+        # hda 字段：资产全名 + 版本 + external 判定（.hda → 非 hip 内嵌）
+        self.assertEqual(entry["hda"], {
+            "type_name": "Sop/mysop",
+            "version": "1.2.3",
+            "definition_source": "external",
+        })
+        # 响应绝不输出 library_path 或任何本机路径
+        blob = json.dumps(result, default=str)
+        self.assertNotIn("library_path", blob)
+        self.assertNotIn("C:/otls", blob)
+        self.assertNotIn("mytool.hda", blob)
+
+    def test_hda_embedded_source_and_version_omitted_when_empty(self):
+        net = _FakeNode("net")
+        # libraryFilePath 指向 .hipnc → embedded；version() 空串 → 省略
+        definition = _FakeDefinition("C:/work/scene.hipnc", version="")
+        hda_node = _FakeNode("HDA1", type_name="mysop", parent=net,
+                             definition=definition)
+        self._select([hda_node])
+        result = self._handler().handle_capture_workflow_snapshot()
         self.assertEqual(result["nodes"][0]["hda"], {
             "type_name": "Sop/mysop",
-            "library_path": "C:/otls/mytool.hda",
+            "definition_source": "embedded",
         })
+        self.assertNotIn("version", result["nodes"][0]["hda"])
+
+    def test_hda_embedded_hip_and_missing_path_degrades(self):
+        net = _FakeNode("net")
+        # .hip → embedded；路径不可得 → 保守不标用户资产（is_hda False，
+        # hda None，不 crash）
+        hip_def = _FakeDefinition("D:/shot/asset.hip")
+        hip_hda = _FakeNode("HDA1", type_name="mysop", parent=net,
+                            definition=hip_def)
+        self._select([hip_hda])
+        result = self._handler().handle_capture_workflow_snapshot()
+        self.assertEqual(result["nodes"][0]["hda"]["definition_source"],
+                         "embedded")
+
+        net2 = _FakeNode("net2")
+
+        class _NoPathDefinition(object):
+            def libraryFilePath(self):
+                raise AttributeError("no path API")
+
+            def version(self):
+                return ""
+
+        nodepath_hda = _FakeNode("HDA2", type_name="mysop", parent=net2,
+                                 definition=_NoPathDefinition())
+        self._select([nodepath_hda])
+        result2 = self._handler().handle_capture_workflow_snapshot()
+        entry2 = result2["nodes"][0]
+        self.assertIs(entry2["is_hda"], False)
+        self.assertIsNone(entry2["hda"])
+
+    def test_builtin_hda_backed_type_not_flagged_as_user_asset(self):
+        # H21 实测 attribwrangle 等 HDA 化内建类型的 definition 挂在
+        # $HFS/houdini/otls/OPlibSop.hda —— 不得误标为用户 HDA（实施修正）
+        net = _FakeNode("net")
+        builtin_def = _FakeDefinition(
+            "C:/PROGRA~1/SIDEEF~1/HOUDIN~1.596/houdini/otls/OPlibSop.hda")
+        wrangle = _FakeNode("wrang", type_name="attribwrangle", parent=net,
+                            definition=builtin_def)
+        self._select([wrangle])
+        saved_hfs = os.environ.get("HFS")
+        try:
+            os.environ["HFS"] = "C:/Program Files/Side Effects Software/" \
+                                "Houdini 21.0.596"
+            result = self._handler().handle_capture_workflow_snapshot()
+        finally:
+            if saved_hfs is None:
+                os.environ.pop("HFS", None)
+            else:
+                os.environ["HFS"] = saved_hfs
+        entry = result["nodes"][0]
+        self.assertIs(entry["is_hda"], False)
+        self.assertIsNone(entry["hda"])
+        # 资产级标识仍可用：type_full 正常
+        self.assertEqual(entry["type_full"], "Sop/attribwrangle")
+
+    def test_user_asset_detected_without_hfs_env(self):
+        # HFS env 不可得时外部 .hda 仍判为用户资产（判定不依赖 HFS）
+        net = _FakeNode("net")
+        definition = _FakeDefinition("C:/otls/mytool.hda", version="2.0")
+        hda_node = _FakeNode("HDA1", type_name="mysop", parent=net,
+                             definition=definition)
+        self._select([hda_node])
+        saved_hfs = os.environ.get("HFS")
+        try:
+            os.environ.pop("HFS", None)
+            result = self._handler().handle_capture_workflow_snapshot()
+        finally:
+            if saved_hfs is not None:
+                os.environ["HFS"] = saved_hfs
+        entry = result["nodes"][0]
+        self.assertIs(entry["is_hda"], True)
+        self.assertEqual(entry["hda"]["definition_source"], "external")
+
+    def test_hip_file_never_contains_full_path(self):
+        net = _FakeNode("net")
+        a = _FakeNode("A", parent=net)
+        self._select([a])
+        # 即使 hipFile.path() 能给出完整路径，快照也只用 basename（隐私安全）
+        self.server_mod.hou.hipFile = types.SimpleNamespace(
+            basename=lambda: "shoot.hip",
+            path=lambda: "C:/Users/someone/scenes/shoot.hip")
+        result = self._handler().handle_capture_workflow_snapshot()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["hip_file"], "shoot.hip")
+        blob = json.dumps(result, default=str)
+        self.assertNotIn("scenes", blob)
+        self.assertNotIn("C:/Users", blob)
+
+    def test_hip_file_degrades_to_empty_on_api_failure(self):
+        net = _FakeNode("net")
+        a = _FakeNode("A", parent=net)
+        self._select([a])
+
+        def boom():
+            raise RuntimeError("hipFile API 不可用")
+
+        self.server_mod.hou.hipFile.basename = boom
+        result = self._handler().handle_capture_workflow_snapshot()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["hip_file"], "")
+
+    # ---- HDA 内部研究（include_hda_internals）----
+
+    def test_hda_internals_not_expanded_by_default(self):
+        net = _FakeNode("net")
+        definition = _FakeDefinition("C:/otls/mytool.hda")
+        inner = _FakeNode("inner_wrangle", type_name="attribwrangle",
+                          parent=net,
+                          parm_values={"snippet": "@P.y += 1;"})
+        hda_node = _FakeNode("HDA1", type_name="mysop", parent=net,
+                             definition=definition, children=[inner])
+        self._select([hda_node])
+        result = self._handler().handle_capture_workflow_snapshot()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["node_count"], 1)
+        self.assertEqual({n["path"] for n in result["nodes"]},
+                         {"/net/HDA1"})
+
+    def test_hda_internals_expanded_with_vex(self):
+        net = _FakeNode("net")
+        definition = _FakeDefinition("C:/otls/mytool.hda")
+        inner = _FakeNode("inner_wrangle", type_name="attribwrangle",
+                          comment="激活算法",
+                          parm_values={"snippet": "f@activation = @P.y > 0.1;"})
+        hda_node = _FakeNode("HDA1", type_name="mysop", parent=net,
+                             definition=definition, children=[inner])
+        # 真实 Houdini 中 HDA 内部节点 path 含资产名层级；fake 需手动挂 parent
+        inner._parent = hda_node
+        self._select([hda_node])
+        result = self._handler().handle_capture_workflow_snapshot(
+            include_hda_internals=True)
+        self.assertEqual(result["status"], "success")
+        self.assertFalse(result["truncated"])
+        by_path = {n["path"]: n for n in result["nodes"]}
+        self.assertEqual(set(by_path.keys()),
+                         {"/net/HDA1", "/net/HDA1/inner_wrangle"})
+        # 内部节点与外部节点同构产出（type_full + vex + comment）
+        entry = by_path["/net/HDA1/inner_wrangle"]
+        self.assertEqual(entry["type_full"], "Sop/attribwrangle")
+        self.assertIs(entry["is_hda"], False)
+        self.assertEqual(entry["vex"], "f@activation = @P.y > 0.1;")
+        self.assertEqual(entry["comment"], "激活算法")
+        # HDA 节点本身仍产出 hda 引用
+        self.assertEqual(by_path["/net/HDA1"]["hda"]["type_name"],
+                         "Sop/mysop")
+
+    def test_hda_internals_nested_hda_recursion(self):
+        net = _FakeNode("net")
+        outer_def = _FakeDefinition("C:/otls/outer.hda")
+        inner_def = _FakeDefinition("C:/otls/inner.hda")
+        wrangle = _FakeNode("deep_wrangle", type_name="attribwrangle",
+                            parm_values={"snippet": "@P.z = 0;"})
+        inner_hda = _FakeNode("inner_asset", type_name="inner_asset",
+                              definition=inner_def, children=[wrangle])
+        outer_hda = _FakeNode("outer_asset", type_name="outer_asset",
+                              parent=net, definition=outer_def,
+                              children=[inner_hda])
+        # fake 层级：wrangle 挂 inner_hda，inner_hda 挂 outer_hda
+        wrangle._parent = inner_hda
+        inner_hda._parent = outer_hda
+        self._select([outer_hda])
+        result = self._handler().handle_capture_workflow_snapshot(
+            include_hda_internals=True)
+        self.assertEqual(result["status"], "success")
+        by_path = {n["path"]: n for n in result["nodes"]}
+        self.assertEqual(set(by_path.keys()), {
+            "/net/outer_asset", "/net/outer_asset/inner_asset",
+            "/net/outer_asset/inner_asset/deep_wrangle"})
+        self.assertEqual(
+            by_path["/net/outer_asset/inner_asset/deep_wrangle"]["vex"],
+            "@P.z = 0;")
+
+    def test_hda_internals_respect_max_nodes_budget(self):
+        net = _FakeNode("net")
+        definition = _FakeDefinition("C:/otls/big.hda")
+        internals = [_FakeNode("inner%02d" % i, parent=net)
+                     for i in range(20)]
+        hda_node = _FakeNode("big_asset", type_name="big_asset", parent=net,
+                             definition=definition, children=internals)
+        self._select([hda_node])
+        result = self._handler().handle_capture_workflow_snapshot(
+            include_hda_internals=True, max_nodes=5)
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["node_count"], 5)
 
     # ---- 无几何数据 ----
 

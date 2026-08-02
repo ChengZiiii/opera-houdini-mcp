@@ -500,6 +500,285 @@ class SaveRecipeTeamRootTests(_BaseDirFixture):
 
 
 # ---------------------------------------------------------------------------
+# improve-knowledge-capture（tasks 4.1）：save_recipe(recipe_id=...) 原地更新
+# ---------------------------------------------------------------------------
+class SaveRecipeUpdateTests(_BaseDirFixture):
+    """按 id 原地更新全场景：替换 9 字段、其他块字节不变、首块 title 同步、
+    非首块 title 不持久化、未知 id / 非法格式、原子写保旧文件、round-trip
+    自校验、追加路径零回归。"""
+
+    def _make_team_root(self, name="teamx", writable=True):
+        self._write_config([{"name": name, "path": name,
+                             "writable": writable}])
+        root = os.path.join(self.base, name)
+        os.makedirs(root, exist_ok=True)
+        return root
+
+    def _create_three(self):
+        """个人库写 3 个规范块（BP-001 带 title），返回更新前全文。"""
+        _lessons.save_recipe(self._personal(),
+                             _valid_fields(title="首块标题", problem="p1",
+                                           symptom="s1", fix="f1"))
+        _lessons.save_recipe(self._personal(),
+                             _valid_fields(problem="p2", symptom="s2",
+                                           fix="f2"))
+        _lessons.save_recipe(self._personal(),
+                             _valid_fields(problem="p3", symptom="s3",
+                                           fix="f3"))
+        return _read(_lessons.recipes_path(self._personal()))
+
+    def test_update_replaces_fields_and_preserves_other_blocks(self):
+        before = self._create_three()
+        bp1_start = before.index("### BP-001")
+        bp2_start = before.index("### BP-002")
+        bp3_start = before.index("### BP-003")
+        bp1_block = before[bp1_start:bp2_start]
+        bp3_block = before[bp3_start:]
+
+        updated = _lessons.save_recipe(
+            self._personal(),
+            _valid_fields(title="首块标题", problem="新问题描述。",
+                          symptom="新症状。", fix="新修复。",
+                          severity="low", category="vex",
+                          affected_versions="H21.0",
+                          verified_versions="H21.0 live"),
+            recipe_id="BP-002")
+        self.assertEqual(updated["id"], "BP-002")
+        self.assertEqual(updated["action"], "updated")
+        self.assertEqual(updated["root"], "personal")
+        self.assertEqual(updated["source"], "agent")
+        self.assertEqual(updated["problem"], "新问题描述。")
+        self.assertEqual(updated["severity"], "low")
+        self.assertEqual(updated["verified_versions"], "H21.0 live")
+        self.assertIs(updated["advisory"], True)
+
+        after = _read(_lessons.recipes_path(self._personal()))
+        # header 与 BP-001 / BP-003 完整块字节不变
+        self.assertIn(bp1_block, after)
+        self.assertIn(bp3_block, after)
+        self.assertEqual(before.count("### BP-"), after.count("### BP-"))
+        # 块体被原位替换：旧内容消失、新内容出现、恰好一个 BP-002 块
+        self.assertNotIn("- problem: p2", after)
+        self.assertIn("- problem: 新问题描述。", after)
+        self.assertEqual(after.count("### BP-002"), 1)
+        # 全文 round-trip 且各块语义正确
+        entries = _best_practices.parse_best_practices(after)
+        by_id = {e["id"]: e for e in entries}
+        self.assertEqual(len(entries), 3)
+        self.assertEqual(by_id["BP-002"]["fix"], "新修复。")
+        self.assertEqual(by_id["BP-001"]["fix"], "f1")
+        self.assertEqual(by_id["BP-003"]["fix"], "f3")
+
+    def test_update_first_block_syncs_title_line(self):
+        _lessons.save_recipe(self._personal(),
+                             _valid_fields(title="旧标题", symptom="s1"))
+        before = _read(_lessons.recipes_path(self._personal()))
+        self.assertIn("> 旧标题", before)
+
+        updated = _lessons.save_recipe(
+            self._personal(), _valid_fields(title="新标题", symptom="s1改"),
+            recipe_id="BP-001")
+        self.assertEqual(updated["action"], "updated")
+        after = _read(_lessons.recipes_path(self._personal()))
+        self.assertIn("> 新标题", after)
+        self.assertNotIn("> 旧标题", after)
+        # title 行仍位于 heading 上方，全文可 round-trip
+        self.assertLess(after.index("> 新标题"), after.index("### BP-001"))
+        _best_practices.parse_best_practices(after)
+
+    def test_update_first_block_inserts_title_line_when_missing(self):
+        # 手工文件：首块无 `> title` 行（_block helper 不渲染 title）
+        pre = "# BEST PRACTICES\n\n" + _block("BP-001") + "\n" + _block("BP-002")
+        _write(_lessons.recipes_path(self._personal()), pre)
+
+        updated = _lessons.save_recipe(
+            self._personal(), _valid_fields(title="插入的标题", symptom="s1改"),
+            recipe_id="BP-001")
+        self.assertEqual(updated["action"], "updated")
+        after = _read(_lessons.recipes_path(self._personal()))
+        self.assertIn("> 插入的标题", after)
+        self.assertLess(after.index("> 插入的标题"), after.index("### BP-001"))
+        entries = _best_practices.parse_best_practices(after)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0]["id"], "BP-001")
+
+    def test_update_first_block_without_title_keeps_existing_title(self):
+        # title 缺失时不动既有 `> title` 行（title 仅供调用方使用/汇报）
+        _lessons.save_recipe(self._personal(),
+                             _valid_fields(title="原标题", symptom="s1"))
+        updated = _lessons.save_recipe(
+            self._personal(), _valid_fields(symptom="s1改"), recipe_id="BP-001")
+        self.assertEqual(updated["action"], "updated")
+        after = _read(_lessons.recipes_path(self._personal()))
+        self.assertIn("> 原标题", after)
+        self.assertIn("- symptom: s1改", after)
+
+    def test_update_non_first_block_does_not_persist_title(self):
+        _lessons.save_recipe(self._personal(),
+                             _valid_fields(title="首块", symptom="s1"))
+        _lessons.save_recipe(self._personal(),
+                             _valid_fields(title="第二块", symptom="s2"))
+        before = _read(_lessons.recipes_path(self._personal()))
+        self.assertNotIn("> 第二块", before)
+
+        updated = _lessons.save_recipe(
+            self._personal(), _valid_fields(title="第二块新标题", symptom="s2改"),
+            recipe_id="BP-002")
+        self.assertEqual(updated["action"], "updated")
+        after = _read(_lessons.recipes_path(self._personal()))
+        self.assertNotIn("> 第二块新标题", after)
+        self.assertIn("> 首块", after)  # 首块 title 不受影响
+        # header 内 "### BP-NNN" 字样不算块：恰 2 块
+        self.assertEqual(after.count("### BP-001"), 1)
+        self.assertEqual(after.count("### BP-002"), 1)
+        _best_practices.parse_best_practices(after)
+
+    def test_update_unknown_id_lists_existing_ids(self):
+        _lessons.save_recipe(self._personal(), _valid_fields(symptom="s1"))
+        _lessons.save_recipe(self._personal(), _valid_fields(symptom="s2"))
+        with self.assertRaises(LessonsError) as ctx:
+            _lessons.save_recipe(self._personal(), _valid_fields(symptom="s3"),
+                                 recipe_id="BP-999")
+        self.assertEqual(ctx.exception.code, "ls_recipe_not_found")
+        self.assertIn("BP-001", ctx.exception.message)
+        self.assertIn("BP-002", ctx.exception.message)
+        self.assertEqual(ctx.exception.details["existing_ids"],
+                         ["BP-001", "BP-002"])
+        # 零写入：文件内容不变（header 内 "### BP-NNN" 字样不算块）
+        after = _read(_lessons.recipes_path(self._personal()))
+        self.assertEqual(after.count("### BP-001"), 1)
+        self.assertEqual(after.count("### BP-002"), 1)
+        self.assertNotIn("BP-999", after)
+
+    def test_update_unknown_id_empty_or_missing_file(self):
+        # 文件不存在（root 存在但无 recipes 文件）→ ls_recipe_not_found
+        with self.assertRaises(LessonsError) as ctx:
+            _lessons.save_recipe(self._personal(), _valid_fields(),
+                                 recipe_id="BP-001")
+        self.assertEqual(ctx.exception.code, "ls_recipe_not_found")
+        self.assertEqual(ctx.exception.details["existing_ids"], [])
+        self.assertIn("尚无", ctx.exception.message)
+        # 空文件同样
+        _write(_lessons.recipes_path(self._personal()), "")
+        with self.assertRaises(LessonsError) as ctx:
+            _lessons.save_recipe(self._personal(), _valid_fields(),
+                                 recipe_id="BP-001")
+        self.assertEqual(ctx.exception.code, "ls_recipe_not_found")
+        self.assertEqual(ctx.exception.details["existing_ids"], [])
+
+    def test_update_invalid_recipe_id_format_rejected(self):
+        _lessons.save_recipe(self._personal(), _valid_fields(symptom="s1"))
+        for bad in ("BP-1", "BP-0001", "bp-001", "BP-ABC", "BP001", 42,
+                    ["BP-001"]):
+            with self.assertRaises(LessonsError) as ctx:
+                _lessons.save_recipe(self._personal(), _valid_fields(),
+                                     recipe_id=bad)
+            self.assertEqual(ctx.exception.code, "ls_write_error")
+            self.assertIn("BP-NNN", ctx.exception.message)
+        # 零写入：仍只有 1 个块（header 内 "### BP-NNN" 字样不算块）
+        after = _read(_lessons.recipes_path(self._personal()))
+        self.assertEqual(after.count("### BP-001"), 1)
+
+    def test_update_recipe_id_none_keeps_append_semantics(self):
+        # recipe_id 省略 → 维持自增追加（action=created），零回归
+        first = _lessons.save_recipe(self._personal(), _valid_fields(symptom="s1"))
+        second = _lessons.save_recipe(self._personal(),
+                                      _valid_fields(symptom="s2"),
+                                      recipe_id=None)
+        self.assertEqual(first["id"], "BP-001")
+        self.assertEqual(first["action"], "created")
+        self.assertEqual(second["id"], "BP-002")
+        self.assertEqual(second["action"], "created")
+        text = _read(_lessons.recipes_path(self._personal()))
+        self.assertEqual(text.count("### BP-001"), 1)
+        self.assertEqual(text.count("### BP-002"), 1)
+
+    def test_update_write_failure_preserves_old_file(self):
+        _lessons.save_recipe(self._personal(), _valid_fields(symptom="s1"))
+        path = _lessons.recipes_path(self._personal())
+        before = _read(path)
+
+        real_replace = _lessons.os.replace
+
+        def boom(src, dst):
+            raise OSError("simulated replace failure")
+
+        _lessons.os.replace = boom
+        try:
+            with self.assertRaises(LessonsError) as ctx:
+                _lessons.save_recipe(self._personal(),
+                                     _valid_fields(symptom="s1改"),
+                                     recipe_id="BP-001")
+            self.assertEqual(ctx.exception.code, "ls_write_error")
+        finally:
+            _lessons.os.replace = real_replace
+
+        self.assertEqual(_read(path), before)
+        self.assertNotIn("s1改", before)
+
+    def test_update_rejects_file_that_cannot_round_trip(self):
+        # 既有文件重复 heading（无法 round-trip）→ 自校验拒绝并保留旧文件
+        corrupt = _block("BP-001") + _block("BP-001")
+        path = _lessons.recipes_path(self._personal())
+        _write(path, corrupt)
+        with self.assertRaises(LessonsError) as ctx:
+            _lessons.save_recipe(self._personal(), _valid_fields(),
+                                 recipe_id="BP-001")
+        self.assertEqual(ctx.exception.code, "ls_write_error")
+        self.assertIn("自校验", ctx.exception.message)
+        self.assertEqual(_read(path), corrupt)
+
+    def test_update_verified_versions_defaults_unknown(self):
+        _lessons.save_recipe(self._personal(),
+                             _valid_fields(symptom="s1",
+                                           verified_versions="H21.0 live"))
+        updated = _lessons.save_recipe(self._personal(),
+                                       _valid_fields(symptom="s1改"),
+                                       recipe_id="BP-001")
+        self.assertEqual(updated["verified_versions"], "unknown")
+        text = _read(_lessons.recipes_path(self._personal()))
+        self.assertIn("- verified_versions: unknown", text)
+        self.assertNotIn("H21.0 live", text)
+
+    def test_update_team_root_annotates_source_and_gate(self):
+        # 团队 root：更新路径同样附 @用户名 归属
+        team_root = self._make_team_root()
+        _lessons.save_recipe(team_root, _valid_fields(symptom="s1"))
+        self._patch_getuser(lambda: "tester")
+        updated = _lessons.save_recipe(team_root,
+                                       _valid_fields(symptom="s1改"),
+                                       recipe_id="BP-001")
+        self.assertEqual(updated["action"], "updated")
+        self.assertEqual(updated["source"], "agent@tester")
+        text = _read(_lessons.recipes_path(team_root))
+        self.assertIn("- source: agent@tester", text)
+        entry = _best_practices.parse_best_practices(text)[0]
+        self.assertEqual(entry["source"], "agent@tester")
+        # writable=false → root_not_writable 零写入（更新路径同闸门）
+        ro_root = self._make_team_root(name="ro", writable=False)
+        with self.assertRaises(LessonsError) as ctx:
+            _lessons.save_recipe(ro_root, _valid_fields(),
+                                 recipe_id="BP-001")
+        self.assertEqual(ctx.exception.code, "root_not_writable")
+        self.assertFalse(os.path.exists(_lessons.recipes_path(ro_root)))
+
+    def test_update_then_search_hits_updated_content(self):
+        _lessons.save_recipe(self._personal(),
+                             _valid_fields(problem="旧问题。", symptom="旧症状。",
+                                           fix="旧修复。"))
+        _lessons.save_recipe(
+            self._personal(),
+            _valid_fields(problem="加深后的原理：按资产级索引组织。",
+                          symptom="加深后的症状。", fix="加深后的修复。"),
+            recipe_id="BP-001")
+        recipes, error = lssearch._load_root_recipes(self._personal())
+        self.assertIsNone(error)
+        self.assertEqual(len(recipes), 1)
+        self.assertEqual(recipes[0]["problem"], "加深后的原理：按资产级索引组织。")
+        self.assertNotEqual(recipes[0]["problem"], "旧问题。")
+
+
+# ---------------------------------------------------------------------------
 # _agent_source：personal 判定与用户名回退链
 # ---------------------------------------------------------------------------
 class AgentSourceTests(_BaseDirFixture):

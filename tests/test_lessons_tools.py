@@ -743,6 +743,34 @@ class WorkflowKnowledgeToolRegistrationTests(LessonsToolsBase):
                 "capture_workflow_snapshot", doc,
                 "{0} docstring 缺少主动沉淀工作流注解".format(name))
 
+    def test_docstrings_contain_methodology_and_update_keywords(self):
+        """improve-knowledge-capture（tasks 4.3）：docstring 方法论协议。
+
+        save_recipe / capture_workflow_snapshot docstring 含方法论 / 原地
+        更新 / 资产标识 / 禁路径关键词；save_lesson / search_lessons 含
+        加深 / 原地更新引导。
+        """
+        bridge = _get_bridge()
+        for name in self.NEW_TOOLS:
+            doc = getattr(bridge, name).__doc__ or ""
+            self.assertIn("方法论", doc,
+                          "{0} docstring 缺少方法论协议".format(name))
+            self.assertIn("本机路径", doc,
+                          "{0} docstring 缺少禁路径协议".format(name))
+        save_doc = (bridge.save_recipe.__doc__ or "")
+        self.assertIn("recipe_id", save_doc)
+        self.assertIn("原地更新", save_doc)
+        self.assertIn("不得新增一条重复知识", save_doc)
+        capture_doc = (bridge.capture_workflow_snapshot.__doc__ or "")
+        self.assertIn("include_hda_internals", capture_doc)
+        self.assertIn("type_full", capture_doc)
+        for name in self.ANNOTATED_TOOLS:
+            doc = getattr(bridge, name).__doc__ or ""
+            self.assertIn("加深", doc,
+                          "{0} docstring 缺少加深引导".format(name))
+            self.assertIn("原地更新", doc,
+                          "{0} docstring 缺少原地更新引导".format(name))
+
     def test_untouched_tool_docstrings_have_no_capture_annotation(self):
         """read_lesson / knowledge_stats 零改动：不含主动沉淀注解。"""
         bridge = _get_bridge()
@@ -883,6 +911,65 @@ class SaveRecipeToolTests(LessonsToolsBase):
         self.assertEqual(env["status"], "error")
         self.assertEqual(env["error"]["code"], "ls_unknown_root")
 
+    # ---- improve-knowledge-capture（tasks 4.3）：recipe_id 原地更新 ----
+
+    def test_append_returns_action_created(self):
+        bridge = _get_bridge()
+        env = self._save(bridge)
+        self.assertEqual(env["status"], "success")
+        self.assertEqual(env["action"], "created")
+        self.assertEqual(env["recipe_id"], "BP-001")
+
+    def test_update_in_place_returns_action_updated_and_searchable(self):
+        bridge = _get_bridge()
+        first = self._save(bridge)
+        self.assertEqual(first["recipe_id"], "BP-001")
+        env = self._save(bridge, recipe_id="BP-001",
+                         problem="加深后的原理：按资产级标识组织正文。",
+                         symptom="recipe symptom zeta unique v2")
+        self.assertEqual(env["status"], "success")
+        self.assertEqual(env["recipe_id"], "BP-001")
+        self.assertEqual(env["action"], "updated")
+        # 文件仍只有一块（原地更新不新增块）
+        path = os.path.join(self.personal(), "recipes",
+                            "BEST_PRACTICES.md")
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertEqual(text.count("### BP-001"), 1)
+        self.assertNotIn("BP-002", text)
+        self.assertIn("加深后的原理", text)
+        # 更新后仍可被检索命中（原地更新不破坏索引通道）
+        found = bridge.search_lessons(None, query="zeta unique v2")
+        self.assertEqual(found["status"], "success")
+        ids = [r["id"] for r in found["results"]]
+        self.assertIn("BP-001", ids)
+
+    def test_update_unknown_id_returns_ls_recipe_not_found(self):
+        bridge = _get_bridge()
+        first = self._save(bridge)
+        self.assertEqual(first["recipe_id"], "BP-001")
+        env = self._save(bridge, recipe_id="BP-999")
+        self.assertEqual(env["status"], "error")
+        self.assertEqual(env["error"]["code"], "ls_recipe_not_found")
+        self.assertIn("BP-001", env["error"]["message"])
+        self.assertEqual(env["error"]["details"]["existing_ids"],
+                         ["BP-001"])
+        # 零写入：文件仍只有创建的那一块
+        path = os.path.join(self.personal(), "recipes",
+                            "BEST_PRACTICES.md")
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertEqual(text.count("### BP-001"), 1)
+        self.assertNotIn("BP-999", text)
+
+    def test_update_invalid_format_returns_ls_write_error(self):
+        bridge = _get_bridge()
+        for bad in ("BP-1", "BP-0001", "bp-001", "BP-ABC"):
+            env = self._save(bridge, recipe_id=bad)
+            self.assertEqual(env["status"], "error")
+            self.assertEqual(env["error"]["code"], "ls_write_error")
+            self.assertIn("BP-NNN", env["error"]["message"])
+
 
 # ---------------------------------------------------------------------------
 # add-workflow-knowledge-capture（tasks 4.4）：capture_workflow_snapshot
@@ -910,7 +997,22 @@ class CaptureWorkflowSnapshotToolTests(LessonsToolsBase):
         self.assertEqual(env, self.SUCCESS_RESULT)
         call_mock.assert_called_once_with(
             "capture_workflow_snapshot",
-            {"node_path": None, "include_vex": True, "max_nodes": 50})
+            {"node_path": None, "include_vex": True, "max_nodes": 50,
+             "include_hda_internals": False})
+
+    def test_include_hda_internals_passed_through(self):
+        bridge = _get_bridge()
+        with mock.patch.object(
+                bridge, "_houdini_call",
+                return_value={"status": "success",
+                              "result": self.SUCCESS_RESULT}) as call_mock:
+            env = bridge.capture_workflow_snapshot(
+                None, include_hda_internals=True, max_nodes=500)
+        self.assertEqual(env["status"], "success")
+        call_mock.assert_called_once_with(
+            "capture_workflow_snapshot",
+            {"node_path": None, "include_vex": True, "max_nodes": 500,
+             "include_hda_internals": True})
 
     def test_connection_error_converted_to_lessons_envelope(self):
         bridge = _get_bridge()

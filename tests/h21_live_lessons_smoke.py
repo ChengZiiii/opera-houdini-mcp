@@ -3,7 +3,8 @@
 在真实 H21 hython 中对 ``_lessons`` / ``_lessons_search`` 做端到端冒烟：
 保存 / 累积 / inbox 晋升 / 检索命中 / read_lesson / 多 root 降级 /
 默认路径推导，外加 capture_workflow_snapshot 真实场景快照、save_recipe
-全链路（个人库 + 团队库门禁）与 bridge 探针（按实际环境降级）。
+全链路（个人库 + 团队库门禁）、HDA 内部研究（include_hda_internals +
+资产级标识 + recipe 原地更新全链路）与 bridge 探针（按实际环境降级）。
 **不使用 mock**，全程沙箱化（HOUDINI_MCP_HOME 指向临时目录），绝不触碰
 真实 ``~/.opera-houdini-mcp``。
 
@@ -668,6 +669,217 @@ def main():
               "source=%r" % (lesson_team["source"],))
     except Exception as exc:
         check("i save_lesson team source @user", False, "%r" % (exc,))
+
+    # ---- j. HDA 内部研究 + 资产级标识 + recipe 原地更新全链路 ----
+    # 真实 HDA：subnet → createDigitalAsset（外部 .hda 库文件）→ 内部
+    # attribwrangle VEX；capture include_hda_internals=True 研究内部；
+    # hda 字段无本机路径（definition_source 正确）；随后在隔离团队 root
+    # 上走 save_recipe 创建 → recipe_id 原地更新（文件仅一块、内容替换、
+    # action=updated）→ search 命中 → 未知 id 错误全链路。
+    try:
+        geo_hda = hou.node("/obj").createNode("geo", "hda_research")
+        subnet = geo_hda.createNode("subnet", "asset_src")
+        inner = subnet.createNode("attribwrangle", "inner_wrangle")
+        inner.parm("snippet").set("f@activation = @P.y > 0.1;")
+        inner.setComment("激活算法：按高度阈值")
+        hda_lib = os.path.join(SANDBOX, "hda_lib")
+        os.makedirs(hda_lib, exist_ok=True)
+        hda_file = os.path.join(hda_lib, "research_asset.hda")
+        subnet.createDigitalAsset("research_asset", hda_file, "research")
+        check("j hda created", True, "file=%s" % hda_file)
+    except Exception as exc:
+        check("j hda created", False, "%r" % (exc,))
+        finish()
+        return
+    # HDA 转换后旧 node 引用失效（ObjectWasDeleted）→ 按 path/definition 重取
+    asset = None
+    for child in hou.node("/obj/hda_research").children():
+        try:
+            if child.type().definition() is not None:
+                asset = child
+                break
+        except Exception:
+            continue
+    check("j hda instance re-fetched by path", asset is not None,
+          "asset=%r" % (asset,))
+    if asset is None:
+        finish()
+        return
+    try:
+        internals = asset.children()
+        inner_names = [n.name() for n in internals]
+        check("j hda children reachable", "inner_wrangle" in inner_names,
+              "children=%r" % (inner_names,))
+    except Exception as exc:
+        check("j hda children reachable", False, "%r" % (exc,))
+    try:
+        resp = instance.handle_capture_workflow_snapshot(
+            node_path=asset.path(), include_vex=True, max_nodes=200,
+            include_hda_internals=True)
+    except Exception as exc:
+        check("j capture with hda internals", False, "%r" % (exc,))
+        finish()
+        return
+    check("j capture status success", resp.get("status") == "success",
+          "status=%r" % (resp.get("status"),))
+    nodes = resp.get("nodes") or []
+    by_path = {n.get("path"): n for n in nodes}
+    inner_key = asset.path() + "/inner_wrangle"
+    check("j internal wrangle entry present", inner_key in by_path,
+          "paths=%r" % (sorted(by_path)[:12],))
+    if inner_key in by_path:
+        ie = by_path[inner_key]
+        check("j internal wrangle vex visible",
+              "f@activation" in (ie.get("vex") or ""),
+              "vex=%r" % ((ie.get("vex") or "")[:60],))
+        check("j internal entry type_full asset-level",
+              ie.get("type_full") == "Sop/attribwrangle",
+              "type_full=%r" % (ie.get("type_full"),))
+        check("j internal entry is_hda False", ie.get("is_hda") is False,
+              "is_hda=%r" % (ie.get("is_hda"),))
+    hda_entries = [n for n in nodes if n.get("is_hda")]
+    check("j hda entry flagged is_hda", bool(hda_entries),
+          "count=%d" % len(hda_entries))
+    if hda_entries:
+        h0 = hda_entries[0]
+        hda_ref = h0.get("hda") or {}
+        check("j hda type_name asset-level",
+              hda_ref.get("type_name") == "Sop/research_asset",
+              "hda=%r" % (hda_ref,))
+        check("j hda definition_source external",
+              hda_ref.get("definition_source") == "external",
+              "hda=%r" % (hda_ref,))
+        check("j hda entry type_full",
+              h0.get("type_full") == "Sop/research_asset",
+              "type_full=%r" % (h0.get("type_full"),))
+        check("j hda response has no library_path",
+              "library_path" not in h0 and "library_path" not in hda_ref,
+              "keys=%r" % (sorted(h0.keys()),))
+    # 响应绝不输出本机路径 / 沙箱路径
+    blob = json.dumps(resp, default=str)
+    check("j no hda file path in snapshot", hda_file not in blob,
+          "contains hda file path")
+    check("j no sandbox path in snapshot", SANDBOX not in blob,
+          "contains sandbox path")
+    check("j hip_file basename only",
+          bool(resp.get("hip_file"))
+          and "/" not in resp.get("hip_file", "")
+          and "\\" not in resp.get("hip_file", ""),
+          "hip_file=%r" % (resp.get("hip_file"),))
+    # 默认 include_hda_internals=False 不展开内部（仅 HDA 节点本身）
+    try:
+        resp_no = instance.handle_capture_workflow_snapshot(
+            node_path=asset.path(), include_vex=True, max_nodes=200)
+        check("j internals off by default",
+              resp_no.get("node_count", 0) == 1,
+              "node_count=%r" % (resp_no.get("node_count"),))
+    except Exception as exc:
+        check("j internals off by default", False, "%r" % (exc,))
+    # 隔离团队 root：文件仅一块 → 创建 → 原地更新 → 检索 → 未知 id
+    hda_team_env = "LESSONS_SMOKE_HDA_TEAM"
+    hda_team = os.path.join(SANDBOX, "hda_team")
+    try:
+        os.makedirs(hda_team, exist_ok=True)
+        os.environ[hda_team_env] = hda_team
+        with open(os.path.join(SANDBOX, "config.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump([{"name": "hda_team",
+                        "path": "${%s}" % hda_team_env,
+                        "priority": 0.9, "writable": True}],
+                      handle, ensure_ascii=False)
+        check("j team root config written", True)
+    except Exception as exc:
+        check("j team root config written", False, "%r" % (exc,))
+    recipe_fields = {
+        "title": "自制 HDA 激活算法研究",
+        "category": "sop",
+        "severity": "medium",
+        "affected_versions": "H21.0",
+        "problem": ("research_asset（Sop/research_asset）的激活算法原理："
+                    "内部 wrangle 按高度阈值输出激活值。"),
+        "symptom": "需要在自定义资产内部按条件激活几何。",
+        "fix": ("用 include_hda_internals=True 研究内部；正文索引用资产全名"
+                " + 版本，不写本机路径。"),
+        "advisory": True,
+    }
+    try:
+        created = _lessons.save_recipe(hda_team, dict(recipe_fields))
+        check("j recipe created", created["id"] == "BP-001"
+              and created["action"] == "created",
+              "id=%s action=%s" % (created["id"], created.get("action")))
+    except Exception as exc:
+        check("j recipe created", False, "%r" % (exc,))
+        finish()
+        return
+    hda_recipes_file = _lessons.recipes_path(hda_team)
+    try:
+        text1 = _read_text(hda_recipes_file)
+        check("j recipes file single block",
+              text1.count("### BP-001") == 1 and "BP-002" not in text1,
+              "blocks=%d" % text1.count("### BP-"))
+    except Exception as exc:
+        check("j recipes file single block", False, "%r" % (exc,))
+    try:
+        updated_fields = dict(recipe_fields)
+        updated_fields["problem"] = ("加深后：activation 阈值由高度决定，"
+                                     "核心原理是……（原地更新）")
+        updated = _lessons.save_recipe(hda_team, updated_fields,
+                                       recipe_id="BP-001")
+        check("j recipe updated in place",
+              updated["id"] == "BP-001" and updated["action"] == "updated",
+              "id=%s action=%s" % (updated["id"], updated.get("action")))
+    except Exception as exc:
+        check("j recipe updated in place", False, "%r" % (exc,))
+    try:
+        text2 = _read_text(hda_recipes_file)
+        check("j update replaces content",
+              "加深后" in text2 and "按高度阈值输出激活值" not in text2,
+              "has_new=%s" % ("加深后" in text2,))
+        check("j update file still single block",
+              text2.count("### BP-001") == 1 and "BP-002" not in text2,
+              "blocks=%d" % text2.count("### BP-"))
+        entries = _best_practices.parse_best_practices(text2)
+        check("j update round-trip", len(entries) == 1
+              and entries[0]["id"] == "BP-001",
+              "entries=%d" % len(entries))
+    except Exception as exc:
+        check("j update file checks", False, "%r" % (exc,))
+    try:
+        found = _lessons_search.search_lessons(query="加深后", scope="hda_team")
+        ids = [r["id"] for r in found.get("results", [])]
+        check("j search hits updated recipe", "BP-001" in ids,
+              "matched=%s ids=%r" % (found.get("matched"), ids))
+        hit = next((r for r in found.get("results", [])
+                    if r.get("id") == "BP-001"), None)
+        if hit is not None:
+            check("j hit source_root hda_team",
+                  hit.get("source_root") == "hda_team",
+                  "source_root=%r" % (hit.get("source_root"),))
+    except Exception as exc:
+        check("j search hits updated recipe", False, "%r" % (exc,))
+    try:
+        try:
+            _lessons.save_recipe(hda_team, dict(recipe_fields),
+                                 recipe_id="BP-999")
+            check("j unknown id raises ls_recipe_not_found", False,
+                  "no error raised")
+        except _lessons.LessonsError as exc:
+            check("j unknown id raises ls_recipe_not_found",
+                  exc.code == "ls_recipe_not_found"
+                  and "BP-001" in exc.message,
+                  "code=%s msg=%s" % (exc.code, exc.message[:80]))
+        text3 = _read_text(hda_recipes_file)
+        check("j unknown id zero write",
+              text3.count("### BP-001") == 1 and "BP-999" not in text3,
+              "blocks=%d" % text3.count("### BP-"))
+    except Exception as exc:
+        check("j unknown id raises ls_recipe_not_found", False, "%r" % (exc,))
+    # 清理：destroy HDA 场景节点
+    try:
+        hou.node("/obj/hda_research").destroy()
+        check("j cleanup hda scene", hou.node("/obj/hda_research") is None)
+    except Exception as exc:
+        check("j cleanup hda scene", False, "%r" % (exc,))
 
     # ---- bridge 探针（hython 3.11 无 mcp 包，预期 ModuleNotFoundError）----
     try:

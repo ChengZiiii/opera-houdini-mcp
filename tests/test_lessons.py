@@ -1124,6 +1124,16 @@ class NoEmbeddingDependencyScanTests(unittest.TestCase):
         with open(bp_path, "r", encoding="utf-8") as handle:
             self.assertIn("def parse_best_practices", handle.read())
 
+    def test_closure_includes_recipe_update_helper(self):
+        """improve-knowledge-capture（tasks 4.4）：save_recipe 原地更新辅助
+        ``_update_recipe_block`` 必须落在无嵌入扫描闭包内。"""
+        with open(os.path.join(ROOT, "_lessons.py"), "r",
+                  encoding="utf-8") as handle:
+            self.assertIn("def _update_recipe_block", handle.read())
+        sources = self._closure_sources()
+        self.assertIn("def _update_recipe_block", "\n".join(sources),
+                      "recipe 原地更新源码必须在扫描闭包内")
+
     def test_no_embedding_vector_library_dependencies(self):
         for text in self._closure_sources():
             for lib in self.FORBIDDEN_LIBS:

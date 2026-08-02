@@ -1118,6 +1118,15 @@ def search_lessons(ctx: Context, query, category=None, severity=None,
     save_recipe）或 lesson（经验，走 save_lesson）→ 写入后向用户汇报写入的
     id / root / 状态。
 
+    加深与研究方法论（advisory 引导，非强制）：用户要求"加深 / 改造 / 优化"
+    既有沉淀时，agent SHALL 先调用本工具定位既有 recipe/lesson id，再用
+    capture_workflow_snapshot（自制 HDA 带 include_hda_internals=True）
+    重新研究，最后 save_recipe(recipe_id=...) 原地更新，**不得新增重复
+    知识**。沉淀目标是原理 / 设计意图 / 为什么（方法论优先），参数按需收录
+    （用户显式要求除外）；正文索引用资产级标识（type_full / hda 资产全名 +
+    版本），实例名仅辅助，**禁止本机路径入正文**（HDA 库路径 / hip 完整
+    路径，团队知识库跨机器误导源）。
+
     参数说明：
     - query: 检索文本（可为空串 → 按新鲜度/priority 基线浏览）。
     - category / severity: 精确过滤（severity: low/medium/high/critical）。
@@ -1164,6 +1173,14 @@ def save_lesson(ctx: Context, problem, symptom, fix, category, severity,
     → capture_workflow_snapshot 取快照 → 组织为 recipe（用法文档，走
     save_recipe）或 lesson（经验，走本工具）→ 写入后向用户汇报写入的
     id / root / 状态。
+
+    加深与研究方法论（advisory 引导，非强制）：用户要求"加深 / 改造 / 优化"
+    既有沉淀时，agent SHALL 先 search_lessons 定位既有 id，再用
+    capture_workflow_snapshot（自制 HDA 带 include_hda_internals=True）
+    重新研究，最后 save_recipe(recipe_id=...) 原地更新（recipe 通道），
+    **不得新增重复知识**。沉淀目标是原理 / 设计意图 / 为什么（方法论优先），
+    参数按需收录（用户显式要求除外）；正文索引用资产级标识（type_full /
+    hda 资产全名 + 版本），实例名仅辅助，**禁止本机路径入正文**。
 
     参数说明：
     - problem / symptom / fix / category / affected_versions: 必填。
@@ -1298,7 +1315,7 @@ def knowledge_stats(ctx: Context, scope=None):
 
 @mcp.tool()
 def capture_workflow_snapshot(ctx, node_path=None, include_vex=True,
-                              max_nodes=50):
+                              max_nodes=50, include_hda_internals=False):
     """把用户选中（或 node_path 指定）的节点子网络捕获为结构化工作流快照
     （add-workflow-knowledge-capture，readOnly relay，不修改场景）。
 
@@ -1313,21 +1330,39 @@ def capture_workflow_snapshot(ctx, node_path=None, include_vex=True,
       结构化错误，不静默回退）；指定时捕获以该节点为根的闭包子网络。
     - include_vex: 可选，默认 True；包含 Attribute Wrangle 的 VEX snippet。
     - max_nodes: 可选，默认 50；闭包节点硬上限，超限截断并标记 truncated。
+    - include_hda_internals: 可选，默认 False；True 时 HDA 节点内部子网
+      （node.children()，含嵌套 HDA 递归）并入同一 BFS 遍历，受同一
+      max_nodes 预算与 truncated 语义。研究用户自制 HDA 原理（内部 VEX /
+      约束 / 子网结构）时启用，并可视需要上调 max_nodes（大资产内部节点
+      多，如 500）。
 
-    返回结构：{status:success, root, node_count, truncated, nodes,
-    sticky_notes, connections}，超限截断时 truncated=true；API 降级附
-    _warning。快照只含节点表（path/name/type/comment/非默认参数/vex/hda/
-    errors/warnings）+ sticky note + 连线，**不含几何数据**，readOnly
-    不修改场景，纯规则读取**不调用 LLM / 嵌入模型**。错误为 status=error
-    + error={code,message,details}（no_selection / invalid_node_path /
+    返回结构：{status:success, root, node_count, truncated, hip_file,
+    nodes, sticky_notes, connections}，超限截断时 truncated=true；API
+    降级附 _warning。节点表每项含资产级标识 type_full（nameWithCategory，
+    API 缺失降级 type）与 is_hda（definition() is not None），hda 字段
+    为 {type_name, version(可选), definition_source: embedded|external}，
+    **绝不输出 library_path 或任何本机路径**（跨机器复现误导源）；顶层
+    hip_file 只取 basename（隐私安全）。快照只含节点表（path/name/type/
+    type_full/is_hda/comment/非默认参数/vex/hda/errors/warnings）+
+    sticky note + 连线，**不含几何数据**，readOnly 不修改场景，纯规则
+    读取**不调用 LLM / 嵌入模型**。错误为 status=error + error={code,
+    message,details}（no_selection / invalid_node_path /
     selection_read_failed / capture_connection_error）。整体过
     apply_response_cap。
+
+    方法论沉淀协议（advisory，非强制）：沉淀目标是工作流的**原理 / 设计
+    意图 / 为什么这么搭**，不是节点名与参数的复制粘贴；参数仅在用户要求
+    或直接影响复现时收录。正文索引用 type_full / hda 资产标识，实例名仅
+    辅助；**禁止本机路径入正文**（HDA 库路径 / hip 完整路径，团队知识库
+    跨机器误导源），资产只用全名 + 版本索引。自制 HDA 先
+    include_hda_internals=True 研究内部原理再组织为 recipe。
     """
     try:
         env = _houdini_call("capture_workflow_snapshot", {
             "node_path": node_path,
             "include_vex": include_vex,
             "max_nodes": max_nodes,
+            "include_hda_internals": include_hda_internals,
         })
         if env.get("status") == "error":
             # 连接层 / 转发层失败（origin=connection / mcp_bridge / houdini）
@@ -1352,8 +1387,9 @@ def capture_workflow_snapshot(ctx, node_path=None, include_vex=True,
 
 @mcp.tool()
 def save_recipe(ctx, title, problem, symptom, fix, category, severity,
-                affected_versions, verified_versions=None, root=None):
-    """把一条用法/流程知识以 ### BP-NNN 块追加写入指定 root 的 recipes 文件
+                affected_versions, verified_versions=None, recipe_id=None,
+                root=None):
+    """把一条用法/流程知识写入指定 root 的 recipes 文件
     （add-workflow-knowledge-capture，write，bridge-local 不连接 Houdini）。
 
     触发时机（advisory）：用户完成工作流后说"沉淀这些知识"时，agent 先用
@@ -1370,15 +1406,31 @@ def save_recipe(ctx, title, problem, symptom, fix, category, severity,
     - severity: 必填，recipes severity 合法取值 low / medium / high
       （3 值，与 lesson 的 4 值不同）。
     - verified_versions: 可选；缺省 "unknown"。
+    - recipe_id: 可选；引用**既有** ``### BP-NNN`` 块 id（格式
+      ``BP-\\d{3}``，非自定义新 id）。提供时**原地替换**该块 9 字段、
+      不新增块（首块 ``> title`` 行同步更新），响应 action=updated；
+      未提供时维持自增追加，响应 action=created。
     - root: 可选 root 名；缺省 personal（唯一默认可写 root）。
 
     返回：{status:success, recipe_id, root, severity, source,
-    immediately_searchable:true}；recipe_id 为 BP-NNN 自动生成（扫描既有块
-    最大序号 + 1），**不接受自定义 id**；团队 root 写入 source 自动附
-    ``@<用户名>``（系统标注）。错误为 status=error + error={code,message,
-    details}（非法 severity → ls_write_error 并列出合法值；只读团队 root
-    → root_not_writable；未知/不可用 root → ls_unknown_root）。整体过
+    immediately_searchable:true, action:created|updated}；recipe_id 为
+    BP-NNN 自动生成（扫描既有块最大序号 + 1），**不接受自定义 id**；团队
+    root 写入 source 自动附 ``@<用户名>``（系统标注）。错误为 status=error
+    + error={code,message,details}（非法 severity → ls_write_error 并列出
+    合法值；recipe_id 格式非法 → ls_write_error；引用不存在的 id →
+    ls_recipe_not_found 且 message 附既有 id 列表；只读团队 root →
+    root_not_writable；未知/不可用 root → ls_unknown_root）。整体过
     apply_response_cap。
+
+    方法论沉淀协议（advisory，非强制）：
+    - 沉淀内容是工作流的**原理 / 设计意图 / 方法论**（为什么这么搭），
+      不是节点名与参数的复制粘贴；参数仅在用户要求或直接影响复现时收录。
+    - 正文索引用资产级标识（capture_workflow_snapshot 的 type_full / hda
+      资产全名 + 版本），实例名仅辅助。
+    - **禁止本机路径入正文**：不写 HDA 库路径 / hip 完整路径（团队知识库
+      跨机器误导源）。
+    - 改造 / 加深既有知识时先 search_lessons 定位既有 id，再传 recipe_id
+      **原地更新**，**不得新增一条重复知识**。
     """
     try:
         if severity not in _lessons.RECIPE_SEVERITIES:
@@ -1411,7 +1463,8 @@ def save_recipe(ctx, title, problem, symptom, fix, category, severity,
         }
         if verified_versions is not None:
             fields["verified_versions"] = verified_versions
-        recipe = _lessons.save_recipe(root_desc["path"], fields)
+        recipe = _lessons.save_recipe(root_desc["path"], fields,
+                                      recipe_id=recipe_id)
         return _lessons_capped({
             "status": "success",
             "recipe_id": recipe["id"],
@@ -1420,6 +1473,7 @@ def save_recipe(ctx, title, problem, symptom, fix, category, severity,
             "source": recipe["source"],
             # 写入即被 search_lessons 检索（recipes 通道无 draft 门槛）
             "immediately_searchable": True,
+            "action": recipe["action"],
         })
     except _lessons.LessonsError as exc:
         return _lessons_capped(_lessons_error_envelope(exc))
