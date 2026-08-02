@@ -1096,6 +1096,34 @@ class NoEmbeddingDependencyScanTests(unittest.TestCase):
         self.assertGreaterEqual(len(sources), 2)
         self.assertIn("def parse_lesson", "\n".join(sources))
 
+    def test_closure_includes_best_practices_via_lessons(self):
+        """新增代码路径（save_recipe 引擎 + 其自校验依赖的 strict parser）
+        必须落在无嵌入扫描闭包内（tasks 4.5）。
+
+        _lessons.py 新增 ``save_recipe`` 与本地导入 ``_best_practices``（容错
+        两段式）。本用例显式断言：真实文件存在（闭包解析依据）+ ``def
+        save_recipe`` 与 ``def parse_best_practices`` 都出现在闭包合并源码里
+        ——保证这两条新代码路径一旦引入 embedding / vector / rerank 依赖，
+        既有的 test_no_embedding_vector_library_dependencies 等扫描用例会
+        覆盖到它们。
+        """
+        bp_path = os.path.join(ROOT, "_best_practices.py")
+        self.assertTrue(os.path.isfile(bp_path),
+                        "本地依赖 _best_practices.py 必须存在")
+        sources = self._closure_sources()
+        combined = "\n".join(sources)
+        self.assertIn("def save_recipe", combined,
+                      "save_recipe 引擎源码必须在扫描闭包内")
+        self.assertIn("def parse_best_practices", combined,
+                      "strict parser 源码必须在扫描闭包内")
+        # 两个定义各自来自真实落盘文件（防止闭包因导入写法变化悄悄收缩后，
+        # 合并源码仍偶然含字样而误判覆盖）
+        with open(os.path.join(ROOT, "_lessons.py"), "r",
+                  encoding="utf-8") as handle:
+            self.assertIn("def save_recipe", handle.read())
+        with open(bp_path, "r", encoding="utf-8") as handle:
+            self.assertIn("def parse_best_practices", handle.read())
+
     def test_no_embedding_vector_library_dependencies(self):
         for text in self._closure_sources():
             for lib in self.FORBIDDEN_LIBS:
