@@ -40,6 +40,7 @@
 - **零新增 pip 依赖** — `get_houdini_help` 用 stdlib `html.parser` 替代 `beautifulsoup4`，维持 `mcp[cli]==1.12.2 + requests + python-dotenv` 三件套
 - **结构化 audit** — 每次 `execute_code` 响应附 `_audit` 块（policy / dangerous_hits / heavy_hits / mutation_hits / bypass_used / elapsed_ms / undo_group）
 - **local-help-first** — `get_houdini_help` / `verify_hou_api` 优先打 Houdini 本地 help server（`127.0.0.1:48626`），失败自动回退在线 SideFX
+- **自进化知识库** — 4 个 bridge-local 知识工具（`search_lessons` / `save_lesson` / `read_lesson` / `knowledge_stats`）+ 自动错误捕获 hook（零上下文成本）；多 root（个人库自动发现 + 团队库注册表声明，默认只读）；**无嵌入模型**（BM25 + 指纹 + 统计，全 stdlib）
 
 ---
 
@@ -174,6 +175,46 @@ git submodule sync
 | 文档 | `verify_hou_api` | python_hou 默认 + `_ai_hint` 合成，AI-friendly wrapper over `get_houdini_help` |
 | 诊断 | `check_connection` / `ping_houdini` | 不持久化连接的 ping |
 | 缓存 | `manage_cache` | stats / invalidate / warmup |
+| 知识库 | `get_best_practices` | fork 人工审查 advisory recipes（bridge-local，不建立 Houdini 连接） |
+| 知识库 | `search_docs` / `get_doc` / `parse_hip_offline` | BM25 离线文档检索 / 全文 / 离线 .hip 解析 |
+| 知识库 | `search_lessons` / `save_lesson` / `read_lesson` / `knowledge_stats` | 自进化知识沉淀：跨 root BM25 融合检索 / 沉淀 / 全文 / 统计 |
+
+---
+
+## 自进化知识库
+
+agent 操作 Houdini 的试错经验跨 session 持久化为可检索 lesson（模块 `_lessons.py` +
+`_lessons_search.py`，纯 stdlib、无嵌入模型）。**触发时机**：遇到报错、重试第 2 次
+仍未解决、或遇到不认识的 API/参数时，先 `search_lessons` 检索既往经验；命中后用
+`read_lesson` 拉全文；解决问题后用 `save_lesson` 沉淀。lesson 是 advisory，不替代
+`verify_hou_api` / `get_houdini_help` / `get_best_practices`。
+
+**自动捕获（零上下文成本）**：bridge 在响应出口检测 `status=error` 响应，把错误
+事件以 append-only 方式写入个人库 `inbox/events.jsonl`（同指纹去重、≥3 次自动生成
+draft 骨架并在检索时提示「已踩 N 次，请补充 fix」）。
+
+**存储位置**（全部在个人目录 `~/.opera-houdini-mcp/`，不入仓库 git）：
+
+```
+~/.opera-houdini-mcp/
+├── config.json              # 注册表（仅声明额外团队 root，个人库自动发现）
+├── knowledge/
+│   ├── lessons/*.md         # draft + published lesson（9 字段 + id/status/strength/root/时间戳）
+│   ├── recipes/BEST_PRACTICES.md   # 个人人工 recipes（可空）
+│   └── inbox/events.jsonl   # 自动捕获原始事件
+└── cache/index/<root-name>/ # 各 root BM25 索引缓存
+```
+
+**团队库注册**（`config.json`，可选）：路径只接受 `${VAR}` 环境占位符或相对路径
+（相对 `~/.opera-houdini-mcp/`），拒绝裸绝对路径；`writable` 默认 `false`（AI 只读，
+晋升人工把关）；占位符未定义 → `unconfigured` 静默跳过，路径不可达 → `unavailable`
+跳过并附 `_warning`，均不影响个人库。
+
+```json
+[
+  { "name": "team_knowledge", "path": "${TEAM_SHARE}/houdini/knowledge", "priority": 0.8, "writable": false }
+]
+```
 
 ---
 
