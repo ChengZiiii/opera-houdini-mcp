@@ -209,30 +209,52 @@ def _snapshot_parent(node):
         return None
 
 
+def _snapshot_editable_contents(node):
+    """include_hda_internals 展开判定（用户三轮反馈收敛后的最终语义）。
+
+    H21.0.596 实机语义：
+    - 展开前提：``children()`` 非空（有可读内部内容）
+    - HDA 类型（``definition()`` 非 None）：
+      - 用户资产（库文件非 ``$HFS/houdini/otls``，见
+        ``_snapshot_user_asset_definition``）→ **展开**
+      - 官方 HDA 带 Editable Nodes 声明（``hasSection("EditableNodes")``，
+        如 rbdbulletsolver 的 dopnet/forces 子网络）→ **展开**
+      - 官方 HDA 无声明（rbdconstraintproperties / rbdconfigure 等，
+        即使内部有封装内容）→ **不展开**（用户预期：官方节点默认不
+        拆解分析）
+    - 非 HDA 类型（``definition()`` 为 None 的普通网络容器，如 subnet /
+      geo）：children 非空即展开（其 children 是用户工作流内容）
+    API 缺失/异常降级 False（保守不展开，绝不 crash）。
+    """
+    try:
+        if not node.children():
+            return False
+    except Exception:
+        return False
+    try:
+        definition = node.type().definition()
+    except Exception:
+        definition = None
+    if definition is None:
+        return True
+    if _snapshot_user_asset_definition(definition):
+        return True
+    try:
+        if hasattr(definition, "hasSection"):
+            return bool(definition.hasSection("EditableNodes"))
+    except Exception:
+        pass
+    return False
+
+
 def _snapshot_neighbors(node, include_hda_internals=False):
     """inputs() + outputs() 合并；异常 / 缺 API 降级为 []。
 
-    ``include_hda_internals=True`` 时，**有可读内部内容**的节点
-    （``children()`` 非空）额外展开 ``children()``（内部子网）；嵌套
-    有内容的节点由其 children 再次触发同一展开，自然递归。
-
-    H21.0.596 实机语义（用户需求：官方节点默认不拆解分析，可编辑内容
-    参与分析）：
-    - 展开依据 = ``children()`` 非空（内部内容可读即参与）。**不能用
-      ``isEditable()``**：HDA 实例内容与定义一致（未修改）时
-      isEditable() 为 False（matchesCurrentDefinition True），但
-      children 完全可读——实机：rbdbulletsolver1 isEditable False 且
-      children 307（内部 dopnet/forces 子网络）；用户 HDA
-      csr_voronoi_advanced1 isEditable False 且 children 29。且大型
-      HDA 上 isEditable() 的定义比较可能极慢（实机 30s+ 超时）
-    - 用户自制 HDA（含便签 / 子网络）→ children 非空 → **展开**
-    - 官方带 Editable Nodes 的节点（如 rbdbulletsolver1）→ children
-      非空 → **展开**
-    - 官方无内容内建节点（OPlib 锁定如 attribwrangle，children 恒空）
-      → 不展开
-    - 普通可编辑网络容器（subnet / geo 等）→ children 非空即展开；
-      非网络节点（box 等）children() 恒空 → 无副作用
-    children 读取异常降级为 []。
+    ``include_hda_internals=True`` 时，满足 ``_snapshot_editable_contents``
+    的节点（children 非空且为用户资产 / 官方带 Editable Nodes 声明 /
+    普通可编辑容器）额外展开 ``children()``（内部子网）；嵌套有内容的
+    节点由其 children 再次触发同一展开，自然递归。children 读取异常
+    降级为 []。
     """
     neighbors = []
     for getter in ("inputs", "outputs"):
@@ -244,7 +266,7 @@ def _snapshot_neighbors(node, include_hda_internals=False):
             if item is None:
                 continue
             neighbors.append(item)
-    if include_hda_internals:
+    if include_hda_internals and _snapshot_editable_contents(node):
         try:
             children = node.children() or []
         except Exception:
@@ -3586,20 +3608,19 @@ class HoudiniMCPServer:
         解析 → ``invalid_node_path``）。多个选中节点全部作为 BFS seeds。
 
         闭包：以 seeds 为根沿 ``inputs()`` + ``outputs()`` 双向 BFS，
-        ``include_hda_internals=True`` 时**有可读内部内容**的节点
-        （``children()`` 非空，见 ``_snapshot_neighbors``）额外展开
-        ``children()``（内部子网，嵌套递归）——H21 实测展开依据**不能
-        用 ``isEditable()``**：HDA 实例内容与定义一致（未修改）时
-        isEditable() 为 False，但 children 完全可读（rbdbulletsolver1
-        锁定态下 children 307；用户 HDA csr_voronoi_advanced1 锁定态下
-        children 29），且大 HDA 上 isEditable() 定义比较可能极慢。按
-        children 非空展开后：用户自制 HDA（含便签 / 子网络）与官方带
-        Editable Nodes 的节点（如 rbdbulletsolver1 的 dopnet/forces
-        子网络）参与分析；官方无内容内建节点（OPlib 锁定如
-        attribwrangle，children 恒空）默认**不拆解**；普通可编辑容器
-        （subnet / geo）children 非空同样展开。同一 ``max_nodes`` 硬
-        上限（int 化，<1 视为 1），超限截断 + ``truncated: true``；
-        输出按 path 排序稳定。
+        ``include_hda_internals=True`` 时按 ``_snapshot_editable_contents``
+        展开内部（children 非空，且满足：用户资产 / 官方 HDA 带
+        Editable Nodes 声明 / 普通可编辑容器）——H21 实测（用户语义
+        收敛）：用户自制 HDA（含便签 / 子网络）完全展开；官方带
+        Editable Nodes 声明的节点（如 rbdbulletsolver1 的
+        dopnet/forces 子网络，``hasSection("EditableNodes")``）展开；
+        官方无声明的封装 HDA（rbdconstraintproperties / rbdconfigure
+        等）默认**不拆解**；普通容器（subnet / geo）children 非空同样
+        展开；官方空壳节点（attribwrangle 等 children 恒空）不展开。
+        **不能用 ``isEditable()`` 判定**（实例锁定态 isEditable False
+        但 children 完全可读，且大 HDA 上定义比较可能极慢）。同一
+        ``max_nodes`` 硬上限（int 化，<1 视为 1），超限截断 +
+        ``truncated: true``；输出按 path 排序稳定。
 
         节点表每项：``path / name / type / type_full / is_hda / comment /
         params（非默认参数，≤40 条 + params_truncated）/ vex（attribwrangle

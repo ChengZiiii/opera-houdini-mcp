@@ -14,15 +14,15 @@
   hda 字段 = {type_name, version(空串省略), definition_source
   (embedded/external)}，**绝不输出 library_path 或本机路径**；顶层
   hip_file = basename（隐私安全，异常降级空串）。
-- HDA 内部研究：include_hda_internals=True → **有可读内部内容**的节点
-  （children() 非空）children() 并入 BFS（嵌套递归，内部 wrangle VEX
-  可见）——**展开依据不能用 isEditable()**（实机：HDA 实例锁定态
-  isEditable False 但 children 完全可读，rbdbulletsolver1 锁定态
-  children 307、用户 HDA 锁定态 children 29；且大 HDA 上 isEditable()
-  定义比较可能极慢）；用户 HDA（含便签/子网络）与官方 Editable Nodes
-  节点（rbdbulletsolver1）参与分析，官方无内容内建节点（attribwrangle
-  children 恒空）默认不拆解；普通可编辑容器（subnet）children 非空同样
-  展开；默认 False 不展开；同一 max_nodes 预算与 truncated 语义。
+- HDA 内部研究：include_hda_internals=True → 展开判定（用户语义收敛）=
+  children() 非空 且（用户资产（非 $HFS otls）／官方 HDA 带 Editable
+  Nodes 声明（definition().hasSection("EditableNodes")，如
+  rbdbulletsolver 的 dopnet/forces）／非 HDA 普通容器 subnet/geo）；
+  官方无声明的封装 HDA（rbdconstraintproperties/rbdconfigure 实机
+  64/102 children）默认不拆解；官方空壳节点（attribwrangle children
+  恒空）不展开；不能用 isEditable() 判定（锁定态 isEditable False 但
+  children 可读，且大 HDA 上定义比较可能极慢）；嵌套递归、同一
+  max_nodes 预算与 truncated 语义。
 - sticky note：父网络去重 ``iterStickyNotes`` 提取 text/position；API
   缺失（AttributeError）降级跳过 + ``_warning``。
 - 连线：每节点每个已连接 input → ``{from, to, input_index}``。
@@ -81,15 +81,20 @@ def _import_server_module():
 # fake hou.Node 基建
 # ---------------------------------------------------------------------------
 class _FakeDefinition(object):
-    def __init__(self, library_path, version=""):
+    def __init__(self, library_path, version="", editable_nodes=False):
         self._library_path = library_path
         self._version = version
+        self._editable_nodes = editable_nodes
 
     def libraryFilePath(self):
         return self._library_path
 
     def version(self):
         return self._version
+
+    def hasSection(self, section):
+        # 官方 HDA 的 Editable Nodes 声明（Type Properties 字段）
+        return section == "EditableNodes" and self._editable_nodes
 
 
 class _FakeNodeType(object):
@@ -673,11 +678,12 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
                          {"/net/empty"})
 
     def test_editable_contents_node_expanded_even_with_builtin_path(self):
-        # 官方节点若处于 allow editing of contents 状态（isEditable True）
-        # → 参与分析（用户预期：可编辑就拆解）
+        # 官方节点带 Editable Nodes 声明（hasSection("EditableNodes")，
+        # 如 rbdbulletsolver 的 dopnet/forces）→ 参与分析
         net = _FakeNode("net")
         official_def = _FakeDefinition(
-            "C:/PROGRA~1/SIDEEF~1/HOUDIN~1.596/houdini/otls/OPlibSop.hda")
+            "C:/PROGRA~1/SIDEEF~1/HOUDIN~1.596/houdini/otls/OPlibSop.hda",
+            editable_nodes=True)
         inner = _FakeNode("editable_inner", parent=net)
         official = _FakeNode("unlocked_official", type_name="attribwrangle",
                              parent=net, definition=official_def,
@@ -691,6 +697,53 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
         self.assertEqual(set(by_path.keys()),
                          {"/net/unlocked_official",
                           "/net/unlocked_official/editable_inner"})
+
+    def test_official_hda_without_editable_nodes_not_expanded(self):
+        # 官方无声明的封装 HDA（rbdconstraintproperties 实机 64 children
+        # / rbdconfigure 102 children，均无 EditableNodes section）→
+        # 即使内部有封装内容也不拆解（用户预期：官方节点默认不拆解）
+        net = _FakeNode("net")
+        official_def = _FakeDefinition(
+            "C:/PROGRA~1/SIDEEF~1/HOUDIN~1.596/houdini/otls/OPlibSop.hda")
+        inner = _FakeNode("wrapped_inner", parent=net)
+        official = _FakeNode("rbdconstraintproperties1",
+                             type_name="rbdconstraintproperties",
+                             parent=net, definition=official_def,
+                             children=[inner])
+        inner._parent = official
+        self._select([official])
+        saved_hfs = os.environ.get("HFS")
+        try:
+            os.environ["HFS"] = "C:/Program Files/Side Effects Software/" \
+                                "Houdini 21.0.596"
+            result = self._handler().handle_capture_workflow_snapshot(
+                include_hda_internals=True)
+        finally:
+            if saved_hfs is None:
+                os.environ.pop("HFS", None)
+            else:
+                os.environ["HFS"] = saved_hfs
+        self.assertEqual(result["status"], "success")
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["node_count"], 1)
+        self.assertEqual({n["path"] for n in result["nodes"]},
+                         {"/net/rbdconstraintproperties1"})
+
+    def test_plain_network_container_expanded(self):
+        # 非 HDA 普通容器（subnet，definition None）+ children 非空 →
+        # 展开（其 children 是用户工作流内容）
+        net = _FakeNode("net")
+        sub = _FakeNode("mysubnet", type_name="subnet", parent=net)
+        sub_inner = _FakeNode("sub_w", type_name="attribwrangle", parent=sub,
+                              parm_values={"snippet": "f@x = 1.0;"})
+        sub._children = [sub_inner]
+        self._select([sub])
+        result = self._handler().handle_capture_workflow_snapshot(
+            include_hda_internals=True)
+        self.assertEqual(result["status"], "success")
+        by_path = {n["path"]: n for n in result["nodes"]}
+        self.assertEqual(set(by_path.keys()),
+                         {"/net/mysubnet", "/net/mysubnet/sub_w"})
 
     def test_hda_internals_expanded_with_vex(self):
         net = _FakeNode("net")
