@@ -4,6 +4,7 @@ Stdlib unittest, no hython required. hou is mocked via a tiny stub class.
 Run with:
     python -m unittest tests.test_scene tests.test_execute_code_safety tests.test_common -v
 """
+import ast
 import os
 import sys
 import unittest
@@ -11,6 +12,7 @@ import importlib.util as _ilu
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+BRIDGE_PATH = os.path.join(ROOT, "houdini_mcp_server.py")
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
@@ -585,6 +587,48 @@ class ExportContractTests(unittest.TestCase):
     def test_common_has_invalidate_all_caches(self):
         self.assertIn("invalidate_all_caches", cmn.__all__)
         self.assertTrue(hasattr(cmn, "invalidate_all_caches"))
+
+
+# ===========================================================================
+# Section H: bridge 场景工具 return annotation 契约（AST）
+# ===========================================================================
+class BridgeSceneToolAnnotationTests(unittest.TestCase):
+    """``houdini_mcp_server.py`` 4 个场景工具注解 MUST 为 ``-> dict``。
+
+    出处：openspec change ``fix-scene-tools-bridge-return-type``（design D1/D2）。
+    save_scene / load_scene / new_scene / serialize_scene 返回
+    ``_houdini_call`` 的 dict envelope；若注解改回 ``-> str``，FastMCP/Pydantic
+    输出校验会拒绝 dict-for-str（``render_single_view`` 同款历史 bug），工具
+    响应无法返回给 AI。本测试解析 bridge 源码 AST 防回归，风格参照
+    tests/test_resources.py 的 ``ResourceDecoratorAstTests``。
+    """
+
+    TOOLS = ("save_scene", "load_scene", "new_scene", "serialize_scene")
+
+    @classmethod
+    def setUpClass(cls):
+        with open(BRIDGE_PATH, "r", encoding="utf-8") as f:
+            source = f.read()
+        cls.tree = ast.parse(source)
+        cls.funcs = {
+            node.name: node
+            for node in cls.tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+
+    def test_all_four_scene_tools_exist(self):
+        for name in self.TOOLS:
+            self.assertIn(name, self.funcs, f"missing tool def {name}")
+
+    def test_return_annotation_is_dict(self):
+        for name in self.TOOLS:
+            fn = self.funcs[name]
+            ann = fn.returns
+            self.assertIsNotNone(ann, f"{name} 缺少 return annotation")
+            self.assertIsInstance(ann, ast.Name,
+                                  f"{name} 注解必须是 ``dict``，实际 {ann!r}")
+            self.assertEqual(ann.id, "dict",
+                             f"{name} 注解必须是 -> dict，实际 -> {ann.id}")
 
 
 if __name__ == "__main__":

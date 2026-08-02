@@ -1197,7 +1197,7 @@ def get_last_scene_diff(ctx: Context) -> str:
 
 
 @mcp.tool()
-def save_scene(ctx: Context, file_path: str | None = None) -> str:
+def save_scene(ctx: Context, file_path: str | None = None) -> dict:
     """Save the current Houdini scene to file_path.
 
     file_path 省略（None/""）时保存到当前 hip 路径（hou.hipFile.path()）；
@@ -1208,7 +1208,7 @@ def save_scene(ctx: Context, file_path: str | None = None) -> str:
 
 
 @mcp.tool()
-def load_scene(ctx: Context, file_path: str) -> str:
+def load_scene(ctx: Context, file_path: str) -> dict:
     """Load a .hip file as the current Houdini scene.
 
     Server-side also calls cmn.invalidate_all_caches() so downstream caches
@@ -1218,7 +1218,7 @@ def load_scene(ctx: Context, file_path: str) -> str:
 
 
 @mcp.tool()
-def new_scene(ctx: Context) -> str:
+def new_scene(ctx: Context) -> dict:
     """Reset Houdini to an empty scene (suppress_save_prompt=True).
 
     默认禁用：未设置 HOUDINI_MCP_ALLOW_NEW_SCENE（或非 truthy）时返回错误，
@@ -1232,7 +1232,7 @@ def new_scene(ctx: Context) -> str:
 @mcp.tool()
 def serialize_scene(ctx: Context, root_path: str = "/obj",
                     include_params: bool = False,
-                    max_depth: int = 10) -> str:
+                    max_depth: int = 10) -> dict:
     """递归序列化 root_path 下的节点树为 dict。
 
     只读操作，AI 用于场景结构对比 / 文档生成。
