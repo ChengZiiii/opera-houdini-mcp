@@ -86,6 +86,19 @@ try:
 except ImportError:
     import _hip_parser as _hip  # type: ignore
 
+# 自进化知识库（add-self-evolving-knowledge-base）：
+# _lessons 存储/registry（draft 写、inbox、多 root），_lessons_search 检索/统计。
+# 与 _bp/_rag 同款容错导入（package 与 flat 两种布局）。
+try:
+    from . import _lessons as _lessons
+except ImportError:
+    import _lessons as _lessons  # type: ignore
+
+try:
+    from . import _lessons_search as _lessons_search
+except ImportError:
+    import _lessons_search as _lessons_search  # type: ignore
+
 # OPUS RapidAPI 可选模块（refactor-opus-optional-and-debt-cleanup）。
 # 容错加载：package 与 flat 两种布局均尝试；加载失败时仅五个委托给
 # ``_opus`` 的 wrapper 返回 module unavailable，``opus_import_model_url``
@@ -1036,6 +1049,239 @@ def parse_hip_offline(ctx, file_path, include_params=False, max_depth=10):
     return _hip.parse_hip_offline(
         file_path, include_params=include_params, max_depth=max_depth,
         response_cap_fn=getattr(cmn, "apply_response_cap", None))
+
+
+# -------------------------------------------------------------------
+# Lessons Knowledge Base Tools（bridge-local；不建立 Houdini 连接）
+# 与 get_best_practices / search_docs / get_doc / parse_hip_offline 同处
+# 无 # PR 探针区。知识工具是 advisory，不替代 verify_hou_api /
+# get_houdini_help / get_best_practices，也不替代目标 Houdini 版本 live
+# verification。全部响应走统一 envelope（status + error={code,message,
+# details}）+ apply_response_cap（defense-in-depth）。
+# -------------------------------------------------------------------
+def _lessons_error_envelope(exc):
+    """把 LessonsError 归一为统一 error envelope（code/message/details）。"""
+    return {
+        "status": "error",
+        "error": {"code": exc.code, "message": exc.message,
+                  "details": exc.details},
+    }
+
+
+def _lessons_internal_error(tool_name, exc):
+    """未知异常 → ls_internal_error（绝不泄漏 raw traceback）。"""
+    return {
+        "status": "error",
+        "error": {"code": "ls_internal_error",
+                  "message": "{0} 内部错误: {1}".format(
+                      tool_name, exc.__class__.__name__),
+                  "details": {}},
+    }
+
+
+def _lessons_capped(result):
+    """defense-in-depth：响应整体过 apply_response_cap（失败原样返回）。"""
+    cap_fn = getattr(cmn, "apply_response_cap", None)
+    if not callable(cap_fn):
+        return result
+    try:
+        capped = cap_fn(result)
+    except Exception:
+        return result
+    if isinstance(capped, dict):
+        return capped
+    return result
+
+
+def _auto_lesson_title(problem, symptom):
+    """save_lesson 无 title 参数：由 problem/symptom 首行生成标题（<=60 字符）。"""
+    for text in (problem, symptom):
+        for line in text.splitlines():
+            if line.strip():
+                return line.strip()[:60] + "（自动生成）"
+    return "未分类问题（自动生成）"
+
+
+@mcp.tool()
+def search_lessons(ctx: Context, query, category=None, severity=None,
+                   node_type=None, houdini_version=None, scope=None):
+    """跨全部可用知识库 root 检索既往经验（published lessons + root recipes）。
+
+    触发时机：agent 在 Houdini 操作遇到报错、重试第 2 次仍未解决、或遇到
+    不认识的 API/参数时，先调用本工具检索既往经验；命中后用 read_lesson
+    拉全文。本工具是 advisory，不替代 verify_hou_api / get_houdini_help /
+    get_best_practices，也不替代目标 Houdini 版本的 live verification。
+
+    参数说明：
+    - query: 检索文本（可为空串 → 按新鲜度/priority 基线浏览）。
+    - category / severity: 精确过滤（severity: low/medium/high/critical）。
+    - node_type: doc 文本子串过滤（如 /obj/geo1、sop/attribwrangle）。
+    - houdini_version: affected_versions 子串过滤（如 H21.0）。
+    - scope: 可选 root 名（如 "personal"）或 "all"；缺省检索全部 root。
+
+    返回统一 envelope：status/query/top_k/matched/returned_count/truncated/
+    results（紧凑摘要，含 source_root）/draft_suggestions；unavailable root
+    附 _warning。错误为 status=error + error={code,message,details}
+    （未知 scope → ls_unknown_root）。整体过 apply_response_cap。
+    """
+    try:
+        result = _lessons_search.search_lessons(
+            query=query, category=category, severity=severity,
+            node_type=node_type, houdini_version=houdini_version,
+            scope=scope,
+            response_cap_fn=getattr(cmn, "apply_response_cap", None))
+        # _lessons_search 的错误 envelope 由其内部早退返回（不过它自己的
+        # _apply_cap）；此处桥侧兜底让 error 返回与 success 同走 cap。
+        if isinstance(result, dict) and result.get("status") == "error":
+            return _lessons_capped(result)
+        return result
+    except _lessons.LessonsError as exc:
+        return _lessons_capped(_lessons_error_envelope(exc))
+    except Exception as exc:
+        return _lessons_capped(_lessons_internal_error("search_lessons", exc))
+
+
+@mcp.tool()
+def save_lesson(ctx: Context, problem, symptom, fix, category, severity,
+                affected_versions, verified_versions=None, root=None):
+    """把解决一个 Houdini 问题的经验沉淀为 lesson（写入个人库 draft 状态）。
+
+    触发时机：agent 在解决一个 Houdini 问题后主动沉淀经验。写入个人库
+    draft 状态，不立即进入检索索引；同 symptom 再次出现会自动累积
+    strength（只累积不覆盖）。团队 root 默认只读，写入返回
+    root_not_writable。沉淀的是 advisory 经验，不替代 verify_hou_api /
+    get_houdini_help / get_best_practices 与目标 Houdini 版本 live
+    verification。
+
+    参数说明：
+    - problem / symptom / fix / category / affected_versions: 必填。
+    - severity: 必填，取值 low / medium / high / critical。
+    - verified_versions: 可选；缺省 "unknown"。
+    - root: 可选 root 名；缺省 personal（唯一可写 root）。
+
+    返回：新 lesson → {status:success, lesson_id, lesson_status:"draft",
+    strength:1, root}；同 fingerprint 已存在 → strength 递增且内容保留。
+    错误为 status=error + error={code,message,details}（非法 severity →
+    ls_write_error 并列出合法值；只读团队 root → root_not_writable）。
+    """
+    try:
+        if severity not in _lessons.SEVERITIES:
+            return _lessons_capped({
+                "status": "error",
+                "error": {
+                    "code": "ls_write_error",
+                    # fail-fast 预检：消息引用校验错误（合法取值在
+                    # details.valid，与 _lessons._validate_save_fields 同源）
+                    "message": "severity 参数校验失败（合法取值见 "
+                               "error.details.valid）",
+                    "details": {"field": "severity", "value": severity,
+                                "valid": sorted(_lessons.SEVERITIES)},
+                },
+            })
+        root_desc = _lessons.resolve_root_for_write(root)
+        fields = {
+            "title": _auto_lesson_title(problem, symptom),
+            "category": category,
+            "severity": severity,
+            "affected_versions": affected_versions,
+            # 工具签名不含 source/advisory：agent 主动沉淀默认未人工核验，
+            # source 标记 agent 写入，advisory=False（与 inbox-auto 语义一致）
+            "source": "agent",
+            "advisory": False,
+            "problem": problem,
+            "symptom": symptom,
+            "fix": fix,
+        }
+        if verified_versions is not None:
+            fields["verified_versions"] = verified_versions
+        lesson = _lessons.save_lesson(root_desc["path"], fields)
+        return _lessons_capped({
+            "status": "success",
+            "lesson_id": lesson["id"],
+            "lesson_status": lesson["status"],
+            "strength": lesson["strength"],
+            "root": lesson["root"],
+        })
+    except _lessons.LessonsError as exc:
+        return _lessons_capped(_lessons_error_envelope(exc))
+    except Exception as exc:
+        return _lessons_capped(_lessons_internal_error("save_lesson", exc))
+
+
+@mcp.tool()
+def read_lesson(ctx: Context, id):
+    """按 id 拉取单条 lesson 的完整 markdown 全文（含 front matter 与三段正文）。
+
+    触发时机：search_lessons 命中后按需拉全文；draft 也可读。本工具只读
+    advisory 内容，不替代 verify_hou_api / get_houdini_help /
+    get_best_practices，也不替代目标 Houdini 版本的 live verification。
+
+    参数说明：
+    - id: lesson id（如 L-20260802-001），由 search_lessons 返回。
+
+    返回：{status:success, id, root, lesson_status, markdown}（markdown 为
+    规范格式，可 round-trip）；id 不存在 → status=error + error.code=
+    ls_lesson_not_found（提示先 search_lessons 获取 id）。整体过
+    apply_response_cap。
+    """
+    try:
+        lesson = _lessons_search.find_lesson_by_id(id)
+        if lesson is None:
+            return _lessons_capped({
+                "status": "error",
+                "error": {
+                    "code": "ls_lesson_not_found",
+                    "message": ("未找到 lesson id {0!r}；请先调用 "
+                                "search_lessons 获取 id".format(id)),
+                    "details": {"id": id},
+                },
+            })
+        markdown = _lessons._render_lesson_markdown(lesson)
+        return _lessons_capped({
+            "status": "success",
+            "id": lesson["id"],
+            "root": lesson.get("root"),
+            "lesson_status": lesson["status"],
+            "markdown": markdown,
+        })
+    except _lessons.LessonsError as exc:
+        return _lessons_capped(_lessons_error_envelope(exc))
+    except Exception as exc:
+        return _lessons_capped(_lessons_internal_error("read_lesson", exc))
+
+
+@mcp.tool()
+def knowledge_stats(ctx: Context, scope=None):
+    """查看各知识库 root 状态与计数（只读状态报告）。
+
+    触发时机：需要了解知识库状态、确认写入是否生效或排查检索范围时调用。
+    查看各 root 状态（ok/unconfigured/unavailable）与 lessons/inbox/
+    recipes 计数；unconfigured 静默、unavailable 会带 _warning。本工具是
+    只读状态查询，不替代 verify_hou_api / get_houdini_help /
+    get_best_practices，也不替代目标 Houdini 版本的 live verification。
+
+    参数说明：
+    - scope: 可选 root 名；缺省/"all" 报告全部 root。
+
+    返回：{status:success, roots:[{name, state, path, priority, writable,
+    lesson_count, draft_count, published_count, inbox_count,
+    recipes_count}]}；未知 scope → status=error + error.code=
+    ls_unknown_root。整体过 apply_response_cap。
+    """
+    try:
+        stats = _lessons_search.compute_stats(scope)
+        result = {"status": "success", "roots": stats["roots"]}
+        unavailable = [r["name"] for r in stats["roots"]
+                       if r.get("state") == "unavailable"]
+        if unavailable:
+            result["_warning"] = [
+                "root {0} 不可达（state=unavailable）".format(name)
+                for name in unavailable]
+        return _lessons_capped(result)
+    except _lessons.LessonsError as exc:
+        return _lessons_capped(_lessons_error_envelope(exc))
+    except Exception as exc:
+        return _lessons_capped(_lessons_internal_error("knowledge_stats", exc))
 
 
 # -------------------------------------------------------------------
@@ -4544,6 +4790,115 @@ def usd_stage_resource(encoded_node_path: str):
         "usd_stage", "lop_stage_info",
         lambda: _houdini_call("lop_stage_info", {"lop_path": path}),
     )
+
+
+# -------------------------------------------------------------------
+# 自动捕获 hook（add-self-evolving-knowledge-base task 5.1-5.3）
+# 挂载点：mcp._tool_manager.call_tool —— 所有工具调用经协议到达的**唯一**
+# 逐调用入口（FastMCP.call_tool 是实例方法，但 lowlevel server 在 __init__
+# 时已把其 bound method 捕获进 handler 闭包，事后给 mcp.call_tool 赋值
+# 实例属性不会拦截协议调用；ToolManager 实例属性在每次调用时动态解析，
+# 包装它才是真实 choke point，已在测试中经 create_connected_server_and_
+# client_session 实证）。响应出口检测 status=error → 静默写个人库 inbox。
+#
+# 纪律（task 5.2/5.3）：
+# - 纯规则检测：不调用 LLM / 嵌入模型 / 外部服务，零上下文成本；
+# - 只写个人库 inbox（knowledge_dir()），绝不写其他 root；
+# - 捕获路径任何失败（record_error_event 返回 False 或抛异常）一律吞掉，
+#   原始响应**永不**被修改；工具调用自身抛异常 → 捕获后原样重抛。
+# -------------------------------------------------------------------
+def _capture_error_from_result(tool_name, result):
+    """从工具调用结果提取 status=error 事件并写入个人库 inbox。
+
+    结果可能是：dict（直接调用路径）或 list[TextContent]（协议路径，
+    text 为 pydantic_core.to_json 序列化的 JSON）。error code 取新 shape
+    （error.code）或旧 shape（error_code / origin）。本函数绝不抛异常。
+    """
+    payload = None
+    if isinstance(result, dict) and result.get("status") == "error":
+        payload = result
+    elif isinstance(result, (list, tuple)):
+        for item in result:
+            text = getattr(item, "text", None)
+            if not isinstance(text, str):
+                continue
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                continue
+            if isinstance(parsed, dict) and parsed.get("status") == "error":
+                payload = parsed
+                break
+    if payload is None:
+        return
+
+    error = payload.get("error")
+    if isinstance(error, dict):
+        error_code = (error.get("code") or payload.get("error_code")
+                      or payload.get("origin") or "unknown")
+        message = error.get("message") or payload.get("message") or ""
+    else:
+        error_code = (payload.get("error_code") or payload.get("origin")
+                      or "unknown")
+        message = payload.get("message") or ""
+
+    try:
+        _lessons.record_error_event(
+            _lessons.knowledge_dir(), tool=tool_name,
+            error_code=error_code, message=message,
+            source="bridge-capture")
+    except Exception:
+        pass  # 捕获路径永不打断原响应
+
+
+def _install_capture_hook():
+    """包装 mcp._tool_manager.call_tool，安装自动捕获 hook（幂等）。
+
+    为什么包 ToolManager 而不是 FastMCP.call_tool：lowlevel server 在
+    FastMCP.__init__（_setup_handlers）时就把 ``self.call_tool`` 的 bound
+    method 存进了 CallToolRequest handler 闭包，之后给实例赋属性不会影响
+    协议路径；而 handler → FastMCP.call_tool → ``self._tool_manager.call_tool``
+    的属性查找发生在每次调用时，包装 ToolManager 实例方法可拦截**所有**
+    协议调用（含全部既有工具）。直接调用工具函数不经过这里（保持惰性）。
+    """
+    manager = getattr(mcp, "_tool_manager", None)
+    if manager is None or getattr(manager, "_lessons_capture_installed", False):
+        return
+    original = manager.call_tool
+
+    async def _wrapped_call_tool(name, arguments, context=None,
+                                 convert_result=False):
+        try:
+            result = await original(name, arguments, context=context,
+                                    convert_result=convert_result)
+        except Exception as exc:
+            # 工具调用自身抛异常：捕获（tool 名 + 异常类/消息）后原样重抛，
+            # 协议错误处理不变
+            try:
+                _capture_error_from_result(name, {
+                    "status": "error",
+                    "error": {
+                        "code": "tool_exception",
+                        "message": "{0}: {1}".format(
+                            exc.__class__.__name__, exc),
+                    },
+                })
+            except Exception:
+                pass
+            raise
+        try:
+            _capture_error_from_result(name, result)
+        except Exception:
+            pass
+        return result
+
+    _wrapped_call_tool.__name__ = getattr(original, "__name__", "call_tool")
+    _wrapped_call_tool.__doc__ = getattr(original, "__doc__", None)
+    manager.call_tool = _wrapped_call_tool
+    manager._lessons_capture_installed = True
+
+
+_install_capture_hook()
 
 
 def main():
