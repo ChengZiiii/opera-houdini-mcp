@@ -1,18 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Opera Houdini MCP 图标：扁平图形化。纯色块：深色底 + 橙色 H（Houdini）+ 蓝色插头插脚（MCP 连接，插向 H 右腿） -->
+<!-- Opera Houdini MCP 图标：O 型黑洞扁平设计。纯色块：深色底 + 中心黑洞（事件视界）+ 橙色吸积环（O 型，顶部开口）+ 浅蓝光子 + 蓝色轨道弧（连接宇宙） -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
   <!-- 底板（纯色，无渐变） -->
   <rect x="8" y="8" width="112" height="112" rx="24" fill="#1a1f26"/>
 
-  <!-- H 左腿 -->
-  <rect x="28" y="28" width="18" height="72" rx="5" fill="#ff7a1a"/>
-  <!-- H 右腿（插头将插入的"插座"） -->
-  <rect x="88" y="28" width="18" height="72" rx="5" fill="#ff7a1a"/>
-  <!-- 横梁（贯通左右腿，确保 H 完整可读） -->
-  <rect x="28" y="55" width="60" height="18" rx="5" fill="#ff7a1a"/>
+  <!-- 黑洞（事件视界，扁平提边） -->
+  <circle cx="64" cy="64" r="26" fill="#0b0e13" stroke="#39404b" stroke-width="2"/>
 
-  <!-- MCP 插头：插头体骑在横梁右端 + 双插脚指向右腿 -->
-  <rect x="66" y="52" width="14" height="24" rx="3" fill="#2f9be6"/>
-  <rect x="80" y="57" width="6" height="8" rx="1" fill="#b5e6ff"/>
-  <rect x="80" y="67" width="6" height="8" rx="1" fill="#b5e6ff"/>
+  <!-- 吸积环：O 型环，顶部 60° 开口（300° 大弧，跨右/下/左） -->
+  <path d="M 81 34.6 A 34 34 0 1 1 47 34.6" fill="none" stroke="#ff7a1a" stroke-width="5.5" stroke-linecap="round"/>
+
+  <!-- 顶部开口处飞出的光子/信号 -->
+  <circle cx="64" cy="22" r="4" fill="#b5e6ff"/>
+
+  <!-- 连接宇宙：左右两条蓝色轨道弧（引力波/信号轨道） -->
+  <path d="M 25.9 86 A 44 44 0 0 1 25.9 42" fill="none" stroke="#2f9be6" stroke-width="4" stroke-linecap="round"/>
+  <path d="M 102.1 42 A 44 44 0 0 1 102.1 86" fill="none" stroke="#2f9be6" stroke-width="4" stroke-linecap="round"/>
 </svg>
