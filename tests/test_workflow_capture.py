@@ -14,12 +14,15 @@
   hda 字段 = {type_name, version(空串省略), definition_source
   (embedded/external)}，**绝不输出 library_path 或本机路径**；顶层
   hip_file = basename（隐私安全，异常降级空串）。
-- HDA 内部研究：include_hda_internals=True → **可编辑内容**的 HDA
-  （definition 非 None 且 isEditable() True，对应 Allow Editing of
-  Contents / Editable Nodes）children() 并入 BFS（嵌套可编辑 HDA 递归，
-  内部 wrangle VEX 可见）；官方锁定节点（OPlib，isEditable False）与
-  锁定用户 HDA 默认**不拆解**；官方节点若可编辑同样展开；默认 False 不
-  展开；同一 max_nodes 预算与 truncated 语义。
+- HDA 内部研究：include_hda_internals=True → **有可读内部内容**的节点
+  （children() 非空）children() 并入 BFS（嵌套递归，内部 wrangle VEX
+  可见）——**展开依据不能用 isEditable()**（实机：HDA 实例锁定态
+  isEditable False 但 children 完全可读，rbdbulletsolver1 锁定态
+  children 307、用户 HDA 锁定态 children 29；且大 HDA 上 isEditable()
+  定义比较可能极慢）；用户 HDA（含便签/子网络）与官方 Editable Nodes
+  节点（rbdbulletsolver1）参与分析，官方无内容内建节点（attribwrangle
+  children 恒空）默认不拆解；普通可编辑容器（subnet）children 非空同样
+  展开；默认 False 不展开；同一 max_nodes 预算与 truncated 语义。
 - sticky note：父网络去重 ``iterStickyNotes`` 提取 text/position；API
   缺失（AttributeError）降级跳过 + ``_warning``。
 - 连线：每节点每个已连接 input → ``{from, to, input_index}``。
@@ -614,17 +617,16 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
         self.assertEqual({n["path"] for n in result["nodes"]},
                          {"/net/HDA1"})
 
-    def test_official_locked_hda_not_expanded(self):
-        # H21 实测：官方 OPlib 节点（如 attribwrangle）内容锁定
-        # （isEditable() False / isLockedHDA() True）→ 即使有 children
-        # 也不拆解分析（用户需求：官方节点默认不展开）
+    def test_official_locked_hda_without_children_not_expanded(self):
+        # H21 实测：官方 OPlib 节点（如 attribwrangle）内容锁定且
+        # children() 恒空 → 无可拆解内容，不展开（用户需求：官方节点
+        # 默认不拆解分析）
         net = _FakeNode("net")
         official_def = _FakeDefinition(
             "C:/PROGRA~1/SIDEEF~1/HOUDIN~1.596/houdini/otls/OPlibSop.hda")
-        inner = _FakeNode("hidden_inner", parent=net)
         official = _FakeNode("official_asset", type_name="attribwrangle",
                              parent=net, definition=official_def,
-                             children=[inner], is_editable=False)
+                             is_editable=False)
         self._select([official])
         result = self._handler().handle_capture_workflow_snapshot(
             include_hda_internals=True)
@@ -634,8 +636,11 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
         self.assertEqual({n["path"] for n in result["nodes"]},
                          {"/net/official_asset"})
 
-    def test_locked_user_hda_not_expanded(self):
-        # 用户自制 HDA 若锁定（Allow Editing of Contents 关闭）→ 不展开
+    def test_locked_user_hda_still_expanded(self):
+        # 用户自制 HDA 即使实例锁定（isEditable False，内容与定义一致）
+        # children() 仍完全可读 → 参与分析（实机：csr_voronoi_advanced1
+        # isEditable False 且 children 29；rbdbulletsolver1 isEditable
+        # False 且 children 307——用户反馈"识别不到"的根因）
         net = _FakeNode("net")
         definition = _FakeDefinition("C:/otls/mytool.hda")
         inner = _FakeNode("inner_wrangle", type_name="attribwrangle",
@@ -644,13 +649,28 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
         locked_hda = _FakeNode("HDA1", type_name="mysop", parent=net,
                                definition=definition, children=[inner],
                                is_editable=False)
+        inner._parent = locked_hda
         self._select([locked_hda])
+        result = self._handler().handle_capture_workflow_snapshot(
+            include_hda_internals=True)
+        self.assertEqual(result["status"], "success")
+        self.assertFalse(result["truncated"])
+        by_path = {n["path"]: n for n in result["nodes"]}
+        self.assertEqual(set(by_path.keys()),
+                         {"/net/HDA1", "/net/HDA1/inner_wrangle"})
+
+    def test_node_without_children_not_expanded(self):
+        # 无内部内容（children 空）的节点即使可编辑也不展开
+        net = _FakeNode("net")
+        empty = _FakeNode("empty", type_name="attribwrangle", parent=net,
+                          is_editable=True)
+        self._select([empty])
         result = self._handler().handle_capture_workflow_snapshot(
             include_hda_internals=True)
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["node_count"], 1)
         self.assertEqual({n["path"] for n in result["nodes"]},
-                         {"/net/HDA1"})
+                         {"/net/empty"})
 
     def test_editable_contents_node_expanded_even_with_builtin_path(self):
         # 官方节点若处于 allow editing of contents 状态（isEditable True）

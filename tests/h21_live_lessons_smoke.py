@@ -815,9 +815,11 @@ def main():
     except Exception as exc:
         check("j editable network container expanded", False, "%r" % (exc,))
     # 官方 Editable Nodes 声明节点（bulletrbdsolver，Type Properties 中
-    # Editable Nodes = dopnet/forces）：isEditable True（可编辑内容状态
-    # 成立），但其子网络为条件内容，HOM children() 不可见 → capture
-    # include_hda_internals 自洽（node_count=1），不产生误导性拆解。
+    # Editable Nodes = dopnet/forces）：展开依据 = children() 非空（不是
+    # isEditable——实机 rbdbulletsolver1 锁定态 isEditable False 但
+    # children 307 全可读）。hython 下新建实例内容未实例化（children
+    # 空）→ 无可展开，capture 自洽 node_count=1；实机 GUI 使用中的实例
+    # children 300+（含 dopnet/forces 子网络）→ 参与分析。
     try:
         probe_dopnet = hou.node("/obj").createNode("dopnet", "bullet_probe")
         probe_solver = probe_dopnet.createNode("bulletrbdsolver", "solver1")

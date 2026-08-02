@@ -1330,17 +1330,19 @@ def capture_workflow_snapshot(ctx, node_path=None, include_vex=True,
       结构化错误，不静默回退）；指定时捕获以该节点为根的闭包子网络。
     - include_vex: 可选，默认 True；包含 Attribute Wrangle 的 VEX snippet。
     - max_nodes: 可选，默认 50；闭包节点硬上限，超限截断并标记 truncated。
-    - include_hda_internals: 可选，默认 False；True 时**可编辑内容**的节点
-      （isEditable()，对应 Allow Editing of Contents / Editable Nodes）内部
-      子网（node.children()，含嵌套可编辑 HDA 递归）并入同一 BFS 遍历，受
-      同一 max_nodes 预算与 truncated 语义。H21 实测官方内建节点
-      （OPlib*.hda 等）内容锁定（isEditable() False）默认**不拆解**；用户
-      自制 HDA（unlocked）与普通可编辑网络容器（subnet / geo 等）参与
-      分析；官方节点若处于 allow editing of contents 状态（如带 Editable
-      Nodes 的 bulletrbdsolver）同样参与（其子网络为条件内容，HOM
-      children() 不可见时自然无可展开）。研究用户自制 HDA 原理（内部
-      VEX / 约束 / 子网结构）时启用，并可视需要上调 max_nodes（大资产
-      内部节点多，如 500）。
+    - include_hda_internals: 可选，默认 False；True 时**有可读内部内容**的
+      节点（node.children() 非空，含嵌套递归）内部子网并入同一 BFS 遍历，
+      受同一 max_nodes 预算与 truncated 语义。H21 实测展开依据**不能用
+      isEditable()**：HDA 实例内容与定义一致（未修改）时 isEditable()
+      为 False 但 children 完全可读（rbdbulletsolver1 锁定态 children
+      307；用户 HDA 锁定态 children 29），且大 HDA 上 isEditable() 定义
+      比较可能极慢。按 children 非空展开后：用户自制 HDA（含便签 / 子
+      网络）与官方带 Editable Nodes 的节点（如 rbdbulletsolver1 的
+      dopnet/forces 子网络）参与分析；官方无内容内建节点（OPlib*.hda
+      等，children 恒空）默认**不拆解**；普通可编辑容器（subnet / geo）
+      children 非空同样展开。研究用户自制 HDA 原理（内部 VEX / 约束 /
+      子网结构）时启用，并可视需要上调 max_nodes（大资产内部节点多，
+      如 500）。
 
     返回结构：{status:success, root, node_count, truncated, hip_file,
     nodes, sticky_notes, connections}，超限截断时 truncated=true；API

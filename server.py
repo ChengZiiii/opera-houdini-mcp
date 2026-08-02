@@ -209,40 +209,30 @@ def _snapshot_parent(node):
         return None
 
 
-def _snapshot_editable_contents(node):
-    """include_hda_internals 展开判定：仅展开**可编辑内容**的节点。
-
-    H21.0.596 实机语义（用户需求：官方节点默认不拆解分析，可编辑内容
-    参与分析）：
-    - 官方内建节点（OPlib*.hda 等 HDA 化内建类型，如 attribwrangle）内容
-      锁定——``isEditable()`` 返回 False（``isLockedHDA()`` True）→
-      **不展开**
-    - 用户自制 HDA（Allow Editing of Contents 开启 / Editable Nodes，
-      unlocked）→ ``isEditable()`` True → **展开**（含嵌套可编辑 HDA
-      递归）；锁定（不允许编辑内容）的用户 HDA → 不展开
-    - 官方节点若处于 allow editing of contents 状态（如带 Editable
-      Nodes 的 ``bulletrbdsolver``，isEditable True）→ **展开**
-      （其子网络在 GUI 会话中可见时并入快照；hython 下条件子网络未
-      实例化则 children 为空，无内容可展开）
-    - 普通网络容器（subnet / geo / dopnet 等）→ 展开（其 children 是
-      用户工作流的一部分）；非网络节点（box 等）isEditable True 但
-      children 恒空 → 无副作用
-    API 缺失/异常降级 False（保守不展开，绝不 crash）。
-    """
-    try:
-        return bool(node.isEditable())
-    except Exception:
-        return False
-
-
 def _snapshot_neighbors(node, include_hda_internals=False):
     """inputs() + outputs() 合并；异常 / 缺 API 降级为 []。
 
-    ``include_hda_internals=True`` 时，**可编辑内容**的节点
-    （``_snapshot_editable_contents``：``isEditable()``，对应 Allow
-    Editing of Contents / Editable Nodes；官方锁定内建节点 False）额外
-    展开 ``children()``（内部子网）；嵌套可编辑 HDA 由其 children 再次
-    触发同一展开，自然递归。children 读取异常降级为 []。
+    ``include_hda_internals=True`` 时，**有可读内部内容**的节点
+    （``children()`` 非空）额外展开 ``children()``（内部子网）；嵌套
+    有内容的节点由其 children 再次触发同一展开，自然递归。
+
+    H21.0.596 实机语义（用户需求：官方节点默认不拆解分析，可编辑内容
+    参与分析）：
+    - 展开依据 = ``children()`` 非空（内部内容可读即参与）。**不能用
+      ``isEditable()``**：HDA 实例内容与定义一致（未修改）时
+      isEditable() 为 False（matchesCurrentDefinition True），但
+      children 完全可读——实机：rbdbulletsolver1 isEditable False 且
+      children 307（内部 dopnet/forces 子网络）；用户 HDA
+      csr_voronoi_advanced1 isEditable False 且 children 29。且大型
+      HDA 上 isEditable() 的定义比较可能极慢（实机 30s+ 超时）
+    - 用户自制 HDA（含便签 / 子网络）→ children 非空 → **展开**
+    - 官方带 Editable Nodes 的节点（如 rbdbulletsolver1）→ children
+      非空 → **展开**
+    - 官方无内容内建节点（OPlib 锁定如 attribwrangle，children 恒空）
+      → 不展开
+    - 普通可编辑网络容器（subnet / geo 等）→ children 非空即展开；
+      非网络节点（box 等）children() 恒空 → 无副作用
+    children 读取异常降级为 []。
     """
     neighbors = []
     for getter in ("inputs", "outputs"):
@@ -254,7 +244,7 @@ def _snapshot_neighbors(node, include_hda_internals=False):
             if item is None:
                 continue
             neighbors.append(item)
-    if include_hda_internals and _snapshot_editable_contents(node):
+    if include_hda_internals:
         try:
             children = node.children() or []
         except Exception:
@@ -3596,18 +3586,20 @@ class HoudiniMCPServer:
         解析 → ``invalid_node_path``）。多个选中节点全部作为 BFS seeds。
 
         闭包：以 seeds 为根沿 ``inputs()`` + ``outputs()`` 双向 BFS，
-        ``include_hda_internals=True`` 时**可编辑内容**的节点（
-        ``isEditable()``，见 ``_snapshot_editable_contents``）额外展开
-        ``children()``（内部子网，嵌套可编辑 HDA 递归）——H21 实测官方
-        内建节点（OPlib*.hda 等，如 attribwrangle）内容锁定
-        （``isEditable()`` False）默认**不拆解**；用户自制 HDA（Allow
-        Editing of Contents / Editable Nodes，unlocked）参与分析；官方
-        节点若处于 allow editing of contents 状态（如带 Editable Nodes
-        的 bulletrbdsolver）同样参与（其子网络为条件内容，HOM
-        children() 不可见时自然无可展开）；普通可编辑网络容器（subnet /
-        geo 等）同样展开（其 children 是用户工作流的一部分）。同一
-        ``max_nodes`` 硬上限（int 化，<1 视为 1），超限截断 +
-        ``truncated: true``；输出按 path 排序稳定。
+        ``include_hda_internals=True`` 时**有可读内部内容**的节点
+        （``children()`` 非空，见 ``_snapshot_neighbors``）额外展开
+        ``children()``（内部子网，嵌套递归）——H21 实测展开依据**不能
+        用 ``isEditable()``**：HDA 实例内容与定义一致（未修改）时
+        isEditable() 为 False，但 children 完全可读（rbdbulletsolver1
+        锁定态下 children 307；用户 HDA csr_voronoi_advanced1 锁定态下
+        children 29），且大 HDA 上 isEditable() 定义比较可能极慢。按
+        children 非空展开后：用户自制 HDA（含便签 / 子网络）与官方带
+        Editable Nodes 的节点（如 rbdbulletsolver1 的 dopnet/forces
+        子网络）参与分析；官方无内容内建节点（OPlib 锁定如
+        attribwrangle，children 恒空）默认**不拆解**；普通可编辑容器
+        （subnet / geo）children 非空同样展开。同一 ``max_nodes`` 硬
+        上限（int 化，<1 视为 1），超限截断 + ``truncated: true``；
+        输出按 path 排序稳定。
 
         节点表每项：``path / name / type / type_full / is_hda / comment /
         params（非默认参数，≤40 条 + params_truncated）/ vex（attribwrangle
