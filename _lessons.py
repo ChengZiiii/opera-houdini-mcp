@@ -38,6 +38,9 @@ BM25 检索与 bridge 工具注册由后续 agent 基于本模块的公开 API �
 - recipes（``recipes/BEST_PRACTICES.md``）：``save_recipe`` 以 ``### BP-NNN``
   块追加写用法/流程知识（id 自增、9 字段校验、advisory 固定 true、source 系统
   标注），写入即被检索（无 draft 门槛）；团队 root 写入附 ``@<用户名>`` 归属。
+  title 可选，仅用于校验、首块 ``> title`` 注释行渲染与响应汇报；追加写入因
+  strict parser 限制（块间仅允许 ``- field`` 行与空行）不落盘；9 字段 schema
+  无 title 字段。
 - 路径推导：base dir = ``~/.opera-houdini-mcp``（expanduser("~")；Windows
   上 expanduser 返回 "~" 时兜底 USERPROFILE）；可用 ``HOUDINI_MCP_HOME``
   环境变量覆盖（测试钩子）。绝不使用 ``_repo_root()`` 或硬编码用户名。
@@ -1006,10 +1009,16 @@ def _validate_recipe_fields(fields, root_name):
     return recipe
 
 
-def _render_recipe_block(recipe):
-    """渲染单个 recipe 块（可选 ``> title`` 行在块上方，块体 9 个 - key: value）。"""
+def _render_recipe_block(recipe, render_title=True):
+    """渲染单个 recipe 块。
+
+    ``render_title=True`` 时在块上方渲染 ``> <title>`` 注释行（仅首块场景；
+    strict parser 只允许首个 heading 之前的 ``>`` 行，块间 ``>`` 行会被判为
+    前一块的非法正文，因此追加写入必须传 False）。块体为 9 个
+    ``- key: value`` 字段行。
+    """
     lines = []
-    if recipe.get("title"):
+    if render_title and recipe.get("title"):
         lines.append("> " + recipe["title"])
         lines.append("")
     lines.append("### " + recipe["id"])
@@ -1027,8 +1036,11 @@ def save_recipe(root_path, fields):
     写入即被 ``search_lessons`` 检索（recipes 通道无 draft 门槛）。id 自动
     生成（扫描既有块最大序号 + 1，撞号重试），MUST NOT 接受用户自定义 id。
     source 由系统标注：个人库 ``"agent"``，团队 root ``"agent@<用户名>"``；
-    advisory 固定 true；verified_versions 缺省 ``"unknown"``。文件缺失/为空
-    → 写 header 再追加；写前全文过 ``_best_practices.parse_best_practices``
+    advisory 固定 true；verified_versions 缺省 ``"unknown"``。title 可选：
+    仅用于校验、首块 ``> title`` 注释行渲染与响应汇报；追加到已有块的文件
+    时 title 不落盘（strict parser 只允许首个 heading 前的 ``>`` 行，块间
+    仅允许 ``- field`` 行与空行；9 字段 schema 无 title 字段）。文件缺失/为
+    空 → 写 header 再追加；写前全文过 ``_best_practices.parse_best_practices``
     自校验保证 round-trip；``_atomic_write_text`` 原子写，失败保留旧文件。
     registry 声明 writable=false / state!=ok → ``root_not_writable``（零写入）。
     成功返回完整 recipe dict（{id, root, category, severity,
@@ -1049,7 +1061,11 @@ def save_recipe(root_path, fields):
         existing = _read_text(path)
 
     recipe["id"] = _next_recipe_id(existing)
-    block_text = _render_recipe_block(recipe)
+    # title 只在「文件尚无任何 BP 块」的首块场景落盘：strict parser 只允许
+    # 首个 heading 之前的 `>` 行，块间 `> title` 会被判为前一块的非法正文，
+    # 因此追加写入时 title 不落盘（仍做校验、仍随响应汇报）。
+    render_title = _RECIPE_HEADING_RE.search(existing) is None
+    block_text = _render_recipe_block(recipe, render_title)
     if existing.strip():
         full_text = existing.rstrip("\n") + "\n\n" + block_text
     else:

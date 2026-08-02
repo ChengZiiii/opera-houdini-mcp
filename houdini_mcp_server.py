@@ -1112,6 +1112,12 @@ def search_lessons(ctx: Context, query, category=None, severity=None,
     拉全文。本工具是 advisory，不替代 verify_hou_api / get_houdini_help /
     get_best_practices，也不替代目标 Houdini 版本的 live verification。
 
+    主动沉淀工作流（advisory 行为注解，非强制协议）：用户完成 HDA / 节点流
+    / VEX 工作流后说"沉淀这些知识"时，agent SHALL 依次：get_selection 定位
+    → capture_workflow_snapshot 取快照 → 组织为 recipe（用法文档，走
+    save_recipe）或 lesson（经验，走 save_lesson）→ 写入后向用户汇报写入的
+    id / root / 状态。
+
     参数说明：
     - query: 检索文本（可为空串 → 按新鲜度/priority 基线浏览）。
     - category / severity: 精确过滤（severity: low/medium/high/critical）。
@@ -1152,6 +1158,12 @@ def save_lesson(ctx: Context, problem, symptom, fix, category, severity,
     root_not_writable。沉淀的是 advisory 经验，不替代 verify_hou_api /
     get_houdini_help / get_best_practices 与目标 Houdini 版本 live
     verification。
+
+    主动沉淀工作流（advisory 行为注解，非强制协议）：用户完成 HDA / 节点流
+    / VEX 工作流后说"沉淀这些知识"时，agent SHALL 依次：get_selection 定位
+    → capture_workflow_snapshot 取快照 → 组织为 recipe（用法文档，走
+    save_recipe）或 lesson（经验，走本工具）→ 写入后向用户汇报写入的
+    id / root / 状态。
 
     参数说明：
     - problem / symptom / fix / category / affected_versions: 必填。
@@ -1282,6 +1294,137 @@ def knowledge_stats(ctx: Context, scope=None):
         return _lessons_capped(_lessons_error_envelope(exc))
     except Exception as exc:
         return _lessons_capped(_lessons_internal_error("knowledge_stats", exc))
+
+
+@mcp.tool()
+def capture_workflow_snapshot(ctx, node_path=None, include_vex=True,
+                              max_nodes=50):
+    """把用户选中（或 node_path 指定）的节点子网络捕获为结构化工作流快照
+    （add-workflow-knowledge-capture，readOnly relay，不修改场景）。
+
+    触发时机（advisory）：用户完成 HDA / 节点流 / VEX 工作流后说"沉淀这些
+    知识"时，agent 先调用 get_selection 定位，再调本工具取快照，组织为
+    recipe（用法文档，走 save_recipe）或 lesson（经验，走 save_lesson）。
+    本工具是 advisory，不替代 verify_hou_api / get_houdini_help /
+    get_best_practices，也不替代目标 Houdini 版本的 live verification。
+
+    参数说明：
+    - node_path: 可选；省略时取当前节点选择（空选择返回 no_selection
+      结构化错误，不静默回退）；指定时捕获以该节点为根的闭包子网络。
+    - include_vex: 可选，默认 True；包含 Attribute Wrangle 的 VEX snippet。
+    - max_nodes: 可选，默认 50；闭包节点硬上限，超限截断并标记 truncated。
+
+    返回结构：{status:success, root, node_count, truncated, nodes,
+    sticky_notes, connections}，超限截断时 truncated=true；API 降级附
+    _warning。快照只含节点表（path/name/type/comment/非默认参数/vex/hda/
+    errors/warnings）+ sticky note + 连线，**不含几何数据**，readOnly
+    不修改场景，纯规则读取**不调用 LLM / 嵌入模型**。错误为 status=error
+    + error={code,message,details}（no_selection / invalid_node_path /
+    selection_read_failed / capture_connection_error）。整体过
+    apply_response_cap。
+    """
+    try:
+        env = _houdini_call("capture_workflow_snapshot", {
+            "node_path": node_path,
+            "include_vex": include_vex,
+            "max_nodes": max_nodes,
+        })
+        if env.get("status") == "error":
+            # 连接层 / 转发层失败（origin=connection / mcp_bridge / houdini）
+            # → 转成统一 lessons error envelope，code 标记连接类错误
+            return _lessons_capped({
+                "status": "error",
+                "error": {
+                    "code": "capture_connection_error",
+                    "message": env.get("message", "未知错误"),
+                    "details": {"origin": env.get("origin", "unknown")},
+                },
+            })
+        # 成功 → 透传 server 端已 cap 的 lessons 形状 result（defense-in-depth
+        # 再走一次 _lessons_capped）
+        return _lessons_capped(env.get("result", env))
+    except _lessons.LessonsError as exc:
+        return _lessons_capped(_lessons_error_envelope(exc))
+    except Exception as exc:
+        return _lessons_capped(_lessons_internal_error(
+            "capture_workflow_snapshot", exc))
+
+
+@mcp.tool()
+def save_recipe(ctx, title, problem, symptom, fix, category, severity,
+                affected_versions, verified_versions=None, root=None):
+    """把一条用法/流程知识以 ### BP-NNN 块追加写入指定 root 的 recipes 文件
+    （add-workflow-knowledge-capture，write，bridge-local 不连接 Houdini）。
+
+    触发时机（advisory）：用户完成工作流后说"沉淀这些知识"时，agent 先用
+    get_selection 定位，再调 capture_workflow_snapshot 取快照；用法/流程
+    文档（"怎么用这个 HDA""这个网络怎么搭"）走本工具 save_recipe（写入即被
+    search_lessons 检索，无 draft 门槛），错误经验走 save_lesson（draft
+    门槛 + 指纹累积）。本工具是 advisory，不替代 verify_hou_api /
+    get_houdini_help / get_best_practices，也不替代目标 Houdini 版本的
+    live verification。
+
+    参数说明：
+    - title / problem / symptom / fix / category / severity /
+      affected_versions: 必填；title 渲染为块上方 ``> title`` 注释行。
+    - severity: 必填，recipes severity 合法取值 low / medium / high
+      （3 值，与 lesson 的 4 值不同）。
+    - verified_versions: 可选；缺省 "unknown"。
+    - root: 可选 root 名；缺省 personal（唯一默认可写 root）。
+
+    返回：{status:success, recipe_id, root, severity, source,
+    immediately_searchable:true}；recipe_id 为 BP-NNN 自动生成（扫描既有块
+    最大序号 + 1），**不接受自定义 id**；团队 root 写入 source 自动附
+    ``@<用户名>``（系统标注）。错误为 status=error + error={code,message,
+    details}（非法 severity → ls_write_error 并列出合法值；只读团队 root
+    → root_not_writable；未知/不可用 root → ls_unknown_root）。整体过
+    apply_response_cap。
+    """
+    try:
+        if severity not in _lessons.RECIPE_SEVERITIES:
+            # fail-fast 预检：recipes severity 只有 3 值（与 lesson 的 4 值
+            # 不同），消息写清「recipes」避免与 lesson 语义混淆；合法取值
+            # 在 details.valid（与 _lessons._validate_recipe_fields 同源）
+            return _lessons_capped({
+                "status": "error",
+                "error": {
+                    "code": "ls_write_error",
+                    "message": "severity 参数校验失败（recipes severity 合法"
+                               "取值见 error.details.valid）",
+                    "details": {"field": "severity", "value": severity,
+                                "valid": sorted(_lessons.RECIPE_SEVERITIES)},
+                },
+            })
+        root_desc = _lessons.resolve_root_for_write(root)
+        fields = {
+            "title": title,
+            "category": category,
+            "severity": severity,
+            "affected_versions": affected_versions,
+            "problem": problem,
+            "symptom": symptom,
+            "fix": fix,
+            # 工具签名不含 source：source 由 _lessons.save_recipe 按 root
+            # 归属系统标注（个人库 "agent"，团队 root "agent@<用户名>"）；
+            # advisory 固定 true（recipes 恒为用法/流程 advisory 知识）
+            "advisory": True,
+        }
+        if verified_versions is not None:
+            fields["verified_versions"] = verified_versions
+        recipe = _lessons.save_recipe(root_desc["path"], fields)
+        return _lessons_capped({
+            "status": "success",
+            "recipe_id": recipe["id"],
+            "root": recipe["root"],
+            "severity": recipe["severity"],
+            "source": recipe["source"],
+            # 写入即被 search_lessons 检索（recipes 通道无 draft 门槛）
+            "immediately_searchable": True,
+        })
+    except _lessons.LessonsError as exc:
+        return _lessons_capped(_lessons_error_envelope(exc))
+    except Exception as exc:
+        return _lessons_capped(_lessons_internal_error("save_recipe", exc))
 
 
 # -------------------------------------------------------------------

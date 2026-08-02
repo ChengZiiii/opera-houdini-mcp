@@ -307,6 +307,42 @@ class SaveRecipePersonalTests(_BaseDirFixture):
         # title 不参与检索，返回 dict 也不含 title
         self.assertNotIn("title", recipe)
 
+    def test_title_not_rendered_when_appending_to_existing_blocks(self):
+        # 追加到已有块的文件：title 仍校验、仍返回，但不落盘（strict parser
+        # 只允许首个 heading 之前的 `>` 行，块间 `> title` 会被判为前一块的
+        # 非法正文 → 自校验失败 → ls_write_error）
+        first = _lessons.save_recipe(
+            self._personal(), _valid_fields(title="首块标题"))
+        second = _lessons.save_recipe(
+            self._personal(),
+            _valid_fields(title="第二条标题", symptom="另一个症状。"))
+        self.assertEqual(first["id"], "BP-001")
+        self.assertEqual(second["id"], "BP-002")
+        text = _read(_lessons.recipes_path(self._personal()))
+        # 首块 title 仍在（位于 BP-001 上方），但追加块的 title 不落盘
+        self.assertIn("> 首块标题", text)
+        self.assertNotIn("> 第二条标题", text)
+        # 全文 round-trip：两块都在、无非法正文
+        entries = _best_practices.parse_best_practices(text)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0]["id"], "BP-001")
+        self.assertEqual(entries[1]["id"], "BP-002")
+
+    def test_title_rendered_when_appending_to_header_only_file(self):
+        # header-only 文件（无任何 BP 块）+ 带 title 追加 → 视为首块场景，
+        # title 渲染在首块上方（parser 只允许首个 heading 前的 `>` 行）
+        path = _lessons.recipes_path(self._personal())
+        _write(path, "# BEST PRACTICES\n\n> 说明：本文件由人工维护。\n")
+        recipe = _lessons.save_recipe(
+            self._personal(), _valid_fields(title="渲染排查示例"))
+        self.assertEqual(recipe["id"], "BP-001")
+        text = _read(path)
+        self.assertIn("> 渲染排查示例", text)
+        self.assertLess(text.index("> 渲染排查示例"), text.index("### BP-001"))
+        entries = _best_practices.parse_best_practices(text)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["id"], "BP-001")
+
     def test_personal_source_never_stamped_with_username(self):
         # 个人库写入不受 getpass 影响：source 恒为 agent，无 @ 后缀
         self._patch_getuser(lambda: "tester")

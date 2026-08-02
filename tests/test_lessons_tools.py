@@ -697,5 +697,256 @@ class LessonsToolsDocstringTests(LessonsToolsBase):
                 "{0} docstring 缺少 advisory 关键词（不替代）".format(name))
 
 
+# ---------------------------------------------------------------------------
+# add-workflow-knowledge-capture（tasks 4.4）：2 个新工具 + 行为注解 docstring
+# ---------------------------------------------------------------------------
+class WorkflowKnowledgeToolRegistrationTests(LessonsToolsBase):
+    """新工具注册 + docstring 触发时机 / advisory 关键词 + 既有工具注解增补。
+
+    覆盖 tasks 4.4：capture_workflow_snapshot / save_recipe 在 bridge 可调用，
+    docstring 含触发时机关键词（沉淀 / 触发时机）与 advisory 关键词（不替代）；
+    save_lesson / search_lessons docstring 含「主动沉淀工作流」注解片段
+    （capture_workflow_snapshot）；read_lesson / knowledge_stats 零改动
+    （不含该注解）。
+    """
+
+    NEW_TOOLS = ("capture_workflow_snapshot", "save_recipe")
+    ANNOTATED_TOOLS = ("save_lesson", "search_lessons")
+    UNTOUCHED_TOOLS = ("read_lesson", "knowledge_stats")
+
+    def test_new_tools_registered_and_callable(self):
+        bridge = _get_bridge()
+        registered = set()
+        for tool in bridge.mcp._tool_manager.list_tools():
+            registered.add(tool.name)
+        for name in self.NEW_TOOLS:
+            self.assertIn(name, registered)
+            self.assertTrue(callable(getattr(bridge, name)))
+
+    def test_new_tool_docstrings_contain_trigger_and_advisory_keywords(self):
+        bridge = _get_bridge()
+        for name in self.NEW_TOOLS:
+            doc = getattr(bridge, name).__doc__ or ""
+            self.assertTrue(
+                "沉淀" in doc or "触发时机" in doc,
+                "{0} docstring 缺少触发时机关键词".format(name))
+            self.assertIn(
+                "不替代", doc,
+                "{0} docstring 缺少 advisory 关键词（不替代）".format(name))
+
+    def test_annotated_tool_docstrings_mention_capture_flow(self):
+        """save_lesson / search_lessons docstring 增补主动沉淀工作流注解。"""
+        bridge = _get_bridge()
+        for name in self.ANNOTATED_TOOLS:
+            doc = getattr(bridge, name).__doc__ or ""
+            self.assertIn(
+                "capture_workflow_snapshot", doc,
+                "{0} docstring 缺少主动沉淀工作流注解".format(name))
+
+    def test_untouched_tool_docstrings_have_no_capture_annotation(self):
+        """read_lesson / knowledge_stats 零改动：不含主动沉淀注解。"""
+        bridge = _get_bridge()
+        for name in self.UNTOUCHED_TOOLS:
+            doc = getattr(bridge, name).__doc__ or ""
+            self.assertNotIn(
+                "capture_workflow_snapshot", doc,
+                "{0} docstring 不应含主动沉淀注解（零改动）".format(name))
+
+
+# ---------------------------------------------------------------------------
+# add-workflow-knowledge-capture（tasks 4.4）：save_recipe 端到端
+# ---------------------------------------------------------------------------
+class SaveRecipeToolTests(LessonsToolsBase):
+
+    def _save(self, bridge, **overrides):
+        fields = {
+            "title": "Custom HDA usage flow",
+            "problem": "how to wire the custom hda",
+            "symptom": "recipe symptom zeta unique",
+            "fix": "connect the output to a null",
+            "category": "workflow",
+            "severity": "high",
+            "affected_versions": "H21",
+        }
+        fields.update(overrides)
+        return bridge.save_recipe(None, **fields)
+
+    def test_success_writes_personal_and_is_immediately_searchable(self):
+        bridge = _get_bridge()
+        env = self._save(bridge)
+        self.assertEqual(env["status"], "success")
+        self.assertEqual(env["recipe_id"], "BP-001")
+        self.assertEqual(env["root"], "personal")
+        self.assertEqual(env["severity"], "high")
+        self.assertEqual(env["source"], "agent")
+        self.assertTrue(env["immediately_searchable"])
+        # 落盘校验：title 渲染为块上方 `> title` 注释行（位于 ### BP-001 之前）
+        path = os.path.join(self.personal(), "recipes",
+                            "BEST_PRACTICES.md")
+        self.assertTrue(os.path.isfile(path))
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("> Custom HDA usage flow", text)
+        self.assertLess(text.index("> Custom HDA usage flow"),
+                        text.index("### BP-001"))
+        # 写入即被 search_lessons 命中（recipes 通道无 draft 门槛）
+        found = bridge.search_lessons(None, query="zeta")
+        self.assertEqual(found["status"], "success")
+        ids = [r["id"] for r in found["results"]]
+        self.assertIn("BP-001", ids)
+        hit = next(r for r in found["results"] if r["id"] == "BP-001")
+        self.assertEqual(hit["kind"], "recipe")
+        self.assertEqual(hit["source_root"], "personal")
+
+    def test_second_write_increments_to_bp_002(self):
+        bridge = _get_bridge()
+        first = self._save(bridge)
+        # 第二条带真实 title：追加到已有块的文件时 title 不落盘（strict
+        # parser 只允许首个 heading 前的 `>` 行，块间 `> title` 会被判为
+        # 前一块的非法正文），但照常校验并返回
+        second = self._save(bridge, title="Second zeta flow",
+                            symptom="second zeta flow")
+        self.assertEqual(first["recipe_id"], "BP-001")
+        self.assertEqual(second["recipe_id"], "BP-002")
+        self.assertEqual(second["status"], "success")
+        # 文件只有首块的一条 `> title`，没有第二条
+        path = os.path.join(self.personal(), "recipes",
+                            "BEST_PRACTICES.md")
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertEqual(text.count("> Second zeta flow"), 0)
+        self.assertEqual(text.count("> Custom HDA usage flow"), 1)
+        # 两条都被 search_lessons 命中（recipes 通道无 draft 门槛）
+        found = bridge.search_lessons(None, query="zeta")
+        self.assertEqual(found["status"], "success")
+        ids = [r["id"] for r in found["results"]]
+        self.assertIn("BP-001", ids)
+        self.assertIn("BP-002", ids)
+
+    def test_invalid_severity_returns_ls_write_error_with_recipes_values(self):
+        bridge = _get_bridge()
+        env = self._save(bridge, severity="critical")
+        self.assertEqual(env["status"], "error")
+        self.assertEqual(env["error"]["code"], "ls_write_error")
+        self.assertIn("severity", env["error"]["message"])
+        # 错误消息写清 recipes severity 合法取值（3 值，与 lesson 4 值不同）
+        self.assertIn("recipes", env["error"]["message"])
+        self.assertEqual(env["error"]["details"]["field"], "severity")
+        self.assertEqual(env["error"]["details"]["value"], "critical")
+        self.assertEqual(env["error"]["details"]["valid"],
+                         ["high", "low", "medium"])
+        # 零写入
+        recipes_dir = os.path.join(self.personal(), "recipes")
+        self.assertFalse(
+            os.path.isdir(recipes_dir) and os.listdir(recipes_dir))
+
+    def test_team_root_writable_true_annotates_source_with_username(self):
+        bridge = _get_bridge()
+        os.makedirs(os.path.join(self.base, "teamx"))
+        with open(os.path.join(self.base, "config.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump([{"name": "teamx", "path": "teamx",
+                        "priority": 0.5, "writable": True}], handle)
+        with mock.patch.object(_lessons.getpass, "getuser",
+                               return_value="alice"):
+            env = self._save(bridge, root="teamx")
+        self.assertEqual(env["status"], "success")
+        self.assertEqual(env["root"], "teamx")
+        self.assertEqual(env["source"], "agent@alice")
+        path = os.path.join(self.base, "teamx", "recipes",
+                            "BEST_PRACTICES.md")
+        self.assertTrue(os.path.isfile(path))
+
+    def test_team_root_writable_false_returns_root_not_writable(self):
+        bridge = _get_bridge()
+        os.makedirs(os.path.join(self.base, "teamx"))
+        with open(os.path.join(self.base, "config.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump([{"name": "teamx", "path": "teamx",
+                        "priority": 0.5, "writable": False}], handle)
+        env = self._save(bridge, root="teamx")
+        self.assertEqual(env["status"], "error")
+        self.assertEqual(env["error"]["code"], "root_not_writable")
+        # 零写入
+        recipes_dir = os.path.join(self.base, "teamx", "recipes")
+        self.assertFalse(
+            os.path.isdir(recipes_dir) and os.listdir(recipes_dir))
+
+    def test_unavailable_team_root_returns_ls_unknown_root(self):
+        bridge = _get_bridge()
+        # registry 声明但目录不存在 → state=unavailable → ls_unknown_root
+        with open(os.path.join(self.base, "config.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump([{"name": "teamx", "path": "teamx",
+                        "priority": 0.5, "writable": True}], handle)
+        env = self._save(bridge, root="teamx")
+        self.assertEqual(env["status"], "error")
+        self.assertEqual(env["error"]["code"], "ls_unknown_root")
+
+
+# ---------------------------------------------------------------------------
+# add-workflow-knowledge-capture（tasks 4.4）：capture_workflow_snapshot
+# envelope / cap 透传（mock 连接层，不真连 Houdini）
+# ---------------------------------------------------------------------------
+class CaptureWorkflowSnapshotToolTests(LessonsToolsBase):
+
+    SUCCESS_RESULT = {
+        "status": "success",
+        "root": "selection",
+        "node_count": 1,
+        "truncated": False,
+        "nodes": [],
+        "sticky_notes": [],
+        "connections": [],
+    }
+
+    def test_success_result_passed_through_verbatim(self):
+        bridge = _get_bridge()
+        with mock.patch.object(
+                bridge, "_houdini_call",
+                return_value={"status": "success",
+                              "result": self.SUCCESS_RESULT}) as call_mock:
+            env = bridge.capture_workflow_snapshot(None)
+        self.assertEqual(env, self.SUCCESS_RESULT)
+        call_mock.assert_called_once_with(
+            "capture_workflow_snapshot",
+            {"node_path": None, "include_vex": True, "max_nodes": 50})
+
+    def test_connection_error_converted_to_lessons_envelope(self):
+        bridge = _get_bridge()
+        with mock.patch.object(
+                bridge, "_houdini_call",
+                return_value={"status": "error", "message": "conn down",
+                              "origin": "connection"}):
+            env = bridge.capture_workflow_snapshot(None)
+        self.assertEqual(env["status"], "error")
+        self.assertEqual(env["error"]["code"], "capture_connection_error")
+        self.assertEqual(env["error"]["message"], "conn down")
+        self.assertEqual(env["error"]["details"]["origin"], "connection")
+
+    def test_large_payload_passes_cap_with_truncation_marker(self):
+        bridge = _get_bridge()
+        big = {
+            "status": "success",
+            "root": "selection",
+            "node_count": 3000,
+            "truncated": False,
+            "nodes": [{"path": "/obj/geo1/node{0}".format(i),
+                       "name": "node{0}".format(i), "type": "box"}
+                      for i in range(3000)],
+            "sticky_notes": [],
+            "connections": [],
+        }
+        with mock.patch.object(
+                bridge, "_houdini_call",
+                return_value={"status": "success", "result": big}):
+            env = bridge.capture_workflow_snapshot(None)
+        # 过 _lessons_capped 后仍为 dict，超大 payload 触发 _truncated 标记
+        self.assertIsInstance(env, dict)
+        self.assertEqual(env["status"], "success")
+        self.assertIn("_truncated", env)
+        self.assertIn("_original_size", env)
+
+
 if __name__ == "__main__":
     unittest.main()
