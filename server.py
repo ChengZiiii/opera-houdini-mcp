@@ -177,6 +177,68 @@ def _evaluate_render_policy_command(command, params):
     return evaluator(command, params)
 
 
+# ---------------------------------------------------------------------------
+# add-workflow-knowledge-capture: capture_workflow_snapshot 内部 helper
+# （模块级；全部兜底不抛，异常降级不 crash）
+# ---------------------------------------------------------------------------
+_SNAPSHOT_MAX_PARAMS = 40
+
+
+def _workflow_error(code, message, details=None):
+    """统一错误 envelope（与 _selection._error 同形状）。"""
+    payload = {"status": "error",
+               "error": {"code": code, "message": message}}
+    if details is not None:
+        payload["error"]["details"] = details
+    return payload
+
+
+def _snapshot_node_path(node):
+    """节点 path()，异常降级为 ""（兜底，正常场景不触发）。"""
+    try:
+        return node.path()
+    except Exception:
+        return ""
+
+
+def _snapshot_parent(node):
+    """节点 parent()，异常降级为 None。"""
+    try:
+        return node.parent()
+    except Exception:
+        return None
+
+
+def _snapshot_neighbors(node):
+    """inputs() + outputs() 合并；异常 / 缺 API 降级为 []。"""
+    neighbors = []
+    for getter in ("inputs", "outputs"):
+        try:
+            items = getattr(node, getter)() or []
+        except Exception:
+            items = []
+        for item in items:
+            if item is None:
+                continue
+            neighbors.append(item)
+    return neighbors
+
+
+def _snapshot_value_parm_types():
+    """从 hou.parmTemplateType 提取允许的数值类 parm 类型集合。
+
+    仅 Float / Int / String / Toggle；菜单与 script/callback/命令类
+    （Button / Data 等）及 Folder / Label 等结构类型全部跳过。
+    """
+    allowed = set()
+    ptype = getattr(hou, "parmTemplateType", None)
+    if ptype is not None:
+        for attr_name in ("Float", "Int", "String", "Toggle"):
+            allowed.add(getattr(ptype, attr_name, None))
+    allowed.discard(None)
+    return allowed
+
+
 class HoudiniMCPServer:
     MUTATING_COMMANDS = frozenset({
         "create_node", "modify_node", "delete_node", "set_material",
@@ -298,6 +360,11 @@ class HoudiniMCPServer:
         # READ_ONLY_COMMANDS。set_current_take / create_take 写 take 归
         # MUTATING，clear_cache / write_cache 改运行态/磁盘归 NO_UNDO。
         "list_takes", "get_current_take", "list_caches", "get_cache_status",
+        # add-workflow-knowledge-capture: capture_workflow_snapshot 是纯
+        # 规则读取（单次 HOM 遍历：comment / sticky note / VEX / 非默认
+        # 参数 / HDA 引用 / error-warning 探测），**不**修改场景，归
+        # READ_ONLY_COMMANDS（不进 undo group）。
+        "capture_workflow_snapshot",
     })
 
     NO_UNDO_COMMANDS = frozenset({
@@ -862,6 +929,12 @@ class HoudiniMCPServer:
             "get_cache_status": self.handle_get_cache_status,
             "clear_cache": self.handle_clear_cache,
             "write_cache": self.handle_write_cache,
+            # add-workflow-knowledge-capture：capture_workflow_snapshot 单
+            # handler 一次 HOM 遍历产出紧凑结构化快照（E1：非 bridge
+            # 组合调用），readOnly 归 READ_ONLY_COMMANDS（不进 undo）；
+            # 统一 error envelope + apply_response_cap。实现内联于
+            # handle_capture_workflow_snapshot，不新增模块。
+            "capture_workflow_snapshot": self.handle_capture_workflow_snapshot,
         }
 
         if getattr(getattr(hou, "session", None),
@@ -3410,6 +3483,323 @@ class HoudiniMCPServer:
         """
         return cmn.apply_response_cap(
             mats.create_material_network(hou, parent_path, name=name))
+
+    # -----------------------------------------------------------------
+    # add-workflow-knowledge-capture: capture_workflow_snapshot（readOnly）
+    # -----------------------------------------------------------------
+    # 单次 HOM 遍历把选中（或 node_path 指定的）节点子网络转换为紧凑
+    # 结构化快照：节点表（path/name/type/comment/非默认参数/vex/hda/
+    # errors/warnings）+ sticky note + 连线。纯规则读取，**不**调用
+    # LLM/外部服务，**不**修改场景、**不**进 undo group（归
+    # READ_ONLY_COMMANDS）。响应整体过 apply_response_cap。
+    def handle_capture_workflow_snapshot(self, node_path=None,
+                                         include_vex=True, max_nodes=50):
+        """add-workflow-knowledge-capture：工作流知识主动捕获快照。
+
+        定位：``node_path`` 省略 → ``hou.selectedNodes()``（空 → 结构化
+        错误 ``no_selection``，不静默回退）；给定 → ``hou.node``（不可
+        解析 → ``invalid_node_path``）。多个选中节点全部作为 BFS seeds。
+
+        闭包：以 seeds 为根沿 ``inputs()`` + ``outputs()`` 双向 BFS，
+        ``max_nodes`` 硬上限（int 化，<1 视为 1），超限截断 +
+        ``truncated: true``；输出按 path 排序稳定。
+
+        节点表每项：``path / name / type / comment / params（非默认参数，
+        ≤40 条 + params_truncated）/ vex（attribwrangle snippet）/
+        hda（definition 引用）/ errors / warnings``；API 缺失一律降级
+        并记 ``_warning``，绝不 crash。sticky note 对闭包内节点所属父
+        网络去重 ``iterStickyNotes()``。连线为 ``{from, to, input_index}``
+        平铺列表。**不**包含几何数据 / 完整参数表。
+
+        触发时机（advisory）：用户完成 HDA / 节点流 / VEX 工作流后说
+        "沉淀这些知识"时，agent 先 ``get_selection`` 定位，再调本工具取
+        快照组织为 recipe / lesson。响应过 ``apply_response_cap``。
+        """
+        warnings_list = []
+
+        # --- 定位 seeds ---
+        if node_path is None:
+            try:
+                seeds = list(hou.selectedNodes() or [])
+            except Exception as err:
+                return cmn.apply_response_cap(_workflow_error(
+                    "selection_read_failed",
+                    "读取当前选择失败: %s" % err,
+                    {"exception": err.__class__.__name__}))
+            if not seeds:
+                return cmn.apply_response_cap(_workflow_error(
+                    "no_selection",
+                    "请先在 Houdini 中选择节点，或传入 node_path 参数",
+                    {"hint": "选中节点后重试，或传 node_path=<节点路径>"}))
+            root_label = "selection"
+        else:
+            if not isinstance(node_path, str) or not node_path.strip():
+                return cmn.apply_response_cap(_workflow_error(
+                    "invalid_node_path",
+                    "node_path 必须是有效节点路径字符串",
+                    {"field": "node_path", "value": node_path}))
+            try:
+                seed = hou.node(node_path)
+            except Exception as err:
+                return cmn.apply_response_cap(_workflow_error(
+                    "invalid_node_path",
+                    "节点解析失败: %s" % err,
+                    {"field": "node_path", "value": node_path,
+                     "exception": err.__class__.__name__}))
+            if seed is None:
+                return cmn.apply_response_cap(_workflow_error(
+                    "invalid_node_path",
+                    "节点不存在: %s" % node_path,
+                    {"field": "node_path", "value": node_path}))
+            seeds = [seed]
+            root_label = node_path
+
+        # --- max_nodes 硬上限（int 化，<1 视为 1）---
+        try:
+            limit = int(max_nodes)
+        except (TypeError, ValueError):
+            limit = 50
+        if limit < 1:
+            limit = 1
+
+        # --- BFS 闭包遍历（inputs + outputs 双向，path 去重）---
+        queue = []
+        discovered = set()
+        for seed in seeds:
+            seed_path = _snapshot_node_path(seed)
+            if seed_path not in discovered:
+                discovered.add(seed_path)
+                queue.append(seed)
+
+        visited = {}
+        truncated = False
+        while queue:
+            node = queue.pop(0)
+            key = _snapshot_node_path(node)
+            if key in visited:
+                continue
+            visited[key] = node
+            # 先展开邻居完成可达性发现；预算用尽后发现的节点不再入队
+            # 访问（被截断的节点不展开），但计入 truncated。
+            for neighbor in _snapshot_neighbors(node):
+                neighbor_path = _snapshot_node_path(neighbor)
+                if neighbor_path not in discovered:
+                    discovered.add(neighbor_path)
+                    if len(visited) < limit:
+                        queue.append(neighbor)
+            if len(visited) >= limit:
+                break
+        # 已发现但未收录的节点 → 超限截断
+        truncated = bool(discovered - set(visited.keys()))
+
+        # --- 节点表（按 path 排序稳定）---
+        nodes = []
+        sorted_nodes = sorted(visited.values(),
+                              key=lambda n: _snapshot_node_path(n))
+        for node in sorted_nodes:
+            nodes.append(self._snapshot_node_entry(
+                node, include_vex, warnings_list))
+
+        # --- sticky note（父网络去重）---
+        sticky_notes = []
+        seen_parents = set()
+        for node in visited.values():
+            parent = _snapshot_parent(node)
+            if parent is None:
+                continue
+            parent_path = _snapshot_node_path(parent)
+            if parent_path in seen_parents:
+                continue
+            seen_parents.add(parent_path)
+            try:
+                notes = list(parent.iterStickyNotes() or [])
+            except AttributeError as err:
+                warnings_list.append(
+                    "iterStickyNotes 不可用，跳过 %s 的 sticky note: %s"
+                    % (parent_path, err))
+                notes = []
+            except Exception as err:
+                warnings_list.append(
+                    "iterStickyNotes 读取失败，跳过 %s 的 sticky note: %s"
+                    % (parent_path, err))
+                notes = []
+            for note in notes:
+                try:
+                    text = note.text()
+                    position = list(note.position())
+                except Exception:
+                    continue
+                sticky_notes.append({
+                    "parent": parent_path,
+                    "text": text,
+                    "position": position,
+                })
+        sticky_notes.sort(key=lambda item: (item["parent"], item["text"]))
+
+        # --- 连线（每节点每个已连接 input）---
+        connections = []
+        for node in sorted_nodes:
+            try:
+                node_inputs = node.inputs() or []
+            except Exception:
+                node_inputs = []
+            for index, src in enumerate(node_inputs):
+                if src is None:
+                    continue
+                connections.append({
+                    "from": _snapshot_node_path(src),
+                    "to": _snapshot_node_path(node),
+                    "input_index": index,
+                })
+
+        result = {
+            "status": "success",
+            "root": root_label,
+            "node_count": len(nodes),
+            "truncated": truncated,
+            "nodes": nodes,
+            "sticky_notes": sticky_notes,
+            "connections": connections,
+        }
+        if warnings_list:
+            result["_warning"] = warnings_list
+        return cmn.apply_response_cap(result)
+
+    def _snapshot_node_entry(self, node, include_vex, warnings_list):
+        """构造单个节点快照条目；所有 API 缺失/异常均降级，不抛。"""
+        path = _snapshot_node_path(node)
+        try:
+            name = node.name()
+        except Exception:
+            name = ""
+        type_name = "unknown"
+        try:
+            type_name = node.type().name()
+        except Exception:
+            pass
+
+        # comment：API 缺失/异常 → None + _warning
+        comment = None
+        try:
+            comment = node.comment()
+        except Exception as err:
+            warnings_list.append(
+                "comment 读取失败: %s (%s: %s)"
+                % (path, err.__class__.__name__, err))
+
+        # 非默认参数：遍历 parmTemplates，仅收录非默认；菜单/命令类
+        # 类型跳过；值过 _json_safe_hou_value；每节点最多 40 条。
+        params = {}
+        params_truncated = False
+        templates = []
+        try:
+            templates = node.parmTemplates() or []
+        except Exception:
+            templates = []
+        for template in templates:
+            try:
+                tname = template.name()
+            except Exception:
+                continue
+            try:
+                ttype = template.type()
+            except Exception:
+                continue
+            if ttype not in _snapshot_value_parm_types():
+                continue
+            try:
+                default = template.defaultValue()
+            except Exception:
+                default = None
+            parm = None
+            try:
+                parm = node.parm(tname)
+            except Exception:
+                parm = None
+            if parm is not None:
+                try:
+                    value = parm.eval()
+                except Exception:
+                    continue
+            else:
+                try:
+                    value = node.evalParm(tname)
+                except Exception:
+                    continue
+            try:
+                if value == default:
+                    continue
+            except Exception:
+                pass
+            if len(params) >= _SNAPSHOT_MAX_PARAMS:
+                params_truncated = True
+                break
+            try:
+                safe_value = cmn._json_safe_hou_value(hou, value,
+                                                      max_depth=2)
+            except Exception:
+                safe_value = str(value)
+            params[tname] = safe_value
+
+        # vex：仅 attribwrangle + include_vex=True；异常 → None + _warning
+        vex = None
+        if include_vex and type_name == "attribwrangle":
+            try:
+                snippet_parm = node.parm("snippet")
+                if snippet_parm is not None:
+                    vex = snippet_parm.eval()
+            except Exception as err:
+                warnings_list.append(
+                    "VEX snippet 读取失败: %s (%s: %s)"
+                    % (path, err.__class__.__name__, err))
+
+        # hda：type().definition() 非 None → 完整 type 名 + 库路径
+        hda = None
+        try:
+            definition = node.type().definition()
+            if definition is not None:
+                type_name_full = type_name
+                try:
+                    type_name_full = node.type().nameWithCategory()
+                except Exception:
+                    pass
+                try:
+                    library_path = definition.libraryFilePath()
+                except Exception:
+                    library_path = ""
+                hda = {"type_name": type_name_full,
+                       "library_path": library_path}
+        except Exception:
+            hda = None
+
+        # errors / warnings：异常降级 []
+        errors = []
+        warnings = []
+        try:
+            errors = [str(e) for e in (node.errors() or [])
+                      if str(e).strip()]
+        except Exception:
+            errors = []
+        try:
+            warnings = [str(w) for w in (node.warnings() or [])
+                        if str(w).strip()]
+        except Exception:
+            warnings = []
+
+        entry = {
+            "path": path,
+            "name": name,
+            "type": type_name,
+            "comment": comment,
+            "params": params,
+            "vex": vex,
+            "hda": hda,
+            "errors": errors,
+            "warnings": warnings,
+        }
+        if params_truncated:
+            entry["params_truncated"] = True
+        return entry
 
     # -----------------------------------------------------------------
     # add-viewport-control-tools: 8 个 viewport 控制 handler

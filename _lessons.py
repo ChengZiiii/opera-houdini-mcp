@@ -35,12 +35,16 @@ BM25 检索与 bridge 工具注册由后续 agent 基于本模块的公开 API �
   两者均不影响 personal。非法 root 逐项报错并跳过。
 - writability 门禁：registry 声明 ``writable=false`` 的 root 上
   ``save_lesson`` 返回结构化错误 ``root_not_writable``，零写入。
+- recipes（``recipes/BEST_PRACTICES.md``）：``save_recipe`` 以 ``### BP-NNN``
+  块追加写用法/流程知识（id 自增、9 字段校验、advisory 固定 true、source 系统
+  标注），写入即被检索（无 draft 门槛）；团队 root 写入附 ``@<用户名>`` 归属。
 - 路径推导：base dir = ``~/.opera-houdini-mcp``（expanduser("~")；Windows
   上 expanduser 返回 "~" 时兜底 USERPROFILE）；可用 ``HOUDINI_MCP_HOME``
   环境变量覆盖（测试钩子）。绝不使用 ``_repo_root()`` 或硬编码用户名。
 - 测试钩子：``_base_dir()`` 可被 monkeypatch，所有路径 helper 都从它派生。
 """
 
+import getpass
 import hashlib
 import json
 import os
@@ -55,6 +59,14 @@ except ImportError:
         import _common as cmn  # noqa: F401
     except ImportError:
         cmn = None
+
+try:
+    from . import _best_practices
+except ImportError:
+    try:
+        import _best_practices
+    except ImportError:
+        _best_practices = None
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +89,34 @@ EVENT_MAX_MESSAGE = 4096       # 单条事件消息上限（字符），超过�
 SEVERITIES = ("low", "medium", "high", "critical")
 STATUSES = ("draft", "published")
 BODY_FIELDS = ("problem", "symptom", "fix")
+
+# recipes（BEST_PRACTICES）常量：schema 与 _best_practices.py 同构（注意
+# severity 枚举与 lesson 不同，recipes 只有 3 值）
+RECIPES_DIRNAME = "recipes"
+RECIPES_FILENAME = "BEST_PRACTICES.md"
+RECIPE_FIELDS = (
+    "category", "severity", "affected_versions", "verified_versions",
+    "source", "advisory", "problem", "symptom", "fix",
+)
+RECIPE_SEVERITIES = ("low", "medium", "high")
+RECIPE_FIELD_KEYS = frozenset(("title",) + RECIPE_FIELDS)  # title 可选
+# 新文件 header（recipe 外只允许 blank / # / > 行，parser 安全）
+RECIPES_HEADER = (
+    "# BEST PRACTICES\n"
+    "\n"
+    "> 本文件由 save_recipe 自动追加维护：每块以 ### BP-NNN 为 heading"
+    "（id 由系统自增，\n"
+    "> 不接受用户自定义），块内为 9 个必填字段（category / severity /"
+    " affected_versions /\n"
+    "> verified_versions / source / advisory / problem / symptom / fix），"
+    "advisory 恒为 true，\n"
+    "> source 由系统按 root 归属标注。人工编辑请保持该结构，否则本 root 的"
+    "recipes 将无法解析。\n"
+)
+
+# 正文行禁止以这些前缀起始（否则会被误读为 field / heading / blockquote）
+_RECIPE_BAD_LINE_PREFIXES = ("- ", "#", ">", "###")
+_RECIPE_HEADING_RE = re.compile(r"^###\s+BP-(\d{3})\s*$", re.MULTILINE)
 
 # front matter 必填（9 个内容字段中的 6 个 + 6 个元数据）
 REQUIRED_FRONTMATTER = (
@@ -170,6 +210,12 @@ def inbox_path(root_path):
     """root_path 下的 inbox 事件文件（inbox/events.jsonl）。"""
     return os.path.join(_normalize_root_path(root_path),
                         INBOX_DIRNAME, INBOX_FILENAME)
+
+
+def recipes_path(root_path):
+    """root_path 下的 recipes 文件（recipes/BEST_PRACTICES.md）。"""
+    return os.path.join(_normalize_root_path(root_path),
+                        RECIPES_DIRNAME, RECIPES_FILENAME)
 
 
 def cache_index_dir(root_name):
@@ -776,6 +822,9 @@ def save_lesson(root_path, fields):
     _check_root_writable(root_path)
 
     lesson = _validate_save_fields(fields, root_name)
+    agent = _agent_source(root_path)
+    if agent is not None:
+        lesson["source"] = lesson["source"] + "@" + agent
     fingerprint = lesson.get("fingerprint")
     if fingerprint is None:
         fingerprint = make_fingerprint(lesson["symptom"])
@@ -819,6 +868,215 @@ def save_lesson(root_path, fields):
                              lesson["id"] + ".md")
     _atomic_write_text(file_path, rendered)
     return lesson
+
+
+# ---------------------------------------------------------------------------
+# 1.6 recipes（save_recipe / _agent_source）
+# ---------------------------------------------------------------------------
+def _agent_source(root_path):
+    """非 personal root 的动态归属用户名（团队库审计用）。
+
+    root_path 等于个人库（``knowledge_dir()``）→ 返回 None，调用方保持
+    source 原样；团队 root → 返回用户名（不含 '@' 前缀）：
+    ``getpass.getuser()`` 动态获取，失败回退 ``USERNAME`` env，再失败
+    ``"unknown-user"``。任何路径绝不抛异常。
+    """
+    target = os.path.abspath(os.path.normpath(root_path))
+    if target == os.path.abspath(os.path.normpath(knowledge_dir())):
+        return None
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = os.environ.get("USERNAME")
+    if not user:
+        user = "unknown-user"
+    return user
+
+
+def _next_recipe_id(text):
+    """扫描既有 recipes 文本的全部 ``### BP-NNN`` 块，返回最大序号 + 1 的 id。
+
+    撞号 while 重试防手工编辑造成的重复 heading；候选序号超 999 抛
+    ``LessonsError('ls_write_error')``（与检索端 ``\\d{3}`` 正则保持兼容，
+    不许突破 3 位）。MUST NOT 接受用户自定义 id。
+    """
+    taken = set()
+    for match in _RECIPE_HEADING_RE.finditer(text):
+        taken.add(int(match.group(1)))
+    candidate = (max(taken) + 1) if taken else 1
+    while candidate in taken:
+        candidate += 1
+    if candidate > 999:
+        raise LessonsError(
+            "ls_write_error",
+            "recipes 序号已达上限 BP-999，无法自动生成新 id",
+            {"max": 999})
+    return "BP-{0:03d}".format(candidate)
+
+
+def _validate_recipe_fields(fields, root_name):
+    """校验 save_recipe 的 fields，返回带 root 名的 recipe 骨架。
+
+    category / affected_versions / problem / symptom / fix 必填非空字符串；
+    verified_versions 缺省 "unknown"；severity 必须是 ``RECIPE_SEVERITIES``
+    （注意 recipes 与 lesson 的 severity 枚举不同，只有 3 值）；advisory 必须
+    为 True（固定 advisory 语义）；source 不接受用户传入（由 ``_agent_source``
+    系统标注）；正文（problem/symptom/fix）必须单行且不以 ``- `` / ``#`` /
+    ``>`` / ``###`` 起始（否则写出的文件无法被 ``parse_best_practices``
+    round-trip）。title 可选（非空 + 单行）。非法抛 ``LessonsError
+    ('ls_write_error')``。
+    """
+    if not isinstance(fields, dict):
+        raise LessonsError(
+            "ls_write_error", "fields 必须是 dict",
+            {"type": type(fields).__name__})
+    unknown = set(fields) - RECIPE_FIELD_KEYS
+    if unknown:
+        raise LessonsError(
+            "ls_write_error",
+            "fields 含未知键: {0}".format(sorted(unknown)),
+            {"unknown": sorted(unknown)})
+
+    recipe = {"root": root_name}
+
+    title = fields.get("title")
+    if title is not None:
+        if not isinstance(title, str) or not title.strip():
+            raise LessonsError(
+                "ls_write_error", "title 不得为空", {"field": "title"})
+        if "\n" in title:
+            raise LessonsError(
+                "ls_write_error", "title 必须单行", {"field": "title"})
+        recipe["title"] = title.strip()
+
+    for key in ("category", "affected_versions", "problem", "symptom", "fix"):
+        value = fields.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise LessonsError(
+                "ls_write_error", "{0} 不得为空".format(key),
+                {"field": key})
+        recipe[key] = value.strip()
+
+    verified = fields.get("verified_versions")
+    if verified is None:
+        recipe["verified_versions"] = "unknown"
+    else:
+        if not isinstance(verified, str) or not verified.strip():
+            raise LessonsError(
+                "ls_write_error", "verified_versions 不得为空",
+                {"field": "verified_versions"})
+        recipe["verified_versions"] = verified.strip()
+
+    severity = fields.get("severity")
+    if severity not in RECIPE_SEVERITIES:
+        raise LessonsError(
+            "ls_write_error",
+            "非法 severity {0!r}（合法: {1}）".format(severity,
+                                                  sorted(RECIPE_SEVERITIES)),
+            {"field": "severity", "value": severity})
+    recipe["severity"] = severity
+
+    # advisory 固定 true（工具不暴露该参数）：省略视为 true，显式非 True 拒绝
+    advisory = fields.get("advisory", True)
+    if advisory is not True:
+        raise LessonsError(
+            "ls_write_error",
+            "advisory 必须为 true（recipes 固定 advisory 语义）",
+            {"field": "advisory", "value": advisory})
+    recipe["advisory"] = True
+
+    # source 不接受用户传入：由 save_recipe 按 root 归属用 _agent_source 标注。
+
+    # 所有落盘字段值必须单行（strict parser 的 field 值是单行的）
+    for key in recipe:
+        value = recipe[key]
+        if isinstance(value, str) and "\n" in value:
+            raise LessonsError(
+                "ls_write_error",
+                "{0} 必须单行（recipes 字段值为单行）".format(key),
+                {"field": key})
+
+    # 正文行前缀安全（否则写出的文件无法 round-trip）
+    for key in BODY_FIELDS:
+        if recipe[key].strip().startswith(_RECIPE_BAD_LINE_PREFIXES):
+            raise LessonsError(
+                "ls_write_error",
+                "{0} 正文以非法前缀起始，格式不安全".format(key),
+                {"field": key})
+    return recipe
+
+
+def _render_recipe_block(recipe):
+    """渲染单个 recipe 块（可选 ``> title`` 行在块上方，块体 9 个 - key: value）。"""
+    lines = []
+    if recipe.get("title"):
+        lines.append("> " + recipe["title"])
+        lines.append("")
+    lines.append("### " + recipe["id"])
+    for key in RECIPE_FIELDS:
+        value = recipe[key]
+        if key == "advisory":
+            value = "true"
+        lines.append("- {0}: {1}".format(key, value))
+    return "\n".join(lines) + "\n"
+
+
+def save_recipe(root_path, fields):
+    """把一条用法/流程知识以 ``### BP-NNN`` 块追加写入 root 的 recipes 文件。
+
+    写入即被 ``search_lessons`` 检索（recipes 通道无 draft 门槛）。id 自动
+    生成（扫描既有块最大序号 + 1，撞号重试），MUST NOT 接受用户自定义 id。
+    source 由系统标注：个人库 ``"agent"``，团队 root ``"agent@<用户名>"``；
+    advisory 固定 true；verified_versions 缺省 ``"unknown"``。文件缺失/为空
+    → 写 header 再追加；写前全文过 ``_best_practices.parse_best_practices``
+    自校验保证 round-trip；``_atomic_write_text`` 原子写，失败保留旧文件。
+    registry 声明 writable=false / state!=ok → ``root_not_writable``（零写入）。
+    成功返回完整 recipe dict（{id, root, category, severity,
+    affected_versions, verified_versions, source, advisory, problem, symptom,
+    fix}）。
+    """
+    root_path = _normalize_root_path(root_path)
+    root_name = _root_name_for_path(root_path)
+    _check_root_writable(root_path)
+
+    recipe = _validate_recipe_fields(fields, root_name)
+    agent = _agent_source(root_path)
+    recipe["source"] = "agent" if agent is None else "agent@" + agent
+
+    path = recipes_path(root_path)
+    existing = ""
+    if os.path.isfile(path):
+        existing = _read_text(path)
+
+    recipe["id"] = _next_recipe_id(existing)
+    block_text = _render_recipe_block(recipe)
+    if existing.strip():
+        full_text = existing.rstrip("\n") + "\n\n" + block_text
+    else:
+        full_text = RECIPES_HEADER + "\n" + block_text
+
+    if _best_practices is not None:
+        try:
+            _best_practices.parse_best_practices(full_text)
+        except _best_practices.BestPracticesError as exc:
+            raise LessonsError(
+                "ls_write_error",
+                "生成的 recipe 无法自校验: {0}".format(exc.message), exc.details)
+
+    _atomic_write_text(path, full_text)
+    return {
+        "id": recipe["id"],
+        "root": recipe["root"],
+        "category": recipe["category"],
+        "severity": recipe["severity"],
+        "affected_versions": recipe["affected_versions"],
+        "verified_versions": recipe["verified_versions"],
+        "source": recipe["source"],
+        "advisory": True,
+        "problem": recipe["problem"],
+        "symptom": recipe["symptom"],
+        "fix": recipe["fix"],
+    }
 
 
 # ---------------------------------------------------------------------------
