@@ -38,7 +38,8 @@ BM25 检索与 bridge 工具注册由后续 agent 基于本模块的公开 API �
 - recipes（``recipes/BEST_PRACTICES.md``）：``save_recipe`` 以 ``### BP-NNN``
   块追加写用法/流程知识（id 自增、9 字段校验、advisory 固定 true、source 系统
   标注），写入即被检索（无 draft 门槛）；团队 root 写入附 ``@<用户名>`` 归属。
-  title 可选，仅用于校验、首块 ``> title`` 注释行渲染与响应汇报；追加写入因
+  title 可选，仅用于校验、首块 ``> title`` 注释行渲染（title 仅供调用方
+  自行使用/汇报）；追加写入因
   strict parser 限制（块间仅允许 ``- field`` 行与空行）不落盘；9 字段 schema
   无 title 字段。
 - 路径推导：base dir = ``~/.opera-houdini-mcp``（expanduser("~")；Windows
@@ -1037,7 +1038,8 @@ def save_recipe(root_path, fields):
     生成（扫描既有块最大序号 + 1，撞号重试），MUST NOT 接受用户自定义 id。
     source 由系统标注：个人库 ``"agent"``，团队 root ``"agent@<用户名>"``；
     advisory 固定 true；verified_versions 缺省 ``"unknown"``。title 可选：
-    仅用于校验、首块 ``> title`` 注释行渲染与响应汇报；追加到已有块的文件
+    仅用于校验、首块 ``> title`` 注释行渲染（title 仅供调用方自行使用/
+    汇报）；追加到已有块的文件
     时 title 不落盘（strict parser 只允许首个 heading 前的 ``>`` 行，块间
     仅允许 ``- field`` 行与空行；9 字段 schema 无 title 字段）。文件缺失/为
     空 → 写 header 再追加；写前全文过 ``_best_practices.parse_best_practices``

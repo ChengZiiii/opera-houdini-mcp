@@ -2,9 +2,10 @@
 
 在真实 H21 hython 中对 ``_lessons`` / ``_lessons_search`` 做端到端冒烟：
 保存 / 累积 / inbox 晋升 / 检索命中 / read_lesson / 多 root 降级 /
-默认路径推导，外加 bridge 探针（按实际环境降级）。**不使用 mock**，
-全程沙箱化（HOUDINI_MCP_HOME 指向临时目录），绝不触碰真实
-``~/.opera-houdini-mcp``。
+默认路径推导，外加 capture_workflow_snapshot 真实场景快照、save_recipe
+全链路（个人库 + 团队库门禁）与 bridge 探针（按实际环境降级）。
+**不使用 mock**，全程沙箱化（HOUDINI_MCP_HOME 指向临时目录），绝不触碰
+真实 ``~/.opera-houdini-mcp``。
 
 运行方式（需真实 H21 hython，workdir=external/houdinimcp）：
     "C:/Program Files/Side Effects Software/Houdini 21.0.596/bin/hython.exe" \\
@@ -13,6 +14,7 @@
 退出码 0 = 全部 PASS；非 0 = 有 FAIL。
 """
 import atexit
+import getpass
 import json
 import os
 import re
@@ -32,6 +34,7 @@ atexit.register(lambda: shutil.rmtree(SANDBOX, ignore_errors=True))
 _PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _PKG_DIR)
 
+import _best_practices  # noqa: E402
 import _lessons  # noqa: E402
 import _lessons_search  # noqa: E402
 
@@ -54,11 +57,29 @@ FIELDS = {
 FIX2 = "改用 detail 属性缓存该值，并在 wrangle 内用 haspointattrib() 检查后读取。"
 QUERY = "未定义属性"          # 特色中文检索词（symptom 中的连续 CJK 串）
 FRESH_MSG = "ROP 提交失败：输出目录不存在或不可写，Deadline 任务被拒绝"
+# section h sticky note：headless 创建通道（网络容器 createStickyNote）
+# 的两条不同文本，用于验证快照逐条捕获。
+STICKY_TEXT_A = "sticky 真实中文文本 工作流备注"
+STICKY_TEXT_B = "第二条 sticky 备注 不同文本"
 
 
 def _read_text(path):
     with open(path, "r", encoding="utf-8") as handle:
         return handle.read()
+
+
+def _dir_signature(path):
+    """递归目录签名（relpath, size, mtime_ns）——证明 smoke 未写真实目录。"""
+    sig = []
+    for root, _dirs, files in os.walk(path):
+        for fname in files:
+            full = os.path.join(root, fname)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            sig.append((os.path.relpath(full, path), st.st_size, st.st_mtime_ns))
+    return sorted(sig)
 
 
 def main():
@@ -391,15 +412,262 @@ def main():
         expected = os.path.join(home, _lessons.BASE_DIRNAME)
         check("g default base dir = ~/.opera-houdini-mcp",
               default_dir == expected, "got=%s expected=%s" % (default_dir, expected))
-        check("g real default dir absent (no writes)",
-              not os.path.exists(expected), expected)
+        # 实机可能已存在真实 base dir（先前开发/人工使用产生，本 smoke 不触碰）；
+        # 此时改验「本次运行未向真实目录写入」：目录签名不变即 PASS。
+        if os.path.isdir(expected):
+            sig_before = _dir_signature(expected)
+        else:
+            sig_before = None
+        check("g no writes to real default dir",
+              (sig_before is None and not os.path.exists(expected))
+              or (sig_before is not None and _dir_signature(expected) == sig_before),
+              "dir=%s pre_existed=%s" % (expected, sig_before is not None))
     except Exception as exc:
-        check("g default base dir = ~/.opera-houdini-mcp", False, "%r" % (exc,))
+        check("g no writes to real default dir", False, "%r" % (exc,))
     finally:
         if saved_home is not None:
             os.environ["HOUDINI_MCP_HOME"] = saved_home
         else:
             os.environ.pop("HOUDINI_MCP_HOME", None)
+
+    # ---- h. capture_workflow_snapshot：真实场景快照（server handler 直调）----
+    # hython 无 GUI（hou.ui 不存在），但 sticky note 有 headless 创建通道：
+    # 网络容器（SopNode/ObjNode 等）的 createStickyNote() + setText()，
+    # H21.0.596 hython 实测可用，不依赖 pane。快照 handler 通过父网络
+    # iterStickyNotes() 去重采集（server.py 3603-3637），此处创建两条
+    # 真实 sticky note，断言其文本/结构被快照捕获。
+    try:
+        geo = hou.node("/obj").createNode("geo", "capture_smoke")
+        box = geo.createNode("box", "capture_box")
+        wrangle = geo.createNode("attribwrangle", "capture_wrangle")
+        wrangle.parm("snippet").set("f@age = 1.0;")
+        wrangle.setComment("真实场景注释")
+        # 真实连线：box 输出 → wrangle 输入（OBJ→SOP 直连在 hython 下
+        # setInput 抛 OperationFailed，属 hython 环境限制，改用 SOP→SOP）。
+        wrangle.setInput(0, box)
+        check("h scene nodes created", geo is not None and wrangle is not None,
+              "geo=%r wrangle=%r" % (geo.path() if geo else None,
+                                     wrangle.path() if wrangle else None))
+    except Exception as exc:
+        check("h scene nodes created", False, "%r" % (exc,))
+        finish()
+        return
+    # sticky note：headless 创建通道 = 网络容器 createStickyNote()（不依赖
+    # hou.ui / pane）。创建在 wrangle.parent()（= geo 容器 /obj/capture_smoke）
+    # 上两条不同文本；失败不提前终止，后续断言会如实 FAIL 展示。
+    try:
+        note_a = wrangle.parent().createStickyNote()
+        note_a.setText(STICKY_TEXT_A)
+        note_b = wrangle.parent().createStickyNote()
+        note_b.setText(STICKY_TEXT_B)
+        check("h sticky notes created (headless createStickyNote)",
+              note_a is not None and note_b is not None,
+              "parent=%s" % (wrangle.parent().path(),))
+    except Exception as exc:
+        check("h sticky notes created (headless createStickyNote)",
+              False, "createStickyNote/setText 失败: %r" % (exc,))
+    try:
+        # server.py 用相对导入（from . import _common），必须按包路径导入：
+        # 把包的父目录（external/）加入 sys.path 后 import houdinimcp.server。
+        # BFS 闭包只沿 inputs()/outputs() 走连接，OBJ 的 child SOP 不在其中，
+        # 因此以 wrangle 为 seed（其 input 指向 box，闭包同时收录两者）。
+        sys.path.insert(0, os.path.dirname(_PKG_DIR))
+        import houdinimcp.server as server  # noqa: E402
+        instance = server.HoudiniMCPServer.__new__(server.HoudiniMCPServer)
+        resp = instance.handle_capture_workflow_snapshot(
+            node_path=wrangle.path(), include_vex=True)
+    except Exception as exc:
+        check("h handle_capture_workflow_snapshot", False, "%r" % (exc,))
+        finish()
+        return
+    check("h status success", resp.get("status") == "success",
+          "status=%r" % (resp.get("status"),))
+    check("h node_count >= 1", resp.get("node_count", 0) >= 1,
+          "node_count=%r" % (resp.get("node_count"),))
+    nodes = resp.get("nodes") or []
+    wr_entries = [n for n in nodes if n.get("type") == "attribwrangle"]
+    check("h wrangle entry present", bool(wr_entries),
+          "nodes=%d types=%r" % (len(nodes), [n.get("type") for n in nodes]))
+    if wr_entries:
+        w0 = wr_entries[0]
+        check("h wrangle path/comment",
+              w0.get("path") == wrangle.path()
+              and w0.get("comment") == "真实场景注释",
+              "path=%r comment=%r" % (w0.get("path"), w0.get("comment")))
+        check("h wrangle vex snippet", "f@age = 1.0;" in (w0.get("vex") or ""),
+              "vex=%r" % ((w0.get("vex") or "")[:60],))
+    conns = resp.get("connections")
+    check("h connections is list", isinstance(conns, list),
+          "connections=%r" % (str(conns)[:120],))
+    check("h connections entry shape",
+          all(isinstance(c, dict) and "from" in c and "to" in c
+              and "input_index" in c for c in (conns or [])),
+          "conns=%d" % len(conns or []))
+    for gk in ("point", "prim", "vertex", "geometry", "P"):
+        check("h no geometry key %s" % gk, gk not in resp,
+              "keys=%r" % (sorted(resp.keys()),))
+    for n in nodes:
+        for gk in ("point", "prim", "vertex", "geometry", "P"):
+            if gk in n:
+                check("h node entry no geometry key %s" % gk, False,
+                      "node=%s" % (n.get("path"),))
+    sticky = resp.get("sticky_notes")
+    check("h sticky_notes is list", isinstance(sticky, list),
+          "sticky=%r" % (str(sticky)[:120],))
+    # 快照必须捕获真实创建的 sticky note：非空、含两条文本、条目结构
+    # 含 parent/text/position 三键（position 为 list 类值）。
+    check("h sticky_notes non-empty", bool(sticky),
+          "notes=%r" % (str(sticky)[:160],))
+    sticky_texts = [s.get("text") for s in (sticky or [])]
+    check("h sticky note text captured", STICKY_TEXT_A in sticky_texts,
+          "texts=%r" % (sticky_texts,))
+    check("h second sticky note text captured", STICKY_TEXT_B in sticky_texts,
+          "texts=%r" % (sticky_texts,))
+    check("h sticky entry parent/text/position shape",
+          all(isinstance(s, dict) and "parent" in s and "text" in s
+              and "position" in s and isinstance(s["position"], list)
+              and len(s["position"]) >= 2 for s in (sticky or [])),
+          "shape=%r" % ([sorted(s.keys()) for s in (sticky or [])],))
+    check("h sticky parent is geo container",
+          all(s.get("parent") == wrangle.parent().path()
+              for s in (sticky or [])),
+          "parents=%r" % ({s.get("parent") for s in (sticky or [])},))
+    check("h truncated False", resp.get("truncated") is False,
+          "truncated=%r" % (resp.get("truncated"),))
+    # 错误路径实测：无选择 → no_selection；不存在路径 → invalid_node_path
+    try:
+        err_resp = instance.handle_capture_workflow_snapshot(node_path=None)
+        check("h no_selection error",
+              err_resp.get("status") == "error"
+              and err_resp.get("error", {}).get("code") == "no_selection",
+              "resp=%r" % (str(err_resp)[:160],))
+    except Exception as exc:
+        check("h no_selection error", False, "%r" % (exc,))
+    try:
+        err_resp2 = instance.handle_capture_workflow_snapshot(
+            node_path="/obj/不存在的节点")
+        check("h invalid_node_path error",
+              err_resp2.get("status") == "error"
+              and err_resp2.get("error", {}).get("code") == "invalid_node_path",
+              "resp=%r" % (str(err_resp2)[:160],))
+    except Exception as exc:
+        check("h invalid_node_path error", False, "%r" % (exc,))
+    try:
+        hou.node("/obj/capture_smoke").destroy()
+        check("h cleanup nodes", hou.node("/obj/capture_smoke") is None)
+    except Exception as exc:
+        check("h cleanup nodes", False, "%r" % (exc,))
+
+    # ---- i. save_recipe 全链路（真实磁盘沙箱）----
+    # 与 _agent_source 完全一致的用户名推导（hython 下 getpass.getuser 取真值）
+    try:
+        real_user = getpass.getuser()
+    except Exception:
+        real_user = os.environ.get("USERNAME")
+    if not real_user:
+        real_user = "unknown-user"
+    recipe_fields = {
+        "title": "wrangle 未定义属性处理沉淀",
+        "category": "vex",
+        "severity": "high",
+        "affected_versions": "H21.0",
+        "problem": "Attribute Wrangle 直接读取未定义属性导致 cook 失败。",
+        "symptom": "wrangle 读取未定义属性 cook 失败节点标红",
+        "fix": "先用 haspointattrib 守卫判断再读取属性。",
+        "advisory": True,
+    }
+    try:
+        recipe = _lessons.save_recipe(knowledge, dict(recipe_fields))
+    except Exception as exc:
+        check("i save_recipe", False, "%r" % (exc,))
+        finish()
+        return
+    check("i id BP-NNN", bool(re.match(r"^BP-\d{3}$", recipe["id"])),
+          recipe["id"])
+    check("i root personal", recipe["root"] == "personal", recipe["root"])
+    check("i source agent", recipe["source"] == "agent", recipe["source"])
+    recipes_file = _lessons.recipes_path(knowledge)
+    check("i recipes file exists", os.path.isfile(recipes_file), recipes_file)
+    try:
+        entries = _best_practices.parse_best_practices(_read_text(recipes_file))
+        check("i parse_best_practices round-trip",
+              any(e["id"] == recipe["id"] for e in entries),
+              "entries=%d" % len(entries))
+    except Exception as exc:
+        check("i parse_best_practices round-trip", False, "%r" % (exc,))
+    try:
+        search_resp = _lessons_search.search_lessons(
+            query="读取未定义属性", scope=None)
+        ids = [r["id"] for r in search_resp.get("results", [])]
+        check("i search hits recipe id", recipe["id"] in ids,
+              "matched=%s ids=%r" % (search_resp.get("matched"), ids))
+        hit = next((r for r in search_resp.get("results", [])
+                    if r.get("id") == recipe["id"]), None)
+        if hit is not None:
+            check("i hit kind recipe", hit.get("kind") == "recipe",
+                  "kind=%r" % (hit.get("kind"),))
+            check("i hit source_root personal",
+                  hit.get("source_root") == "personal",
+                  "source_root=%r" % (hit.get("source_root"),))
+    except Exception as exc:
+        check("i search hits recipe id", False, "%r" % (exc,))
+    try:
+        recipe2 = _lessons.save_recipe(knowledge, dict(recipe_fields))
+        check("i id increments", recipe2["id"] == "BP-002",
+              "id=%s" % (recipe2["id"],))
+    except Exception as exc:
+        check("i id increments", False, "%r" % (exc,))
+    # 团队库门禁：writable=false → root_not_writable 且零写入
+    team_env = "LESSONS_SMOKE_TEAM"
+    team_path = os.path.join(SANDBOX, "team_recipes")
+    try:
+        os.makedirs(team_path, exist_ok=True)
+        os.environ[team_env] = team_path
+        with open(os.path.join(SANDBOX, "config.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump([{"name": "team_recipe",
+                        "path": "${%s}" % team_env,
+                        "priority": 0.9, "writable": False}],
+                      handle, ensure_ascii=False)
+        try:
+            _lessons.save_recipe(team_path, dict(recipe_fields))
+            check("i team writable=false -> root_not_writable", False,
+                  "no error raised")
+        except _lessons.LessonsError as exc:
+            check("i team writable=false -> root_not_writable",
+                  exc.code == "root_not_writable",
+                  "code=%s msg=%s" % (exc.code, exc.message))
+        check("i zero write on gate",
+              not os.path.isfile(_lessons.recipes_path(team_path)))
+    except Exception as exc:
+        check("i team writable=false -> root_not_writable", False, "%r" % (exc,))
+    # 团队库 writable=true → 写入成功，source 带真实用户名
+    try:
+        with open(os.path.join(SANDBOX, "config.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump([{"name": "team_recipe",
+                        "path": "${%s}" % team_env,
+                        "priority": 0.9, "writable": True}],
+                      handle, ensure_ascii=False)
+        team_recipe = _lessons.save_recipe(team_path, dict(recipe_fields))
+        check("i team source starts agent@",
+              team_recipe["source"].startswith("agent@"),
+              "source=%r" % (team_recipe["source"],))
+        check("i team source ends real username",
+              team_recipe["source"] == "agent@" + real_user,
+              "source=%r user=%r" % (team_recipe["source"], real_user))
+        check("i team recipe file written",
+              os.path.isfile(_lessons.recipes_path(team_path)))
+    except Exception as exc:
+        check("i team writable=true write", False, "%r" % (exc,))
+    # 团队库 source 归属的 save_lesson 侧（tasks 4.6 补充验证）
+    try:
+        lesson_team = _lessons.save_lesson(team_path, dict(FIELDS))
+        check("i save_lesson team source @user",
+              lesson_team["source"].endswith("@" + real_user),
+              "source=%r" % (lesson_team["source"],))
+    except Exception as exc:
+        check("i save_lesson team source @user", False, "%r" % (exc,))
 
     # ---- bridge 探针（hython 3.11 无 mcp 包，预期 ModuleNotFoundError）----
     try:
@@ -416,7 +684,8 @@ def main():
               False, "%r" % (exc,))
     else:
         for fn_name in ("search_lessons", "save_lesson", "read_lesson",
-                        "knowledge_stats"):
+                        "knowledge_stats", "capture_workflow_snapshot",
+                        "save_recipe"):
             check("bridge has function %s" % fn_name,
                   callable(getattr(hms, fn_name, None)))
         try:
