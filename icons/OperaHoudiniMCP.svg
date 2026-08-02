@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Opera Houdini MCP 图标：扁平图形化。纯色块：深色底 + 橙色 H（Houdini）+ 蓝色插头插脚（MCP 连接，插向 H 右腿） -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- 底板（纯色，无渐变） -->
+  <rect x="8" y="8" width="112" height="112" rx="24" fill="#1a1f26"/>
+
+  <!-- H 左腿 -->
+  <rect x="28" y="28" width="18" height="72" rx="5" fill="#ff7a1a"/>
+  <!-- H 右腿（插头将插入的"插座"） -->
+  <rect x="88" y="28" width="18" height="72" rx="5" fill="#ff7a1a"/>
+  <!-- 横梁（贯通左右腿，确保 H 完整可读） -->
+  <rect x="28" y="55" width="60" height="18" rx="5" fill="#ff7a1a"/>
+
+  <!-- MCP 插头：插头体骑在横梁右端 + 双插脚指向右腿 -->
+  <rect x="66" y="52" width="14" height="24" rx="3" fill="#2f9be6"/>
+  <rect x="80" y="57" width="6" height="8" rx="1" fill="#b5e6ff"/>
+  <rect x="80" y="67" width="6" height="8" rx="1" fill="#b5e6ff"/>
+</svg>
