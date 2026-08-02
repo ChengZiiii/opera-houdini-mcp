@@ -1339,7 +1339,9 @@ def capture_workflow_snapshot(ctx, node_path=None, include_vex=True,
     返回结构：{status:success, root, node_count, truncated, hip_file,
     nodes, sticky_notes, connections}，超限截断时 truncated=true；API
     降级附 _warning。节点表每项含资产级标识 type_full（nameWithCategory，
-    API 缺失降级 type）与 is_hda（definition() is not None），hda 字段
+    API 缺失降级 type）与 is_hda（**用户数字资产实例**：definition() 非 None
+    且库文件非 $HFS/houdini/otls 内建库——H21 上 attribwrangle 等 HDA 化
+    内建类型也有 definition，纯 definition 判定会误标），hda 字段
     为 {type_name, version(可选), definition_source: embedded|external}，
     **绝不输出 library_path 或任何本机路径**（跨机器复现误导源）；顶层
     hip_file 只取 basename（隐私安全）。快照只含节点表（path/name/type/

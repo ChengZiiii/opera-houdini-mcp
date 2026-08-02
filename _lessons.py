@@ -1087,7 +1087,9 @@ def _update_recipe_block(existing, recipe_id, recipe):
     lines = existing.split("\n")
     heading_idx = None
     for idx, line in enumerate(lines):
-        if line.strip() == "### " + recipe_id:
+        # 与 _existing_recipe_ids 同一正则（容忍手工编辑的多余空白）
+        match = _RECIPE_HEADING_RE.match(line)
+        if match is not None and match.group(1) == recipe_id[3:]:
             heading_idx = idx
             break
     if heading_idx is None:

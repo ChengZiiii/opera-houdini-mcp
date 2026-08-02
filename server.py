@@ -3582,8 +3582,12 @@ class HoudiniMCPServer:
         snippet）/ hda（资产级引用，见下）/ errors / warnings``；API 缺失
         一律降级并记 ``_warning``，绝不 crash。``type_full`` =
         ``type().nameWithCategory()``（如 ``Sop/box``，API 缺失降级为
-        type 短名）；``is_hda`` = ``definition() is not None``（H21 无
-        isDigitalAsset API）。``hda`` 字段含 ``type_name``（资产全名）/
+        type 短名）；``is_hda`` = **用户数字资产实例**判定（``definition()``
+        非 None 且库文件非 ``$HFS/houdini/otls`` 内建库——H21 上
+        attribwrangle 等 HDA 化内建类型也有 definition，纯 definition
+        判定会误标；embedded .hip/.hipnc 或外部 .hda/.otl 为用户资产，见
+        ``_snapshot_user_asset_definition``）。``hda`` 字段含
+        ``type_name``（资产全名）/
         ``version``（``definition().version()``，空串省略）/
         ``definition_source``（``embedded``/``external``，内部用
         libraryFilePath 后缀判定 .hip/.hipnc）——**绝不输出 library_path
