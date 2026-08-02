@@ -14,9 +14,12 @@
   hda 字段 = {type_name, version(空串省略), definition_source
   (embedded/external)}，**绝不输出 library_path 或本机路径**；顶层
   hip_file = basename（隐私安全，异常降级空串）。
-- HDA 内部研究：include_hda_internals=True → children() 并入 BFS（嵌套
-  HDA 递归，内部 wrangle VEX 可见）；默认 False 不展开；同一 max_nodes
-  预算与 truncated 语义。
+- HDA 内部研究：include_hda_internals=True → **可编辑内容**的 HDA
+  （definition 非 None 且 isEditable() True，对应 Allow Editing of
+  Contents / Editable Nodes）children() 并入 BFS（嵌套可编辑 HDA 递归，
+  内部 wrangle VEX 可见）；官方锁定节点（OPlib，isEditable False）与
+  锁定用户 HDA 默认**不拆解**；官方节点若可编辑同样展开；默认 False 不
+  展开；同一 max_nodes 预算与 truncated 语义。
 - sticky note：父网络去重 ``iterStickyNotes`` 提取 text/position；API
   缺失（AttributeError）降级跳过 + ``_warning``。
 - 连线：每节点每个已连接 input → ``{from, to, input_index}``。
@@ -150,7 +153,8 @@ class _FakeNode(object):
     def __init__(self, name, type_name="geo", parent=None, comment="",
                  templates=None, parm_values=None, inputs=None,
                  outputs=None, errors=None, warnings=None,
-                 definition=None, sticky_notes=None, children=None):
+                 definition=None, sticky_notes=None, children=None,
+                 is_editable=True):
         self._name = name
         self._type = _FakeNodeType(type_name, "Sop", definition)
         self._parent = parent
@@ -163,6 +167,7 @@ class _FakeNode(object):
         self._warnings = list(warnings) if warnings else []
         self._sticky_notes = list(sticky_notes) if sticky_notes else []
         self._children = list(children) if children else []
+        self._is_editable = is_editable
 
     def name(self):
         return self._name
@@ -209,6 +214,9 @@ class _FakeNode(object):
 
     def children(self):
         return list(self._children)
+
+    def isEditable(self):
+        return self._is_editable
 
 
 class _FakeNodeNoNotes(_FakeNode):
@@ -605,6 +613,64 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
         self.assertEqual(result["node_count"], 1)
         self.assertEqual({n["path"] for n in result["nodes"]},
                          {"/net/HDA1"})
+
+    def test_official_locked_hda_not_expanded(self):
+        # H21 实测：官方 OPlib 节点（如 attribwrangle）内容锁定
+        # （isEditable() False / isLockedHDA() True）→ 即使有 children
+        # 也不拆解分析（用户需求：官方节点默认不展开）
+        net = _FakeNode("net")
+        official_def = _FakeDefinition(
+            "C:/PROGRA~1/SIDEEF~1/HOUDIN~1.596/houdini/otls/OPlibSop.hda")
+        inner = _FakeNode("hidden_inner", parent=net)
+        official = _FakeNode("official_asset", type_name="attribwrangle",
+                             parent=net, definition=official_def,
+                             children=[inner], is_editable=False)
+        self._select([official])
+        result = self._handler().handle_capture_workflow_snapshot(
+            include_hda_internals=True)
+        self.assertEqual(result["status"], "success")
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["node_count"], 1)
+        self.assertEqual({n["path"] for n in result["nodes"]},
+                         {"/net/official_asset"})
+
+    def test_locked_user_hda_not_expanded(self):
+        # 用户自制 HDA 若锁定（Allow Editing of Contents 关闭）→ 不展开
+        net = _FakeNode("net")
+        definition = _FakeDefinition("C:/otls/mytool.hda")
+        inner = _FakeNode("inner_wrangle", type_name="attribwrangle",
+                          parent=net,
+                          parm_values={"snippet": "@P.y += 1;"})
+        locked_hda = _FakeNode("HDA1", type_name="mysop", parent=net,
+                               definition=definition, children=[inner],
+                               is_editable=False)
+        self._select([locked_hda])
+        result = self._handler().handle_capture_workflow_snapshot(
+            include_hda_internals=True)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["node_count"], 1)
+        self.assertEqual({n["path"] for n in result["nodes"]},
+                         {"/net/HDA1"})
+
+    def test_editable_contents_node_expanded_even_with_builtin_path(self):
+        # 官方节点若处于 allow editing of contents 状态（isEditable True）
+        # → 参与分析（用户预期：可编辑就拆解）
+        net = _FakeNode("net")
+        official_def = _FakeDefinition(
+            "C:/PROGRA~1/SIDEEF~1/HOUDIN~1.596/houdini/otls/OPlibSop.hda")
+        inner = _FakeNode("editable_inner", parent=net)
+        official = _FakeNode("unlocked_official", type_name="attribwrangle",
+                             parent=net, definition=official_def,
+                             children=[inner], is_editable=True)
+        inner._parent = official
+        self._select([official])
+        result = self._handler().handle_capture_workflow_snapshot(
+            include_hda_internals=True)
+        self.assertEqual(result["status"], "success")
+        by_path = {n["path"]: n for n in result["nodes"]}
+        self.assertEqual(set(by_path.keys()),
+                         {"/net/unlocked_official",
+                          "/net/unlocked_official/editable_inner"})
 
     def test_hda_internals_expanded_with_vex(self):
         net = _FakeNode("net")

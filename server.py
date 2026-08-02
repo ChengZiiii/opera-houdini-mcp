@@ -209,12 +209,40 @@ def _snapshot_parent(node):
         return None
 
 
+def _snapshot_editable_contents(node):
+    """include_hda_internals 展开判定：仅展开**可编辑内容**的节点。
+
+    H21.0.596 实机语义（用户需求：官方节点默认不拆解分析，可编辑内容
+    参与分析）：
+    - 官方内建节点（OPlib*.hda 等 HDA 化内建类型，如 attribwrangle）内容
+      锁定——``isEditable()`` 返回 False（``isLockedHDA()`` True）→
+      **不展开**
+    - 用户自制 HDA（Allow Editing of Contents 开启 / Editable Nodes，
+      unlocked）→ ``isEditable()`` True → **展开**（含嵌套可编辑 HDA
+      递归）；锁定（不允许编辑内容）的用户 HDA → 不展开
+    - 官方节点若处于 allow editing of contents 状态（如带 Editable
+      Nodes 的 ``bulletrbdsolver``，isEditable True）→ **展开**
+      （其子网络在 GUI 会话中可见时并入快照；hython 下条件子网络未
+      实例化则 children 为空，无内容可展开）
+    - 普通网络容器（subnet / geo / dopnet 等）→ 展开（其 children 是
+      用户工作流的一部分）；非网络节点（box 等）isEditable True 但
+      children 恒空 → 无副作用
+    API 缺失/异常降级 False（保守不展开，绝不 crash）。
+    """
+    try:
+        return bool(node.isEditable())
+    except Exception:
+        return False
+
+
 def _snapshot_neighbors(node, include_hda_internals=False):
     """inputs() + outputs() 合并；异常 / 缺 API 降级为 []。
 
-    ``include_hda_internals=True`` 时，HDA 节点（``type().definition()``
-    非 None）额外展开 ``children()``（内部子网）；嵌套 HDA 由其 children
-    再次触发同一展开，自然递归。children 读取异常降级为 []。
+    ``include_hda_internals=True`` 时，**可编辑内容**的节点
+    （``_snapshot_editable_contents``：``isEditable()``，对应 Allow
+    Editing of Contents / Editable Nodes；官方锁定内建节点 False）额外
+    展开 ``children()``（内部子网）；嵌套可编辑 HDA 由其 children 再次
+    触发同一展开，自然递归。children 读取异常降级为 []。
     """
     neighbors = []
     for getter in ("inputs", "outputs"):
@@ -226,20 +254,15 @@ def _snapshot_neighbors(node, include_hda_internals=False):
             if item is None:
                 continue
             neighbors.append(item)
-    if include_hda_internals:
+    if include_hda_internals and _snapshot_editable_contents(node):
         try:
-            is_hda = node.type().definition() is not None
+            children = node.children() or []
         except Exception:
-            is_hda = False
-        if is_hda:
-            try:
-                children = node.children() or []
-            except Exception:
-                children = []
-            for child in children:
-                if child is None:
-                    continue
-                neighbors.append(child)
+            children = []
+        for child in children:
+            if child is None:
+                continue
+            neighbors.append(child)
     return neighbors
 
 
@@ -3573,9 +3596,18 @@ class HoudiniMCPServer:
         解析 → ``invalid_node_path``）。多个选中节点全部作为 BFS seeds。
 
         闭包：以 seeds 为根沿 ``inputs()`` + ``outputs()`` 双向 BFS，
-        ``include_hda_internals=True`` 时 HDA 节点额外展开 ``children()``
-        （内部子网，嵌套 HDA 递归），同一 ``max_nodes`` 硬上限（int 化，
-        <1 视为 1），超限截断 + ``truncated: true``；输出按 path 排序稳定。
+        ``include_hda_internals=True`` 时**可编辑内容**的节点（
+        ``isEditable()``，见 ``_snapshot_editable_contents``）额外展开
+        ``children()``（内部子网，嵌套可编辑 HDA 递归）——H21 实测官方
+        内建节点（OPlib*.hda 等，如 attribwrangle）内容锁定
+        （``isEditable()`` False）默认**不拆解**；用户自制 HDA（Allow
+        Editing of Contents / Editable Nodes，unlocked）参与分析；官方
+        节点若处于 allow editing of contents 状态（如带 Editable Nodes
+        的 bulletrbdsolver）同样参与（其子网络为条件内容，HOM
+        children() 不可见时自然无可展开）；普通可编辑网络容器（subnet /
+        geo 等）同样展开（其 children 是用户工作流的一部分）。同一
+        ``max_nodes`` 硬上限（int 化，<1 视为 1），超限截断 +
+        ``truncated: true``；输出按 path 排序稳定。
 
         节点表每项：``path / name / type / type_full / is_hda / comment /
         params（非默认参数，≤40 条 + params_truncated）/ vex（attribwrangle

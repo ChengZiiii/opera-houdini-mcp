@@ -775,6 +775,76 @@ def main():
               "node_count=%r" % (resp_no.get("node_count"),))
     except Exception as exc:
         check("j internals off by default", False, "%r" % (exc,))
+    # 官方内建节点（OPlib HDA，如 attribwrangle）内容锁定 → 不拆解分析
+    try:
+        official_w = geo_hda.createNode("attribwrangle", "official_w")
+        official_w.parm("snippet").set("f@x = 1.0;")
+        check("j official node is locked hda",
+              official_w.type().definition() is not None
+              and official_w.isEditable() is False,
+              "has_def=%r isEditable=%r" % (
+                  official_w.type().definition() is not None,
+                  official_w.isEditable()))
+        resp_official = instance.handle_capture_workflow_snapshot(
+            node_path=official_w.path(), include_vex=True, max_nodes=200,
+            include_hda_internals=True)
+        check("j official node not expanded",
+              resp_official.get("node_count", 0) == 1,
+              "node_count=%r" % (resp_official.get("node_count"),))
+        entry_o = (resp_official.get("nodes") or [{}])[0]
+        check("j official node is_hda False",
+              entry_o.get("is_hda") is False,
+              "is_hda=%r" % (entry_o.get("is_hda"),))
+        official_w.destroy()
+    except Exception as exc:
+        check("j official node not expanded", False, "%r" % (exc,))
+    # 官方 subnet（可编辑网络容器，isEditable True）含用户内容 → 参与分析
+    try:
+        official_sub = geo_hda.createNode("subnet", "official_sub")
+        sub_w = official_sub.createNode("attribwrangle", "sub_w")
+        sub_w.parm("snippet").set("f@y = 2.0;")
+        resp_sub = instance.handle_capture_workflow_snapshot(
+            node_path=official_sub.path(), include_vex=True, max_nodes=200,
+            include_hda_internals=True)
+        sub_paths = [n.get("path") for n in resp_sub.get("nodes") or []]
+        check("j editable network container expanded",
+              resp_sub.get("node_count", 0) >= 2
+              and official_sub.path() + "/sub_w" in sub_paths,
+              "count=%r paths=%r" % (resp_sub.get("node_count"), sub_paths))
+        official_sub.destroy()
+    except Exception as exc:
+        check("j editable network container expanded", False, "%r" % (exc,))
+    # 官方 Editable Nodes 声明节点（bulletrbdsolver，Type Properties 中
+    # Editable Nodes = dopnet/forces）：isEditable True（可编辑内容状态
+    # 成立），但其子网络为条件内容，HOM children() 不可见 → capture
+    # include_hda_internals 自洽（node_count=1），不产生误导性拆解。
+    try:
+        probe_dopnet = hou.node("/obj").createNode("dopnet", "bullet_probe")
+        probe_solver = probe_dopnet.createNode("bulletrbdsolver", "solver1")
+        check("j bullet solver editable state",
+              probe_solver.isEditable() is True
+              and probe_solver.type().definition() is None,
+              "isEditable=%r defNone=%r" % (
+                  probe_solver.isEditable(),
+                  probe_solver.type().definition() is None))
+        check("j bullet solver children are conditional",
+              list(probe_solver.children()) == [],
+              "children=%r" % ([c.name() for c in probe_solver.children()],))
+        resp_bullet = instance.handle_capture_workflow_snapshot(
+            node_path=probe_solver.path(), include_vex=True, max_nodes=300,
+            include_hda_internals=True)
+        check("j bullet solver capture self-consistent",
+              resp_bullet.get("status") == "success"
+              and resp_bullet.get("node_count", 0) == 1
+              and not resp_bullet.get("truncated"),
+              "status=%r count=%r" % (
+                  resp_bullet.get("status"),
+                  resp_bullet.get("node_count")))
+        probe_dopnet.destroy()
+        check("j bullet probe cleanup",
+              hou.node("/obj/bullet_probe") is None)
+    except Exception as exc:
+        check("j bullet solver probe", False, "%r" % (exc,))
     # 隔离团队 root：文件仅一块 → 创建 → 原地更新 → 检索 → 未知 id
     hda_team_env = "LESSONS_SMOKE_HDA_TEAM"
     hda_team = os.path.join(SANDBOX, "hda_team")
