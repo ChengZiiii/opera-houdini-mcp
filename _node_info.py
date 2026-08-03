@@ -73,16 +73,84 @@ def _collect_input_connectors(node):
     return out
 
 
+def parm_is_non_default(parm, template=None):
+    """非默认参数判定（get_node_info 与 capture_workflow_snapshot 共用语义）。
+
+    - ``parm.isAtDefault()`` 优先（HOM 规范 API，官方 HDA 实例同样可靠）；
+      True/False 直接采用，None（无默认模板）视为默认（排除）。
+    - API 缺失/异常回退：``rawValue()``（不触发表达式求值）与模板默认值
+      对比；rawValue 缺失再回退 ``eval()``。
+    - 模板默认值不可得且 isAtDefault 不可用 → 无法证明为默认，保守按
+      非默认收录（保证官方 HDA 实例参数可靠产出）。
+    - **绝不触发 cook**：只读 parm 模板与取值。
+    """
+    try:
+        at_default = parm.isAtDefault()
+    except Exception:
+        at_default = None
+    if at_default is not None:
+        return not bool(at_default)
+    raw = None
+    try:
+        raw = parm.rawValue()
+    except Exception:
+        raw = None
+    if raw is None:
+        try:
+            raw = parm.eval()
+        except Exception:
+            raw = None
+    default = None
+    if template is not None:
+        try:
+            default = template.defaultValue()
+        except Exception:
+            default = None
+    if raw is None:
+        return True
+    if default is None:
+        return True
+    try:
+        return raw != default
+    except Exception:
+        return True
+
+
+def _parm_type_name(parm, template):
+    """parm 类型名；模板/API 缺失降级 "unknown"（不 crash）。"""
+    if template is not None:
+        try:
+            return template.type().name()
+        except Exception:
+            pass
+    try:
+        return parm.parmTemplate().type().name()
+    except Exception:
+        return "unknown"
+
+
 def _collect_parameters(node):
-    """收集 parm 信息（前 _PARMS_LIMIT 条）。"""
+    """收集**非默认** parm 信息（前 _PARMS_LIMIT 条）。
+
+    与 capture_workflow_snapshot 共用 ``parm_is_non_default`` 语义：只收
+    与参数模板默认值不同的 parm（isAtDefault 优先），官方 HDA 实例同样
+    可靠产出；不触发 cook。
+    """
     parm_list = []
     for i, parm in enumerate(node.parms()):
         if i >= _PARMS_LIMIT:
             break
+        template = None
+        try:
+            template = parm.parmTemplate()
+        except Exception:
+            template = None
+        if not parm_is_non_default(parm, template):
+            continue
         parm_list.append({
             "name": parm.name(),
             "value": str(parm.eval()),
-            "type": parm.parmTemplate().type().name(),
+            "type": _parm_type_name(parm, template),
         })
     return parm_list
 

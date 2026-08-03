@@ -182,6 +182,9 @@ def _evaluate_render_policy_command(command, params):
 # （模块级；全部兜底不抛，异常降级不 crash）
 # ---------------------------------------------------------------------------
 _SNAPSHOT_MAX_PARAMS = 40
+# 完整快照 JSON 序列化超过该阈值 → 返回精简摘要 + 全量落盘 + 可续读分页
+_SNAPSHOT_SUMMARY_THRESHOLD = 512 * 1024
+_SNAPSHOT_PROBE_MODES = ("auto", "expand_all", "editable_only", "none")
 
 
 def _workflow_error(code, message, details=None):
@@ -209,52 +212,213 @@ def _snapshot_parent(node):
         return None
 
 
-def _snapshot_editable_contents(node):
-    """include_hda_internals 展开判定（用户三轮反馈收敛后的最终语义）。
+def _snapshot_has_editable_nodes_section(node):
+    """判定节点定义是否带 EditableNodes 声明（``definition().hasSection``）。
 
-    H21.0.596 实机语义：
-    - 展开前提：``children()`` 非空（有可读内部内容）
-    - HDA 类型（``definition()`` 非 None）：
-      - 用户资产（库文件非 ``$HFS/houdini/otls``，见
-        ``_snapshot_user_asset_definition``）→ **展开**
-      - 官方 HDA 带 Editable Nodes 声明（``hasSection("EditableNodes")``，
-        如 rbdbulletsolver 的 dopnet/forces 子网络）→ **展开**
-      - 官方 HDA 无声明（rbdconstraintproperties / rbdconfigure 等，
-        即使内部有封装内容）→ **不展开**（用户预期：官方节点默认不
-        拆解分析）
-    - 非 HDA 类型（``definition()`` 为 None 的普通网络容器，如 subnet /
-      geo）：children 非空即展开（其 children 是用户工作流内容）
-    API 缺失/异常降级 False（保守不展开，绝不 crash）。
+    API 缺失 / 异常 / 无 definition → False（保守不拆解）。
     """
-    try:
-        if not node.children():
-            return False
-    except Exception:
-        return False
     try:
         definition = node.type().definition()
     except Exception:
         definition = None
     if definition is None:
-        return True
-    if _snapshot_user_asset_definition(definition):
-        return True
+        return False
     try:
-        if hasattr(definition, "hasSection"):
-            return bool(definition.hasSection("EditableNodes"))
+        if not hasattr(definition, "hasSection"):
+            return False
+        return bool(definition.hasSection("EditableNodes"))
+    except Exception:
+        return False
+
+
+def _snapshot_editable_node_paths(node):
+    """读取定义 EditableNodes 段（UTF-8），返回 trim 后的相对路径列表。
+
+    如 rbdbulletsolver 的 ``dopnet/forces``（每行一条，H21 实机 13 字节）。
+    段缺失 / 不可读 / 无 definition → []。``#`` 起始的注释行与空行跳过。
+    """
+    try:
+        definition = node.type().definition()
+    except Exception:
+        definition = None
+    if definition is None:
+        return []
+    raw = None
+    try:
+        if hasattr(definition, "binaryContents"):
+            raw = definition.binaryContents("EditableNodes")
+    except Exception:
+        raw = None
+    if raw is None:
+        try:
+            sections = definition.sections()
+            section = sections.get("EditableNodes")
+            if section is not None and hasattr(section, "binaryContents"):
+                raw = section.binaryContents()
+        except Exception:
+            raw = None
+    if not isinstance(raw, bytes):
+        return []
+    try:
+        text = raw.decode("utf-8")
+    except (UnicodeDecodeError, ValueError):
+        return []
+    paths = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        paths.append(stripped)
+    return paths
+
+
+def _snapshot_resolve_rel_path(node, rel_path):
+    """把 HDA 段内的相对路径（如 ``dopnet/forces``）解析为该实例的节点。
+
+    优先 ``node.node(rel)``；失败逐段沿 children 按名查找（fake / 旧 API
+    兜底）。解析失败返回 None（不 crash）。
+    """
+    try:
+        resolved = node.node(rel_path)
+        if resolved is not None:
+            return resolved
     except Exception:
         pass
+    current = node
+    for segment in rel_path.split("/"):
+        if not segment:
+            continue
+        found = None
+        try:
+            for child in current.children() or []:
+                if child.name() == segment:
+                    found = child
+                    break
+        except Exception:
+            return None
+        if found is None:
+            return None
+        current = found
+    return current
+
+
+def _snapshot_collect_forced_paths(node, forced_paths):
+    """把节点 EditableNodes 段路径解析为实例绝对路径，加入强制展开集合。
+
+    强制路径途经任意容器类型（Sop / **Dop** 等）MUST 允许进入，不受旧
+    subnet/geo 类别限制；解析失败（段路径当前不存在）静默跳过。
+    """
+    for rel in _snapshot_editable_node_paths(node):
+        resolved = _snapshot_resolve_rel_path(node, rel)
+        if resolved is None:
+            continue
+        resolved_path = _snapshot_node_path(resolved)
+        if resolved_path:
+            forced_paths.add(resolved_path)
+
+
+def _probe_depth_for(node, probe_mode):
+    """分层探测深度决策（纯规则，只读；异常逐层降级不 crash）。
+
+    ``probe_mode`` 取值（``_SNAPSHOT_PROBE_MODES``）：
+    - ``auto``（默认）：按节点状态逐层判定：
+      - ``isEditable()=True``（解锁实例，含解锁官方 HDA 嵌入式定义）→
+        ``expand_all``（整棵渗透，不因"官方无 EditableNodes 声明"跳过）；
+      - 定义带 ``EditableNodes`` 声明（锁定官方，如 rbdbulletsolver 的
+        ``dopnet/forces``）→ ``editable_only``（只探 editable 子树）；
+      - 锁定用户数字资产 → ``locked_asset``（不展开；调用方可显式覆盖）；
+      - 其余锁定官方 → ``locked_official``（不展开，仅参数）。
+    - ``expand_all``：全部节点强制整棵展开（显式覆盖锁定资产）。
+    - ``editable_only``：只展开 EditableNodes 段路径对应的子树。
+    - ``none``：完全不展开内部。
+
+    **不能用 isEditable() 判定"不可读"**：``isEditable()`` 只用于**正向解锁
+    判定**（True → 需渗透）；锁定态（False）不代表 children 不可读——锁定
+    官方 / 锁定资产仍由 EditableNodes 声明或显式 probe_mode 决定是否进入。
+    """
+    if probe_mode == "expand_all":
+        return "expand_all"
+    if probe_mode == "none":
+        return "none"
+    if probe_mode == "editable_only":
+        return "editable_only"
+    # auto：按序判定（用户资产判定逻辑与 _snapshot_node_entry 的 is_hda 一致）
+    is_user_asset = False
+    try:
+        definition = node.type().definition()
+        is_user_asset = (definition is not None
+                         and _snapshot_user_asset_definition(definition))
+    except Exception:
+        is_user_asset = False
+    editable = None
+    try:
+        editable = node.isEditable()
+    except Exception:
+        editable = None
+    has_editable_section = _snapshot_has_editable_nodes_section(node)
+    if editable is True:
+        return "expand_all"
+    if has_editable_section:
+        return "editable_only"
+    if is_user_asset:
+        return "locked_asset"
+    return "locked_official"
+
+
+def _snapshot_on_forced_path(node_path, forced_paths):
+    """节点是否在强制展开路径上（自身是 editable 节点，或途经祖先）。
+
+    路径前缀匹配（``fp == node_path`` 或 ``fp.startswith(node_path + "/")``）；
+    强制路径途经的任意容器类型（Sop / **Dop** 等）MUST 允许进入。
+    """
+    for fp in forced_paths:
+        if fp == node_path or fp.startswith(node_path + "/"):
+            return True
     return False
 
 
-def _snapshot_neighbors(node, include_hda_internals=False):
-    """inputs() + outputs() 合并；异常 / 缺 API 降级为 []。
+def _snapshot_children_to_expand(node, probe, forced_paths):
+    """按分层探测结果返回需要进入 BFS 的 children 列表。
 
-    ``include_hda_internals=True`` 时，满足 ``_snapshot_editable_contents``
-    的节点（children 非空且为用户资产 / 官方带 Editable Nodes 声明 /
-    普通可编辑容器）额外展开 ``children()``（内部子网）；嵌套有内容的
-    节点由其 children 再次触发同一展开，自然递归。children 读取异常
-    降级为 []。
+    - ``expand_all``：全部 children（整棵渗透，含嵌套 HDA 递归探测）。
+    - ``none`` / ``locked_asset`` / ``locked_official`` 且不在强制路径上：
+      []（不展开）。
+    - ``editable_only``（或锁定节点恰为 editable 节点）：子树完整进入 BFS；
+      否则只放行**通向强制路径**的子节点（不把无关内部网络拉入——H21
+      实测 rbdbulletsolver 全量展开 307 节点的根因修复）。
+    children 读取异常降级 []。
+    """
+    if probe == "none":
+        return []
+    if probe == "expand_all":
+        try:
+            return node.children() or []
+        except Exception:
+            return []
+    node_path = _snapshot_node_path(node)
+    if node_path in forced_paths:
+        # editable 节点本身 → 子树完整进入 BFS（EditableNodes 子树完整捕获）
+        try:
+            return node.children() or []
+        except Exception:
+            return []
+    try:
+        children = node.children() or []
+    except Exception:
+        return []
+    relevant = []
+    for child in children:
+        child_path = _snapshot_node_path(child)
+        if child_path and _snapshot_on_forced_path(child_path, forced_paths):
+            relevant.append(child)
+    return relevant
+
+
+def _snapshot_connection_neighbors(node):
+    """inputs() + outputs() 合并（include_connected 用）；异常降级为 []。
+
+    与 children 方向分离：默认闭包只沿 children 展开，连线扩展由
+    ``include_connected`` 显式控制，避免无关子树耗尽预算。
     """
     neighbors = []
     for getter in ("inputs", "outputs"):
@@ -266,16 +430,47 @@ def _snapshot_neighbors(node, include_hda_internals=False):
             if item is None:
                 continue
             neighbors.append(item)
-    if include_hda_internals and _snapshot_editable_contents(node):
-        try:
-            children = node.children() or []
-        except Exception:
-            children = []
-        for child in children:
-            if child is None:
-                continue
-            neighbors.append(child)
     return neighbors
+
+
+def _snapshot_summary_entry(entry):
+    """节点详情条目 → 精简摘要行（path/name/type/type_full/is_hda/
+    has_vex/param_count）。"""
+    return {
+        "path": entry["path"],
+        "name": entry["name"],
+        "type": entry["type"],
+        "type_full": entry["type_full"],
+        "is_hda": entry["is_hda"],
+        "has_vex": entry.get("vex") is not None,
+        "param_count": len(entry.get("params") or {}),
+    }
+
+
+def _snapshot_write_summary_file(result):
+    """完整快照 JSON 落盘到本机会话临时目录；返回 basename。
+
+    响应不含敏感路径（绝不返回完整临时路径）；写失败返回 None（调用方以
+    ``summary_file: None`` 降级，仍可用 offset/limit 续读全量节点）。
+    """
+    try:
+        text = json.dumps(result, default=str, ensure_ascii=False)
+        fd, tmp_path = tempfile.mkstemp(prefix="workflow_snapshot_",
+                                        suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+            return None
+        return os.path.basename(tmp_path)
+    except Exception:
+        return None
 
 
 def _snapshot_normalize_path(path):
@@ -3595,32 +3790,57 @@ class HoudiniMCPServer:
     # -----------------------------------------------------------------
     # 单次 HOM 遍历把选中（或 node_path 指定的）节点子网络转换为紧凑
     # 结构化快照：节点表（path/name/type/comment/非默认参数/vex/hda/
-    # errors/warnings）+ sticky note + 连线。纯规则读取，**不**调用
-    # LLM/外部服务，**不**修改场景、**不**进 undo group（归
+    # errors/warnings）+ sticky note + 连线。分层探测（_probe_depth_for：
+    # EditableNodes 段 + isEditable 正向解锁 + 资产来源三层判定），闭包
+    # 默认只沿 children 展开（include_connected 显式开启连线扩展，预算
+    # 两阶段分配），超大输出转摘要 + 落盘 + 分页续读。纯规则读取，**不**
+    # 调用 LLM/外部服务，**不**修改场景、**不**进 undo group（归
     # READ_ONLY_COMMANDS）。响应整体过 apply_response_cap。
     def handle_capture_workflow_snapshot(self, node_path=None,
                                          include_vex=True, max_nodes=50,
-                                         include_hda_internals=False):
+                                         probe_mode="auto",
+                                         include_connected=False,
+                                         include_hda_internals=None,
+                                         offset=None, limit=None):
         """add-workflow-knowledge-capture：工作流知识主动捕获快照。
 
         定位：``node_path`` 省略 → ``hou.selectedNodes()``（空 → 结构化
         错误 ``no_selection``，不静默回退）；给定 → ``hou.node``（不可
         解析 → ``invalid_node_path``）。多个选中节点全部作为 BFS seeds。
 
-        闭包：以 seeds 为根沿 ``inputs()`` + ``outputs()`` 双向 BFS，
-        ``include_hda_internals=True`` 时按 ``_snapshot_editable_contents``
-        展开内部（children 非空，且满足：用户资产 / 官方 HDA 带
-        Editable Nodes 声明 / 普通可编辑容器）——H21 实测（用户语义
-        收敛）：用户自制 HDA（含便签 / 子网络）完全展开；官方带
-        Editable Nodes 声明的节点（如 rbdbulletsolver1 的
-        dopnet/forces 子网络，``hasSection("EditableNodes")``）展开；
-        官方无声明的封装 HDA（rbdconstraintproperties / rbdconfigure
-        等）默认**不拆解**；普通容器（subnet / geo）children 非空同样
-        展开；官方空壳节点（attribwrangle 等 children 恒空）不展开。
-        **不能用 ``isEditable()`` 判定**（实例锁定态 isEditable False
-        但 children 完全可读，且大 HDA 上定义比较可能极慢）。同一
-        ``max_nodes`` 硬上限（int 化，<1 视为 1），超限截断 +
+        分层探测（``probe_mode``，默认 ``auto``）：按目标节点状态逐层决定
+        探测深度——
+        - **锁定官方节点 + 有 EditableNodes 声明**（如 rbdbulletsolver1
+          的 ``dopnet/forces`` 子网络，``definition().hasSection
+          ("EditableNodes")`` 且 ``isEditable()=false``）→ **只展开
+          EditableNodes 段路径对应的子树**，MUST NOT 展开其余内部网络
+          （H21 实测全量展开 307 节点的根因修复）。
+        - **解锁实例**（``isEditable()=true``，含解锁官方 HDA 的嵌入式
+          定义场景，如 transformpieces1）→ **整棵渗透**内部子网络（含
+          嵌套 HDA 递归），不因"官方无 EditableNodes 声明"跳过。
+        - **锁定官方节点 + 无声明**（rbdconstraintproperties /
+          rbdconfigure 等）→ 不展开，仅记录节点与非默认参数。
+        - **锁定用户数字资产**（如 csr_voronoi_advanced1）→ 默认只记
+          节点名；调用方可传 ``probe_mode="expand_all"`` 显式要求展开。
+        ``probe_mode`` 取值：``auto``（默认）/ ``expand_all``（全部整棵
+        展开）/ ``editable_only``（只探 EditableNodes 子树）/ ``none``
+        （完全不展开）。**不能用 isEditable() 判定"children 不可读"**：
+        isEditable() 只用于**正向解锁判定**（True → 需渗透）；锁定态
+        不代表 children 不可读。旧参数 ``include_hda_internals`` 兼容
+        映射：True → ``auto``，False → ``none``（显式 probe_mode 优先）。
+
+        闭包与预算：默认**只沿 children 方向展开**（受分层探测约束），
+        不沿连线扩展；``include_connected=True`` 时把沿 inputs/outputs
+        的邻居入队，用剩余预算（两阶段分配：强制子树优先，连接节点次
+        之）。同一 ``max_nodes`` 硬上限（int 化，<1 视为 1），超限截断 +
         ``truncated: true``；输出按 path 排序稳定。
+
+        输出摘要/分页：完整快照 JSON 超阈值（512KB）时返回**精简摘要**
+        （nodes 降级为 ``{path, name, type, type_full, is_hda, has_vex,
+        param_count}`` 行）+ ``summary: true`` + ``summary_file``（全量
+        落盘临时文件的 basename，**响应不含敏感路径**）；传
+        ``offset/limit`` 可续读全量详情节点（``page.total /
+        next_offset``），不静默截断丢弃目标子树。
 
         节点表每项：``path / name / type / type_full / is_hda / comment /
         params（非默认参数，≤40 条 + params_truncated）/ vex（attribwrangle
@@ -3653,9 +3873,11 @@ class HoudiniMCPServer:
           + 版本）定位节点，实例名（``name``）仅作辅助说明。
         - 知识正文 MUST NOT 写本机绝对路径（HDA 库路径 / hip 完整路径）；
           资产只用全名 + 版本索引（跨机器复现时路径会误导）。
-        - 研究用户自制 HDA 的原理（内部 VEX / 约束 / 子网结构）时传
-          ``include_hda_internals=True``，并可视需要上调 ``max_nodes``
-          （大资产内部节点多，如 500）。
+        - 分层探测语义：未解锁且有 editable nodes 的官方节点只探 editable
+          nodes；解锁节点（含官方）需整棵渗透；锁定自定义 HDA 无专门沉淀
+          时只记节点名。研究用户自制 HDA 的原理（内部 VEX / 约束 / 子网
+          结构）时传 ``probe_mode="auto"``（或 include_hda_internals=True）
+          并可视需要上调 ``max_nodes``（大资产内部节点多，如 500）。
         """
         warnings_list = []
 
@@ -3696,15 +3918,34 @@ class HoudiniMCPServer:
             seeds = [seed]
             root_label = node_path
 
-        # --- max_nodes 硬上限（int 化，<1 视为 1）---
-        try:
-            limit = int(max_nodes)
-        except (TypeError, ValueError):
-            limit = 50
-        if limit < 1:
-            limit = 1
+        # --- probe_mode 规范化 + include_hda_internals 兼容映射 ---
+        # 旧参数 include_hda_internals：True → "auto"（分层探测），False →
+        # "none"（不展开内部）；显式 probe_mode 优先。
+        if probe_mode not in _SNAPSHOT_PROBE_MODES:
+            return cmn.apply_response_cap(_workflow_error(
+                "invalid_probe_mode",
+                "probe_mode 必须是 auto/expand_all/editable_only/none",
+                {"value": probe_mode,
+                 "valid": list(_SNAPSHOT_PROBE_MODES)}))
+        if include_hda_internals is True:
+            probe_mode = "auto"
+        elif include_hda_internals is False:
+            probe_mode = "none"
 
-        # --- BFS 闭包遍历（inputs + outputs 双向，path 去重）---
+        # --- max_nodes 硬上限（int 化，<1 视为 1）---
+        # 命名 budget：避免与分页参数 limit 同名（否则 BFS 赋值会覆盖
+        # 分页参数，导致 offset/limit 分页分支恒真）。
+        try:
+            budget = int(max_nodes)
+        except (TypeError, ValueError):
+            budget = 50
+        if budget < 1:
+            budget = 1
+
+        # --- BFS 阶段 1：children 方向（分层探测，强制子树优先）---
+        # 默认只沿 children 展开；沿连线扩展由 include_connected 显式开启，
+        # 用剩余预算（阶段 2），避免无关子树耗尽预算导致目标缺失。
+        forced_paths = set()
         queue = []
         discovered = set()
         for seed in seeds:
@@ -3715,22 +3956,48 @@ class HoudiniMCPServer:
 
         visited = {}
         truncated = False
-        while queue:
+        while queue and len(visited) < budget:
             node = queue.pop(0)
             key = _snapshot_node_path(node)
             if key in visited:
                 continue
             visited[key] = node
-            # 先展开邻居完成可达性发现；预算用尽后发现的节点不再入队
-            # 访问（被截断的节点不展开），但计入 truncated。
-            for neighbor in _snapshot_neighbors(node, include_hda_internals):
-                neighbor_path = _snapshot_node_path(neighbor)
-                if neighbor_path not in discovered:
-                    discovered.add(neighbor_path)
-                    if len(visited) < limit:
-                        queue.append(neighbor)
-            if len(visited) >= limit:
-                break
+            probe = _probe_depth_for(node, probe_mode)
+            if probe == "editable_only":
+                # 收集 EditableNodes 段路径 → 强制展开集合（动态发现，
+                # 祖先先于后代出队，路径一定在进入子树前生效）
+                _snapshot_collect_forced_paths(node, forced_paths)
+            for child in _snapshot_children_to_expand(node, probe,
+                                                      forced_paths):
+                child_path = _snapshot_node_path(child)
+                if child_path and child_path not in discovered:
+                    discovered.add(child_path)
+                    if len(visited) < budget:
+                        queue.append(child)
+
+        # --- BFS 阶段 2（可选）：include_connected → 沿连线扩展 ---
+        # 用剩余预算；只从已访问节点出发，不向强制集合回溯扩展。
+        if include_connected and len(visited) < budget:
+            conn_queue = []
+            for node in visited.values():
+                for neighbor in _snapshot_connection_neighbors(node):
+                    neighbor_path = _snapshot_node_path(neighbor)
+                    if neighbor_path and neighbor_path not in discovered:
+                        discovered.add(neighbor_path)
+                        if len(visited) < budget:
+                            conn_queue.append(neighbor)
+            while conn_queue and len(visited) < budget:
+                node = conn_queue.pop(0)
+                key = _snapshot_node_path(node)
+                if key in visited:
+                    continue
+                visited[key] = node
+                for neighbor in _snapshot_connection_neighbors(node):
+                    neighbor_path = _snapshot_node_path(neighbor)
+                    if neighbor_path and neighbor_path not in discovered:
+                        discovered.add(neighbor_path)
+                        if len(visited) < budget:
+                            conn_queue.append(neighbor)
         # 已发现但未收录的节点 → 超限截断
         truncated = bool(discovered - set(visited.keys()))
 
@@ -3813,6 +4080,57 @@ class HoudiniMCPServer:
         }
         if warnings_list:
             result["_warning"] = warnings_list
+
+        # --- 分页续读：offset/limit 取回全量详情节点（不落盘摘要）---
+        if offset is not None or limit is not None:
+            try:
+                start = int(offset) if offset is not None else 0
+            except (TypeError, ValueError):
+                start = 0
+            if start < 0:
+                start = 0
+            try:
+                size = int(limit) if limit is not None else len(nodes)
+            except (TypeError, ValueError):
+                size = len(nodes)
+            if size < 0:
+                size = 0
+            page = nodes[start:start + size]
+            next_offset = start + len(page)
+            result["nodes"] = page
+            result["page"] = {
+                "offset": start,
+                "limit": size,
+                "total": len(nodes),
+                "next_offset": next_offset if next_offset < len(nodes)
+                else None,
+            }
+            return cmn.apply_response_cap(result)
+
+        # --- 摘要模式：完整 JSON 超阈值 → 精简摘要 + 全量落盘 + 续读引用 ---
+        # 全量节点仍可用 offset/limit 分页取回（不静默截断丢弃目标子树）。
+        try:
+            oversized = cmn._serialized_size(result) > \
+                _SNAPSHOT_SUMMARY_THRESHOLD
+        except Exception:
+            oversized = False
+        if oversized:
+            summary_file = _snapshot_write_summary_file(result)
+            summary = {
+                "status": "success",
+                "root": root_label,
+                "node_count": len(nodes),
+                "truncated": truncated,
+                "hip_file": hip_file,
+                "summary": True,
+                "summary_file": summary_file,
+                "nodes": [_snapshot_summary_entry(n) for n in nodes],
+                "sticky_notes": sticky_notes,
+                "connections": connections,
+            }
+            if warnings_list:
+                summary["_warning"] = warnings_list
+            return cmn.apply_response_cap(summary)
         return cmn.apply_response_cap(result)
 
     def _snapshot_node_entry(self, node, include_vex, warnings_list):
@@ -3847,8 +4165,10 @@ class HoudiniMCPServer:
                 "comment 读取失败: %s (%s: %s)"
                 % (path, err.__class__.__name__, err))
 
-        # 非默认参数：遍历 parmTemplates，仅收录非默认；菜单/命令类
-        # 类型跳过；值过 _json_safe_hou_value；每节点最多 40 条。
+        # 非默认参数：与 get_node_info 统一语义（_node_info.parm_is_non_default：
+        # isAtDefault 优先、失败回退 rawValue/模板默认对比）——官方 HDA 实例
+        # 同样可靠产出（修复快照 params 恒空）；菜单/命令类类型跳过；值过
+        # _json_safe_hou_value；每节点最多 40 条；不触发 cook。
         params = {}
         params_truncated = False
         templates = []
@@ -3868,15 +4188,15 @@ class HoudiniMCPServer:
             if ttype not in _snapshot_value_parm_types():
                 continue
             try:
-                default = template.defaultValue()
-            except Exception:
-                default = None
-            parm = None
-            try:
                 parm = node.parm(tname)
             except Exception:
                 parm = None
             if parm is not None:
+                try:
+                    if not ni.parm_is_non_default(parm, template):
+                        continue
+                except Exception:
+                    continue
                 try:
                     value = parm.eval()
                 except Exception:
@@ -3886,11 +4206,15 @@ class HoudiniMCPServer:
                     value = node.evalParm(tname)
                 except Exception:
                     continue
-            try:
-                if value == default:
-                    continue
-            except Exception:
-                pass
+                try:
+                    default = template.defaultValue()
+                except Exception:
+                    default = None
+                try:
+                    if value == default:
+                        continue
+                except Exception:
+                    pass
             if len(params) >= _SNAPSHOT_MAX_PARAMS:
                 params_truncated = True
                 break
