@@ -144,10 +144,11 @@ class _FakeParmTemplate(object):
 
 
 class _FakeParm(object):
-    def __init__(self, name, value, default=None):
+    def __init__(self, name, value, default=None, template=None):
         self._name = name
         self._value = value
         self._default = default
+        self._template = template
 
     def name(self):
         return self._name
@@ -164,6 +165,10 @@ class _FakeParm(object):
             return None
         return self._value == self._default
 
+    def parmTemplate(self):
+        # 供类型过滤（菜单/命令类跳过）；模板缺失返回 None
+        return self._template
+
 
 class _FakeStickyNote(object):
     def __init__(self, text, position):
@@ -175,6 +180,17 @@ class _FakeStickyNote(object):
 
     def position(self):
         return self._position
+
+
+class _FakeParmTemplateGroup(object):
+    """H21 真实 API：hou.OpNode 无 parmTemplates()，参数模板来自
+    parmTemplateGroup().parmTemplates()（快照 params 恒空根因修复）。"""
+
+    def __init__(self, templates):
+        self._templates = list(templates) if templates else []
+
+    def parmTemplates(self):
+        return list(self._templates)
 
 
 class _FakeNode(object):
@@ -217,6 +233,21 @@ class _FakeNode(object):
 
     def parmTemplates(self):
         return list(self._templates)
+
+    def parmTemplateGroup(self):
+        # H21 主路径：parmTemplateGroup().parmTemplates()
+        return _FakeParmTemplateGroup(self._templates)
+
+    def parms(self):
+        # 真实主路径：parms() 遍历（定义参数 + spare 全覆盖）；fake 以
+        # templates 为准，parm_values 提供取值
+        out = []
+        for template in self._templates:
+            name = template.name()
+            if name in self._parm_values:
+                out.append(_FakeParm(name, self._parm_values[name],
+                                     template.defaultValue(), template))
+        return out
 
     def parm(self, name):
         if name in self._parm_values:

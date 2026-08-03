@@ -433,6 +433,79 @@ def _snapshot_connection_neighbors(node):
     return neighbors
 
 
+def _snapshot_parm_templates(node):
+    """H21 兼容获取节点参数模板列表。
+
+    ``hou.OpNode`` **没有** ``parmTemplates()`` 方法（那是
+    ``hou.ParmTemplateGroup`` 的方法）；且 ``parmTemplateGroup()`` 只含
+    定义级模板，**不含 spare parameters**（H21 实测 csr_voronoi_advanced
+    77 parms 仅 7 个模板）。以 ``parms()`` 遍历 + ``parm.parmTemplate()``
+    为主路径（定义参数与 spare 全覆盖）；``parmTemplateGroup()`` 与旧式
+    ``parmTemplates()`` 表面仅作无 ``parms()`` API 时的回退。不触发 cook。
+    """
+    tpls = []
+    try:
+        for parm in node.parms() or []:
+            if parm is None:
+                continue
+            try:
+                tpls.append(parm.parmTemplate())
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if tpls:
+        return tpls
+    try:
+        group = node.parmTemplateGroup()
+        if group is not None:
+            tpls = group.parmTemplates()
+            if tpls:
+                return tpls
+    except Exception:
+        pass
+    try:
+        # 兼容既有 fake / 旧式 Node.parmTemplates() 表面（单测用）
+        if hasattr(node, "parmTemplates"):
+            tpls = node.parmTemplates()
+            if tpls:
+                return tpls
+    except Exception:
+        pass
+    return tpls
+
+
+def _snapshot_parm_pairs(node):
+    """(parm, template) 对列表（参数采集主数据源）。
+
+    H21 实测：``parmTemplateGroup()`` 只含定义级模板，**不含 spare
+    parameters**（csr_voronoi_advanced 77 parms 仅 7 模板）；以
+    ``parms()`` 遍历 + ``parm.parmTemplate()`` 为主路径（定义参数与
+    spare 全覆盖）。parm 名与模板名可能不同（向量分量 amp3x/amp3y/amp3z
+    共用一个模板 amp3），取值与键一律走 parm。无 ``parms()`` API 时回退
+    模板列表（parm=None，调用方走 evalParm 分支）。不触发 cook。
+    """
+    pairs = []
+    try:
+        parms = node.parms() or []
+    except Exception:
+        parms = []
+    if parms:
+        for parm in parms:
+            if parm is None:
+                continue
+            template = None
+            try:
+                template = parm.parmTemplate()
+            except Exception:
+                template = None
+            pairs.append((parm, template))
+        return pairs
+    for template in _snapshot_parm_templates(node):
+        pairs.append((None, template))
+    return pairs
+
+
 def _snapshot_summary_entry(entry):
     """节点详情条目 → 精简摘要行（path/name/type/type_full/is_hda/
     has_vex/param_count）。"""
@@ -4166,32 +4239,22 @@ class HoudiniMCPServer:
                 % (path, err.__class__.__name__, err))
 
         # 非默认参数：与 get_node_info 统一语义（_node_info.parm_is_non_default：
-        # isAtDefault 优先、失败回退 rawValue/模板默认对比）——官方 HDA 实例
-        # 同样可靠产出（修复快照 params 恒空）；菜单/命令类类型跳过；值过
-        # _json_safe_hou_value；每节点最多 40 条；不触发 cook。
+        # isAtDefault 优先、失败回退 rawValue/模板默认对比）——H21 兼容采集
+        # （parms() 遍历 + parm.parmTemplate()，覆盖定义参数与 spare；
+        # 键用 parm.name()，避免向量分量共用模板名互相覆盖）；菜单/命令类
+        # 类型跳过；值过 _json_safe_hou_value；每节点最多 40 条；不触发 cook。
         params = {}
         params_truncated = False
-        templates = []
-        try:
-            templates = node.parmTemplates() or []
-        except Exception:
-            templates = []
-        for template in templates:
-            try:
-                tname = template.name()
-            except Exception:
-                continue
-            try:
-                ttype = template.type()
-            except Exception:
-                continue
-            if ttype not in _snapshot_value_parm_types():
-                continue
-            try:
-                parm = node.parm(tname)
-            except Exception:
-                parm = None
+        for parm, template in _snapshot_parm_pairs(node):
             if parm is not None:
+                if template is not None:
+                    try:
+                        ttype = template.type()
+                    except Exception:
+                        ttype = None
+                    if ttype is not None and \
+                            ttype not in _snapshot_value_parm_types():
+                        continue
                 try:
                     if not ni.parm_is_non_default(parm, template):
                         continue
@@ -4201,7 +4264,16 @@ class HoudiniMCPServer:
                     value = parm.eval()
                 except Exception:
                     continue
+                try:
+                    pname = parm.name()
+                except Exception:
+                    continue
             else:
+                # 回退（无 parms() API）：evalParm 与模板默认对比
+                try:
+                    tname = template.name()
+                except Exception:
+                    continue
                 try:
                     value = node.evalParm(tname)
                 except Exception:
@@ -4215,6 +4287,7 @@ class HoudiniMCPServer:
                         continue
                 except Exception:
                     pass
+                pname = tname
             if len(params) >= _SNAPSHOT_MAX_PARAMS:
                 params_truncated = True
                 break
@@ -4223,7 +4296,7 @@ class HoudiniMCPServer:
                                                       max_depth=2)
             except Exception:
                 safe_value = str(value)
-            params[tname] = safe_value
+            params[pname] = safe_value
 
         # vex：仅 attribwrangle + include_vex=True；异常 → None + _warning
         vex = None
