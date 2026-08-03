@@ -737,5 +737,97 @@ class PR10BridgeBehaviorTests(unittest.TestCase):
         self.assertIn("Node not found", result["message"])
 
 
+# ===========================================================================
+# Section C: 共享非默认参数判定（refine-mcp-knowledge-capture）
+# parm_is_non_default 与 capture_workflow_snapshot 共用：isAtDefault 优先，
+# 失败回退 rawValue 与模板默认对比；官方 HDA 实例必须可靠产出。
+# ===========================================================================
+class ParmIsNonDefaultTests(unittest.TestCase):
+
+    def test_is_at_default_primary(self):
+        class AtDefault(object):
+            def isAtDefault(self):
+                return True
+
+        class NotAtDefault(object):
+            def isAtDefault(self):
+                return False
+
+        self.assertFalse(ni.parm_is_non_default(AtDefault()))
+        self.assertTrue(ni.parm_is_non_default(NotAtDefault()))
+
+    def test_fallback_raw_value_vs_template_default(self):
+        class NonDefault(object):
+            def isAtDefault(self):
+                raise AttributeError("no isAtDefault API")
+
+            def rawValue(self):
+                return 2.5
+
+        class AtDefault(object):
+            def isAtDefault(self):
+                raise AttributeError("no isAtDefault API")
+
+            def rawValue(self):
+                return 1.0
+
+        tpl = types.SimpleNamespace(defaultValue=lambda: 1.0)
+        self.assertTrue(ni.parm_is_non_default(NonDefault(), tpl))
+        self.assertFalse(ni.parm_is_non_default(AtDefault(), tpl))
+
+    def test_no_default_template_conservative_non_default(self):
+        class NoDefault(object):
+            def isAtDefault(self):
+                raise AttributeError("no isAtDefault API")
+
+            def rawValue(self):
+                return 5.0
+
+        # 模板默认值不可得且 isAtDefault 不可用 → 保守按非默认收录
+        self.assertTrue(ni.parm_is_non_default(NoDefault(), None))
+
+    def test_collect_parameters_only_non_default(self):
+        class Tpl(object):
+            def __init__(self, default):
+                self._default = default
+
+            def defaultValue(self):
+                return self._default
+
+            def type(self):
+                return types.SimpleNamespace(name=lambda: "Float")
+
+        class Parm(object):
+            def __init__(self, name, value, default):
+                self._name = name
+                self._value = value
+                self._template = Tpl(default)
+
+            def name(self):
+                return self._name
+
+            def eval(self):
+                return self._value
+
+            def rawValue(self):
+                return self._value
+
+            def isAtDefault(self):
+                return self._value == self._template.defaultValue()
+
+            def parmTemplate(self):
+                return self._template
+
+        class Node(object):
+            def parms(self):
+                return [Parm("scale", 2.5, 1.0),   # 非默认 → 收录
+                        Parm("seed", 0, 0)]         # 默认 → 过滤
+
+        out = ni._collect_parameters(Node())
+        self.assertEqual([p["name"] for p in out], ["scale"])
+        self.assertEqual(out[0]["type"], "Float")
+        self.assertEqual(out[0]["value"], "2.5")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -769,10 +769,18 @@ def main():
     # 默认 include_hda_internals=False 不展开内部（仅 HDA 节点本身）
     try:
         resp_no = instance.handle_capture_workflow_snapshot(
-            node_path=asset.path(), include_vex=True, max_nodes=200)
-        check("j internals off by default",
+            node_path=asset.path(), include_vex=True, max_nodes=200,
+            include_hda_internals=False)
+        check("j internals off with explicit include_hda_internals=False",
               resp_no.get("node_count", 0) == 1,
               "node_count=%r" % (resp_no.get("node_count"),))
+        # 显式 probe_mode="none" 同样只记根节点（新参数路径）
+        resp_none = instance.handle_capture_workflow_snapshot(
+            node_path=asset.path(), include_vex=True, max_nodes=200,
+            probe_mode="none")
+        check("j probe_mode none off by default",
+              resp_none.get("node_count", 0) == 1,
+              "node_count=%r" % (resp_none.get("node_count"),))
     except Exception as exc:
         check("j internals off by default", False, "%r" % (exc,))
     # 官方内建节点（OPlib HDA，如 attribwrangle）内容锁定 → 不拆解分析
@@ -842,11 +850,60 @@ def main():
               "status=%r count=%r" % (
                   resp_bullet.get("status"),
                   resp_bullet.get("node_count")))
+        # refine-mcp-knowledge-capture：显式 probe_mode="auto"（分层探测
+        # 路径）在 hython 空实例上同样自洽（editable_only 无强制路径）
+        resp_auto = instance.handle_capture_workflow_snapshot(
+            node_path=probe_solver.path(), include_vex=True, max_nodes=300,
+            probe_mode="auto")
+        check("j layered probe auto self-consistent",
+              resp_auto.get("status") == "success"
+              and resp_auto.get("node_count", 0) == 1
+              and not resp_auto.get("truncated"),
+              "status=%r count=%r" % (
+                  resp_auto.get("status"),
+                  resp_auto.get("node_count")))
         probe_dopnet.destroy()
         check("j bullet probe cleanup",
               hou.node("/obj/bullet_probe") is None)
     except Exception as exc:
         check("j bullet solver probe", False, "%r" % (exc,))
+    # 解锁官方 HDA（transformpieces1 类，Sop/xformpieces）：auto 分层探测
+    # 不因"官方无 EditableNodes 声明"跳过——isEditable=True 时整棵渗透。
+    # hython 新建实例内容未实例化（children 空）→ 自洽 node_count>=1 且
+    # 不 crash；实机 GUI 解锁实例（TestLLMknowledge.hip）→ 内部条目进入
+    # 节点表（见 tasks 6.1 实测回归）。
+    try:
+        geo_xf = hou.node("/obj").createNode("geo", "xform_probe")
+        xf = geo_xf.createNode("xformpieces", "xformpieces1")
+        check("j xformpieces created",
+              xf is not None and xf.type().definition() is not None,
+              "def=%r isEditable=%r" % (
+                  xf.type().definition() is not None, xf.isEditable()))
+        resp_xf = instance.handle_capture_workflow_snapshot(
+            node_path=xf.path(), include_vex=True, max_nodes=200,
+            probe_mode="auto")
+        check("j xformpieces capture self-consistent",
+              resp_xf.get("status") == "success"
+              and resp_xf.get("node_count", 0) >= 1
+              and not resp_xf.get("truncated"),
+              "status=%r count=%r" % (
+                  resp_xf.get("status"), resp_xf.get("node_count")))
+        # 解锁（isEditable=True）且有内容时内部条目必须进入节点表
+        try:
+            xf_editable = xf.isEditable()
+            xf_children = list(xf.children())
+        except Exception:
+            xf_editable, xf_children = False, []
+        if xf_editable and xf_children:
+            xf_paths = [n.get("path") for n in resp_xf.get("nodes") or []]
+            check("j xformpieces internals captured when editable",
+                  any(p.startswith(xf.path() + "/") for p in xf_paths),
+                  "paths=%r" % (xf_paths[:12],))
+        geo_xf.destroy()
+        check("j xformpieces probe cleanup",
+              hou.node("/obj/xform_probe") is None)
+    except Exception as exc:
+        check("j xformpieces probe", False, "%r" % (exc,))
     # 隔离团队 root：文件仅一块 → 创建 → 原地更新 → 检索 → 未知 id
     hda_team_env = "LESSONS_SMOKE_HDA_TEAM"
     hda_team = os.path.join(SANDBOX, "hda_team")

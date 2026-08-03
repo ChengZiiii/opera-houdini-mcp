@@ -998,7 +998,8 @@ class CaptureWorkflowSnapshotToolTests(LessonsToolsBase):
         call_mock.assert_called_once_with(
             "capture_workflow_snapshot",
             {"node_path": None, "include_vex": True, "max_nodes": 50,
-             "include_hda_internals": False})
+             "probe_mode": "auto", "include_connected": False,
+             "include_hda_internals": None, "offset": None, "limit": None})
 
     def test_include_hda_internals_passed_through(self):
         bridge = _get_bridge()
@@ -1012,7 +1013,26 @@ class CaptureWorkflowSnapshotToolTests(LessonsToolsBase):
         call_mock.assert_called_once_with(
             "capture_workflow_snapshot",
             {"node_path": None, "include_vex": True, "max_nodes": 500,
-             "include_hda_internals": True})
+             "probe_mode": "auto", "include_connected": False,
+             "include_hda_internals": True, "offset": None, "limit": None})
+
+    def test_layered_probe_params_passed_through(self):
+        bridge = _get_bridge()
+        with mock.patch.object(
+                bridge, "_houdini_call",
+                return_value={"status": "success",
+                              "result": self.SUCCESS_RESULT}) as call_mock:
+            env = bridge.capture_workflow_snapshot(
+                None, node_path="/obj/geo1/rbdbulletsolver1",
+                probe_mode="auto", include_connected=True,
+                offset=10, limit=20)
+        self.assertEqual(env["status"], "success")
+        call_mock.assert_called_once_with(
+            "capture_workflow_snapshot",
+            {"node_path": "/obj/geo1/rbdbulletsolver1",
+             "include_vex": True, "max_nodes": 50,
+             "probe_mode": "auto", "include_connected": True,
+             "include_hda_internals": None, "offset": 10, "limit": 20})
 
     def test_connection_error_converted_to_lessons_envelope(self):
         bridge = _get_bridge()

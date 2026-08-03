@@ -374,6 +374,28 @@ class SaveRecipePersonalTests(_BaseDirFixture):
                                  _valid_fields(fix="第一行\n第二行"))
         self.assertEqual(ctx.exception.code, "ls_write_error")
 
+    def test_multiline_error_lists_all_restricted_fields(self):
+        # 单行校验失败时错误信息列出**全部**受限字段（不以第一个为限），
+        # details.fields 与 message 一致；单行内中文标点/分号压缩不受影响
+        with self.assertRaises(LessonsError) as ctx:
+            _lessons.save_recipe(
+                self._personal(),
+                _valid_fields(title="两行标题\n第二行",
+                              problem="两行 problem\n第二行",
+                              symptom="两行 symptom\n第二行",
+                              fix="两行 fix\n第二行"))
+        exc = ctx.exception
+        self.assertEqual(exc.code, "ls_write_error")
+        for name in ("title", "problem", "symptom", "fix"):
+            self.assertIn(name, exc.message)
+            self.assertIn(name, exc.details["fields"])
+        self.assertEqual(sorted(exc.details["fields"]),
+                         ["fix", "problem", "symptom", "title"])
+        self.assertIn(exc.details["field"], exc.details["fields"])
+        # 零写入
+        recipes_dir = _lessons.recipes_path(self._personal())
+        self.assertFalse(os.path.isfile(recipes_dir))
+
     def test_unknown_field_rejected(self):
         with self.assertRaises(LessonsError) as ctx:
             _lessons.save_recipe(self._personal(), _valid_fields(bogus="x"))

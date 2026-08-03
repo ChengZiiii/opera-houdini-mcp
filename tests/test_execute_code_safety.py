@@ -247,11 +247,67 @@ class CheckExecuteCodePolicyTests(unittest.TestCase):
         # The code is safe in terms of dangerous/mutation, but import hou is
         # detected. In normal policy this should be allowed but flagged in hits.
         self.assertTrue(r["hits"]["import_hou"])
-        # read-only + import hou should be rejected
+        # read-only + import hou is now ALLOWED (import itself is not a scene
+        # mutation; read-only traversal code can import hou). Flag still set.
         r2 = cmn.check_execute_code_policy(self._import_hou_code(), "read-only",
                                             False, False, False)
-        self.assertFalse(r2["allowed"])
+        self.assertTrue(r2["allowed"], r2)
         self.assertTrue(r2["hits"]["import_hou"])
+        # read-only still rejects actual mutations (双层防御不变)
+        r3 = cmn.check_execute_code_policy(self._mutation_code(), "read-only",
+                                            False, False, False)
+        self.assertFalse(r3["allowed"])
+        self.assertIn("mutation", r3["reason"])
+
+    # ---- read-only 求值白名单：hou.Parm 接收者的 eval 放行 ----
+    def test_read_only_parm_eval_allowed(self):
+        # node.parm('scale').eval() → 接收者链含 .parm( 调用 → 白名单放行
+        code = "import hou\nv = hou.node('/obj/geo1').parm('scale').eval()"
+        r = cmn.check_execute_code_policy(code, "read-only",
+                                          False, False, False)
+        self.assertTrue(r["allowed"], r)
+        self.assertNotIn("eval 动态执行", r["hits"]["dangerous"])
+
+    def test_parm_variable_eval_allowed(self):
+        # p = node.parm('s'); p.eval() → 变量绑定推导 → 白名单放行
+        code = ("import hou\n"
+                "p = hou.node('/obj/geo1').parm('snippet')\n"
+                "print(p.evalAsString())\n"
+                "print(p.rawValue())")
+        r = cmn.check_execute_code_policy(code, "read-only",
+                                          False, False, False)
+        self.assertTrue(r["allowed"], r)
+        self.assertNotIn("eval 动态执行", r["hits"]["dangerous"])
+
+    def test_parms_loop_eval_allowed(self):
+        # for p in node.parms(): p.eval() → 循环变量推导 → 白名单放行
+        code = ("import hou\n"
+                "for p in hou.node('/obj/geo1').parms():\n"
+                "    print(p.eval())")
+        r = cmn.check_execute_code_policy(code, "read-only",
+                                          False, False, False)
+        self.assertTrue(r["allowed"], r)
+        self.assertNotIn("eval 动态执行", r["hits"]["dangerous"])
+
+    def test_bare_eval_still_intercepted(self):
+        # 裸 eval("1+1") 维持拦截；混合场景（parm.eval + 裸 eval）也拦截
+        code = 'import hou\nx = eval("1 + 1")\ny = hou.node("/obj").parm("t").eval()'
+        r = cmn.check_execute_code_policy(code, "read-only",
+                                          False, False, False)
+        self.assertFalse(r["allowed"])
+        self.assertIn("eval 动态执行", r["hits"]["dangerous"])
+        r2 = cmn.check_execute_code_policy('eval("1 + 1")', "normal",
+                                           False, False, False)
+        self.assertFalse(r2["allowed"])
+        self.assertIn("eval 动态执行", r2["hits"]["dangerous"])
+
+    def test_unprovable_receiver_conservatively_intercepted(self):
+        # 接收者无法静态证明为 hou.Parm（普通变量名）→ 保守拦截
+        code = "v = mystery.eval()"
+        r = cmn.check_execute_code_policy(code, "normal",
+                                          False, False, False)
+        self.assertFalse(r["allowed"])
+        self.assertIn("eval 动态执行", r["hits"]["dangerous"])
 
 
 # ===========================================================================

@@ -1315,7 +1315,10 @@ def knowledge_stats(ctx: Context, scope=None):
 
 @mcp.tool()
 def capture_workflow_snapshot(ctx, node_path=None, include_vex=True,
-                              max_nodes=50, include_hda_internals=False):
+                              max_nodes=50, probe_mode="auto",
+                              include_connected=False,
+                              include_hda_internals=None,
+                              offset=None, limit=None):
     """把用户选中（或 node_path 指定）的节点子网络捕获为结构化工作流快照
     （add-workflow-knowledge-capture，readOnly relay，不修改场景）。
 
@@ -1330,32 +1333,40 @@ def capture_workflow_snapshot(ctx, node_path=None, include_vex=True,
       结构化错误，不静默回退）；指定时捕获以该节点为根的闭包子网络。
     - include_vex: 可选，默认 True；包含 Attribute Wrangle 的 VEX snippet。
     - max_nodes: 可选，默认 50；闭包节点硬上限，超限截断并标记 truncated。
-    - include_hda_internals: 可选，默认 False；True 时满足展开判定的节点
-      内部子网并入同一 BFS 遍历（受同一 max_nodes 预算与 truncated
-      语义）。展开判定（H21 实测收敛）：children() 非空 且（用户资产
-      ——库文件非 $HFS otls；或官方 HDA 带 Editable Nodes 声明——
-      definition().hasSection("EditableNodes")，如 rbdbulletsolver1
-      的 dopnet/forces 子网络；或非 HDA 普通容器 subnet/geo）。
-      官方无声明的封装 HDA（rbdconstraintproperties / rbdconfigure
-      等）默认**不拆解**；官方空壳节点（attribwrangle 等 children
-      恒空）不展开。**不能用 isEditable() 判定**（实例锁定态
-      isEditable False 但 children 完全可读，且大 HDA 上定义比较可能
-      极慢）。研究用户自制 HDA 原理（内部 VEX / 约束 / 子网结构）时
-      启用，并可视需要上调 max_nodes（大资产内部节点多，如 500）。
+    - probe_mode: 可选，默认 auto；分层探测深度：
+      - ``auto``：按节点状态逐层判定——锁定官方 + 有 EditableNodes 声明
+        （如 rbdbulletsolver1 的 dopnet/forces）→ **只探 editable 子树**；
+        解锁实例（isEditable()=true，含解锁官方 HDA 嵌入式定义，如
+        transformpieces1）→ **整棵渗透**；锁定用户数字资产（如
+        csr_voronoi_advanced1）→ **只记节点名**；锁定官方无声明 → 仅参数。
+      - ``expand_all``：全部整棵展开（显式覆盖锁定资产）。
+      - ``editable_only``：只展开 EditableNodes 段路径子树。
+      - ``none``：完全不展开内部。
+      **不能用 isEditable() 判定"children 不可读"**：isEditable() 只用于
+      正向解锁判定（True → 需渗透）；锁定态不代表 children 不可读。
+    - include_connected: 可选，默认 False；True 时沿 inputs/outputs 连线
+      扩展（用剩余预算，强制子树优先；默认只沿 children 方向展开，避免
+      无关子树耗尽预算）。
+    - include_hda_internals: 兼容旧参数；True → probe_mode="auto"，
+      False → probe_mode="none"（显式 probe_mode 优先）。
+    - offset/limit: 可选；完整快照超阈值（512KB）返回精简摘要时，传
+      offset/limit 分页续读全量详情节点（page.total / next_offset）。
 
     返回结构：{status:success, root, node_count, truncated, hip_file,
-    nodes, sticky_notes, connections}，超限截断时 truncated=true；API
-    降级附 _warning。节点表每项含资产级标识 type_full（nameWithCategory，
-    API 缺失降级 type）与 is_hda（**用户数字资产实例**：definition() 非 None
-    且库文件非 $HFS/houdini/otls 内建库——H21 上 attribwrangle 等 HDA 化
-    内建类型也有 definition，纯 definition 判定会误标），hda 字段
-    为 {type_name, version(可选), definition_source: embedded|external}，
-    **绝不输出 library_path 或任何本机路径**（跨机器复现误导源）；顶层
-    hip_file 只取 basename（隐私安全）。快照只含节点表（path/name/type/
-    type_full/is_hda/comment/非默认参数/vex/hda/errors/warnings）+
-    sticky note + 连线，**不含几何数据**，readOnly 不修改场景，纯规则
-    读取**不调用 LLM / 嵌入模型**。错误为 status=error + error={code,
-    message,details}（no_selection / invalid_node_path /
+    nodes, sticky_notes, connections}，超限截断时 truncated=true；超大
+    快照返回 {summary:true, summary_file（全量落盘 basename，**响应不含
+    敏感路径**）, nodes: 精简行}；API 降级附 _warning。节点表每项含资产级
+    标识 type_full（nameWithCategory，API 缺失降级 type）与 is_hda
+    （**用户数字资产实例**：definition() 非 None 且库文件非
+    $HFS/houdini/otls 内建库——H21 上 attribwrangle 等 HDA 化内建类型也
+    有 definition，纯 definition 判定会误标），hda 字段为 {type_name,
+    version(可选), definition_source: embedded|external}，**绝不输出
+    library_path 或任何本机路径**（跨机器复现误导源）；顶层 hip_file 只取
+    basename（隐私安全）。快照只含节点表（path/name/type/type_full/
+    is_hda/comment/非默认参数/vex/hda/errors/warnings）+ sticky note +
+    连线，**不含几何数据**，readOnly 不修改场景，纯规则读取**不调用 LLM /
+    嵌入模型**。错误为 status=error + error={code,message,details}
+    （no_selection / invalid_node_path / invalid_probe_mode /
     selection_read_failed / capture_connection_error）。整体过
     apply_response_cap。
 
@@ -1363,15 +1374,21 @@ def capture_workflow_snapshot(ctx, node_path=None, include_vex=True,
     意图 / 为什么这么搭**，不是节点名与参数的复制粘贴；参数仅在用户要求
     或直接影响复现时收录。正文索引用 type_full / hda 资产标识，实例名仅
     辅助；**禁止本机路径入正文**（HDA 库路径 / hip 完整路径，团队知识库
-    跨机器误导源），资产只用全名 + 版本索引。自制 HDA 先
-    include_hda_internals=True 研究内部原理再组织为 recipe。
+    跨机器误导源），资产只用全名 + 版本索引。分层探测语义：未解锁且有
+    editable nodes 的官方节点只探 editable nodes；解锁节点（含官方）需
+    整棵渗透；锁定自定义 HDA 无专门沉淀时只记节点名。自制 HDA 先
+    probe_mode="auto" 研究内部原理再组织为 recipe。
     """
     try:
         env = _houdini_call("capture_workflow_snapshot", {
             "node_path": node_path,
             "include_vex": include_vex,
             "max_nodes": max_nodes,
+            "probe_mode": probe_mode,
+            "include_connected": include_connected,
             "include_hda_internals": include_hda_internals,
+            "offset": offset,
+            "limit": limit,
         })
         if env.get("status") == "error":
             # 连接层 / 转发层失败（origin=connection / mcp_bridge / houdini）
@@ -1411,7 +1428,10 @@ def save_recipe(ctx, title, problem, symptom, fix, category, severity,
 
     参数说明：
     - title / problem / symptom / fix / category / severity /
-      affected_versions: 必填；title 渲染为块上方 ``> title`` 注释行。
+      affected_versions: 必填；**title/problem/symptom/fix 全部单行存储**
+      （strict parser 的 field 值为单行；校验失败错误信息列出全部受限
+      字段名，可在单行内用中文标点 / 分号压缩长内容）；title 渲染为块
+      上方 ``> title`` 注释行。
     - severity: 必填，recipes severity 合法取值 low / medium / high
       （3 值，与 lesson 的 4 值不同）。
     - verified_versions: 可选；缺省 "unknown"。

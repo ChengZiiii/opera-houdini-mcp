@@ -191,6 +191,58 @@ class TokenizerTests(unittest.TestCase):
         self.assertEqual(lssearch.tokenize(None), [])
         self.assertEqual(lssearch.tokenize(123), [])
 
+    # ---- 无下划线复合词：数字化前缀弱匹配（transformpieces1）----
+
+    def test_compound_alnum_prefix_terms(self):
+        # transformpieces1 → 追加数字化前缀 transformpieces
+        self.assertEqual(lssearch._prefix_terms(["transformpieces1"]),
+                         ["transformpieces"])
+        toks = lssearch.tokenize("transformpieces1")
+        self.assertIn("transformpieces1", toks)
+        self.assertIn("transformpieces", lssearch._prefix_terms(toks))
+        # 无尾部数字 → 不追加；下划线复合词维持完整+拆分，不追加前缀
+        self.assertEqual(lssearch._prefix_terms(["rbdbulletsolver"]), [])
+        self.assertEqual(lssearch._prefix_terms(["csr_voronoi_advanced"]),
+                         [])
+        # 剥离后过短 → 不追加
+        self.assertEqual(lssearch._prefix_terms(["v2"]), [])
+        self.assertEqual(lssearch._prefix_terms([]), [])
+
+
+# ---------------------------------------------------------------------------
+# 复合词前缀检索（无下划线复合词弱匹配 + 不挤占精确命中）
+# ---------------------------------------------------------------------------
+class CompoundPrefixSearchTests(_BaseDirFixture):
+
+    def test_query_prefix_hits_compound_doc(self):
+        # 查询 transformpieces MUST 命中含 transformpieces1 的文档
+        lesson = _make_lesson(
+            id="L-20260802-001",
+            symptom="transformpieces1 节点内部无法拆解分析",
+            fingerprint="a" * 64)
+        self._write_lesson(self._personal(), lesson)
+        env = lssearch.search_lessons("transformpieces")
+        self.assertEqual(env["status"], "success")
+        ids = [r["id"] for r in env["results"]]
+        self.assertIn("L-20260802-001", ids)
+
+    def test_exact_match_outranks_prefix_weak_match(self):
+        # 前缀弱匹配（0.5 tf）不挤占精确 token 命中：含精确词的文档排前
+        weak = _make_lesson(
+            id="L-20260802-001",
+            symptom="transformpieces1 复合词弱匹配",
+            fingerprint="a" * 64)
+        exact = _make_lesson(
+            id="L-20260802-002",
+            symptom="transformpieces 精确词命中",
+            fingerprint="b" * 64)
+        self._write_lesson(self._personal(), weak)
+        self._write_lesson(self._personal(), exact)
+        env = lssearch.search_lessons("transformpieces")
+        self.assertEqual(env["status"], "success")
+        self.assertEqual([r["id"] for r in env["results"]],
+                         ["L-20260802-002", "L-20260802-001"])
+
 
 # ---------------------------------------------------------------------------
 # 新鲜度衰减数学
@@ -613,6 +665,89 @@ class DraftSuggestionCapTests(_BaseDirFixture):
         # count 降序
         counts = [s["count"] for s in suggestions]
         self.assertEqual(counts, sorted(counts, reverse=True))
+
+
+# ---------------------------------------------------------------------------
+# draft 可见性（refine-mcp-knowledge-capture）：新写入 draft 立即可见
+# ---------------------------------------------------------------------------
+class RecentDraftVisibilityTests(_BaseDirFixture):
+
+    def _now_iso(self):
+        return datetime.now().astimezone().isoformat()
+
+    def test_recent_draft_visible_in_suggestions_but_not_results(self):
+        # 新写入 draft（count 0，最近写入）→ draft_suggestions 立即可见；
+        # 正式 results 语义不动（draft 绝不进索引）
+        fresh = _make_lesson(
+            id="L-20260802-001", status="draft",
+            symptom="transformpieces1 前缀检索失败",
+            updated_at=self._now_iso(),
+            fingerprint="a" * 64)
+        self._write_lesson(self._personal(), fresh)
+        env = lssearch.search_lessons("transformpieces")
+        self.assertEqual(env["status"], "success")
+        suggestions = env["draft_suggestions"]
+        self.assertEqual([s["id"] for s in suggestions],
+                         ["L-20260802-001"])
+        self.assertEqual(suggestions[0]["count"], 0)
+        # draft 不进正式 results
+        ids = [r["id"] for r in env["results"]]
+        self.assertNotIn("L-20260802-001", ids)
+
+    def test_old_draft_without_count_not_suggested(self):
+        # 30 天前写入且 count=0 的 draft → 不出现（非最近写入）
+        old = _make_lesson(
+            id="L-20260802-001", status="draft",
+            symptom="old draft symptom",
+            updated_at=_iso_ago(30),
+            fingerprint="a" * 64)
+        self._write_lesson(self._personal(), old)
+        env = lssearch.search_lessons(None)
+        self.assertEqual(env["status"], "success")
+        self.assertEqual(env["draft_suggestions"], [])
+
+    def test_recent_drafts_ranked_by_symptom_relevance_then_recency(self):
+        # 相关度优先（symptom token 与查询重叠），并列按写入时间新→旧
+        related = _make_lesson(
+            id="L-20260802-001", status="draft",
+            symptom="transformpieces1 内部节点",
+            updated_at=self._now_iso(),
+            fingerprint="a" * 64)
+        unrelated = _make_lesson(
+            id="L-20260802-002", status="draft",
+            symptom="完全无关的渲染问题",
+            updated_at=self._now_iso(),
+            fingerprint="b" * 64)
+        self._write_lesson(self._personal(), related)
+        self._write_lesson(self._personal(), unrelated)
+        env = lssearch.search_lessons("transformpieces")
+        suggestions = env["draft_suggestions"]
+        self.assertEqual([s["id"] for s in suggestions],
+                         ["L-20260802-001", "L-20260802-002"])
+
+    def test_count_ge_3_drafts_still_priority(self):
+        # count>=3 的既有 draft 语义不动：仍优先于最近写入的新 draft
+        fresh = _make_lesson(
+            id="L-20260802-001", status="draft",
+            symptom="fresh draft symptom",
+            updated_at=self._now_iso(),
+            fingerprint="a" * 64)
+        frequent = _make_lesson(
+            id="L-20260802-002", status="draft",
+            symptom="frequent draft symptom",
+            updated_at=_iso_ago(10),
+            fingerprint="b" * 64)
+        self._write_lesson(self._personal(), fresh)
+        self._write_lesson(self._personal(), frequent)
+        self._write_inbox(self._personal(), [
+            {"fingerprint": frequent["fingerprint"], "count": 4,
+             "message": "frequent draft symptom"},
+        ])
+        env = lssearch.search_lessons(None)
+        suggestions = env["draft_suggestions"]
+        self.assertEqual([s["id"] for s in suggestions],
+                         ["L-20260802-002", "L-20260802-001"])
+        self.assertEqual(suggestions[0]["count"], 4)
 
 
 # ---------------------------------------------------------------------------

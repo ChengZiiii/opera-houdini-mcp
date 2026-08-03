@@ -38,6 +38,7 @@ import importlib.util
 import json
 import os
 import sys
+import tempfile
 import types
 import unittest
 
@@ -81,10 +82,12 @@ def _import_server_module():
 # fake hou.Node 基建
 # ---------------------------------------------------------------------------
 class _FakeDefinition(object):
-    def __init__(self, library_path, version="", editable_nodes=False):
+    def __init__(self, library_path, version="", editable_nodes=False,
+                 editable_nodes_content=None):
         self._library_path = library_path
         self._version = version
         self._editable_nodes = editable_nodes
+        self._editable_nodes_content = editable_nodes_content
 
     def libraryFilePath(self):
         return self._library_path
@@ -95,6 +98,17 @@ class _FakeDefinition(object):
     def hasSection(self, section):
         # 官方 HDA 的 Editable Nodes 声明（Type Properties 字段）
         return section == "EditableNodes" and self._editable_nodes
+
+    def binaryContents(self, section):
+        # EditableNodes 段内容（UTF-8 多行相对路径，如 "dopnet/forces"）
+        if section != "EditableNodes" or not self._editable_nodes:
+            raise KeyError(section)
+        content = self._editable_nodes_content
+        if content is None:
+            content = "dopnet/forces\n"
+        if isinstance(content, str):
+            return content.encode("utf-8")
+        return content
 
 
 class _FakeNodeType(object):
@@ -130,15 +144,25 @@ class _FakeParmTemplate(object):
 
 
 class _FakeParm(object):
-    def __init__(self, name, value):
+    def __init__(self, name, value, default=None):
         self._name = name
         self._value = value
+        self._default = default
 
     def name(self):
         return self._name
 
     def eval(self):
         return self._value
+
+    def rawValue(self):
+        return self._value
+
+    def isAtDefault(self):
+        # HOM 语义：无默认模板返回 None；有默认时按值对比
+        if self._default is None:
+            return None
+        return self._value == self._default
 
 
 class _FakeStickyNote(object):
@@ -162,9 +186,9 @@ class _FakeNode(object):
                  templates=None, parm_values=None, inputs=None,
                  outputs=None, errors=None, warnings=None,
                  definition=None, sticky_notes=None, children=None,
-                 is_editable=True):
+                 is_editable=True, category="Sop"):
         self._name = name
-        self._type = _FakeNodeType(type_name, "Sop", definition)
+        self._type = _FakeNodeType(type_name, category, definition)
         self._parent = parent
         self._comment = comment
         self._templates = list(templates) if templates else []
@@ -196,11 +220,32 @@ class _FakeNode(object):
 
     def parm(self, name):
         if name in self._parm_values:
-            return _FakeParm(name, self._parm_values[name])
+            default = None
+            for template in self._templates:
+                if template.name() == name:
+                    default = template.defaultValue()
+                    break
+            return _FakeParm(name, self._parm_values[name], default)
         return None
 
     def evalParm(self, name):
         return self._parm_values.get(name)
+
+    def node(self, rel_path):
+        # 模拟 hou.Node.node() 相对路径解析（EditableNodes 段路径定位）
+        current = self
+        for segment in rel_path.split("/"):
+            if not segment:
+                continue
+            found = None
+            for child in current._children:
+                if child.name() == segment:
+                    found = child
+                    break
+            if found is None:
+                return None
+            current = found
+        return current
 
     def inputs(self):
         return list(self._inputs)
@@ -307,7 +352,8 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
             errors=["cook error"], warnings=["slow"],
         )
         self._select([a])
-        result = self._handler().handle_capture_workflow_snapshot()
+        result = self._handler().handle_capture_workflow_snapshot(
+            include_connected=True)
 
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["root"], "selection")
@@ -385,7 +431,7 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
         a = _FakeNode("A", parent=net, inputs=[b])
         self._select([a])
         result = self._handler().handle_capture_workflow_snapshot(
-            max_nodes=2)
+            max_nodes=2, include_connected=True)
         self.assertEqual(result["status"], "success")
         self.assertTrue(result["truncated"])
         self.assertEqual(result["node_count"], 2)
@@ -400,7 +446,8 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
         for i in range(59):
             chain[i]._inputs = [chain[i + 1]]
         self._select([chain[0]])
-        result = self._handler().handle_capture_workflow_snapshot()
+        result = self._handler().handle_capture_workflow_snapshot(
+            include_connected=True)
         self.assertEqual(result["status"], "success")
         self.assertTrue(result["truncated"])
         self.assertEqual(result["node_count"], 50)
@@ -607,7 +654,10 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
 
     # ---- HDA 内部研究（include_hda_internals）----
 
-    def test_hda_internals_not_expanded_by_default(self):
+    def test_hda_internals_expanded_by_default_for_unlocked_user_asset(self):
+        # 新语义（分层探测 auto）：解锁实例（isEditable=True，含用户自制
+        # HDA 与解锁官方）默认整棵渗透；probe_mode="none" /
+        # include_hda_internals=False 显式关闭内部展开。
         net = _FakeNode("net")
         definition = _FakeDefinition("C:/otls/mytool.hda")
         inner = _FakeNode("inner_wrangle", type_name="attribwrangle",
@@ -615,12 +665,23 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
                           parm_values={"snippet": "@P.y += 1;"})
         hda_node = _FakeNode("HDA1", type_name="mysop", parent=net,
                              definition=definition, children=[inner])
+        inner._parent = hda_node
         self._select([hda_node])
         result = self._handler().handle_capture_workflow_snapshot()
         self.assertEqual(result["status"], "success")
-        self.assertEqual(result["node_count"], 1)
+        self.assertEqual(result["node_count"], 2)
         self.assertEqual({n["path"] for n in result["nodes"]},
+                         {"/net/HDA1", "/net/HDA1/inner_wrangle"})
+        # 显式关闭内部展开 → 仅根节点
+        result_none = self._handler().handle_capture_workflow_snapshot(
+            probe_mode="none")
+        self.assertEqual(result_none["node_count"], 1)
+        self.assertEqual({n["path"] for n in result_none["nodes"]},
                          {"/net/HDA1"})
+        # 兼容旧参数 include_hda_internals=False → 同样不展开
+        result_legacy = self._handler().handle_capture_workflow_snapshot(
+            include_hda_internals=False)
+        self.assertEqual(result_legacy["node_count"], 1)
 
     def test_official_locked_hda_without_children_not_expanded(self):
         # H21 实测：官方 OPlib 节点（如 attribwrangle）内容锁定且
@@ -641,11 +702,10 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
         self.assertEqual({n["path"] for n in result["nodes"]},
                          {"/net/official_asset"})
 
-    def test_locked_user_hda_still_expanded(self):
-        # 用户自制 HDA 即使实例锁定（isEditable False，内容与定义一致）
-        # children() 仍完全可读 → 参与分析（实机：csr_voronoi_advanced1
-        # isEditable False 且 children 29；rbdbulletsolver1 isEditable
-        # False 且 children 307——用户反馈"识别不到"的根因）
+    def test_locked_user_hda_not_expanded_without_explicit_override(self):
+        # 新语义（分层探测 auto）：锁定用户数字资产（isEditable False，
+        # 如 csr_voronoi_advanced1）默认**只记节点名**（不展开内部）；
+        # 调用方可传 probe_mode="expand_all" 显式要求展开。
         net = _FakeNode("net")
         definition = _FakeDefinition("C:/otls/mytool.hda")
         inner = _FakeNode("inner_wrangle", type_name="attribwrangle",
@@ -660,7 +720,13 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
             include_hda_internals=True)
         self.assertEqual(result["status"], "success")
         self.assertFalse(result["truncated"])
-        by_path = {n["path"]: n for n in result["nodes"]}
+        self.assertEqual(result["node_count"], 1)
+        self.assertEqual({n["path"] for n in result["nodes"]},
+                         {"/net/HDA1"})
+        # 显式 expand_all → 整棵渗透
+        result_all = self._handler().handle_capture_workflow_snapshot(
+            probe_mode="expand_all")
+        by_path = {n["path"]: n for n in result_all["nodes"]}
         self.assertEqual(set(by_path.keys()),
                          {"/net/HDA1", "/net/HDA1/inner_wrangle"})
 
@@ -709,7 +775,7 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
         official = _FakeNode("rbdconstraintproperties1",
                              type_name="rbdconstraintproperties",
                              parent=net, definition=official_def,
-                             children=[inner])
+                             children=[inner], is_editable=False)
         inner._parent = official
         self._select([official])
         saved_hfs = os.environ.get("HFS")
@@ -728,6 +794,251 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
         self.assertEqual(result["node_count"], 1)
         self.assertEqual({n["path"] for n in result["nodes"]},
                          {"/net/rbdconstraintproperties1"})
+
+    def test_editable_only_probes_forces_subtree_only(self):
+        # 锁定官方 + EditableNodes 声明（内容 "dopnet/forces"）→ 只探
+        # editable 子树：Dop 容器（dopnet）进入、forces 子树完整捕获，
+        # 其余内部网络（solver_internals）不展开（H21 全量 307 节点
+        # 的根因修复）。
+        net = _FakeNode("net")
+        official_def = _FakeDefinition(
+            "C:/PROGRA~1/SIDEEF~1/HOUDIN~1.596/houdini/otls/OPlibDop.hda",
+            editable_nodes=True,
+            editable_nodes_content="dopnet/forces\n")
+        wrangle = _FakeNode("inner_wrangle", type_name="attribwrangle",
+                            parent=net,
+                            parm_values={"snippet": "f@age = 1.0;"})
+        forces = _FakeNode("forces", type_name="forces", parent=net,
+                           category="Dop", children=[wrangle])
+        dopnet = _FakeNode("dopnet", type_name="dopnet", parent=net,
+                           category="Dop", children=[forces])
+        hidden_inner = _FakeNode("hidden_w", type_name="attribwrangle",
+                                 parent=net,
+                                 parm_values={"snippet": "f@x = 2.0;"})
+        solver_internals = _FakeNode("solver_internals", type_name="subnet",
+                                     parent=net, children=[hidden_inner])
+        rbdbulletsolver = _FakeNode(
+            "rbdbulletsolver1", type_name="rbdbulletsolver", parent=net,
+            definition=official_def, is_editable=False,
+            children=[dopnet, solver_internals])
+        wrangle._parent = forces
+        forces._parent = dopnet
+        dopnet._parent = rbdbulletsolver
+        hidden_inner._parent = solver_internals
+        solver_internals._parent = rbdbulletsolver
+        self._select([rbdbulletsolver])
+        result = self._handler().handle_capture_workflow_snapshot(
+            include_hda_internals=True)
+        self.assertEqual(result["status"], "success")
+        self.assertFalse(result["truncated"])
+        by_path = {n["path"]: n for n in result["nodes"]}
+        self.assertEqual(set(by_path.keys()), {
+            "/net/rbdbulletsolver1",
+            "/net/rbdbulletsolver1/dopnet",
+            "/net/rbdbulletsolver1/dopnet/forces",
+            "/net/rbdbulletsolver1/dopnet/forces/inner_wrangle"})
+        # 无关内部网络不进入（只探 editable 子树）
+        self.assertNotIn("/net/rbdbulletsolver1/solver_internals",
+                         by_path)
+        self.assertNotIn("/net/rbdbulletsolver1/solver_internals/"
+                         "hidden_w", by_path)
+        # forces 子树内 wrangle 与外部节点同构产出（VEX）
+        self.assertEqual(
+            by_path["/net/rbdbulletsolver1/dopnet/forces/inner_wrangle"]
+            ["vex"], "f@age = 1.0;")
+
+    def test_unlocked_official_hda_fully_expanded(self):
+        # 解锁官方 HDA（isEditable=True，如 transformpieces1）→ 整棵渗透，
+        # 不因"官方无 EditableNodes 声明"跳过
+        net = _FakeNode("net")
+        official_def = _FakeDefinition(
+            "C:/PROGRA~1/SIDEEF~1/HOUDIN~1.596/houdini/otls/OPlibSop.hda")
+        inner_a = _FakeNode("wrangle_a", type_name="attribwrangle",
+                            parent=net,
+                            parm_values={"snippet": "@P.x += 1.0;"})
+        inner_b = _FakeNode("sub_b", type_name="subnet", parent=net,
+                            children=[])
+        xformpieces = _FakeNode("transformpieces1",
+                                type_name="xformpieces", parent=net,
+                                definition=official_def, is_editable=True,
+                                children=[inner_a, inner_b])
+        inner_a._parent = xformpieces
+        inner_b._parent = xformpieces
+        self._select([xformpieces])
+        result = self._handler().handle_capture_workflow_snapshot(
+            include_hda_internals=True)
+        self.assertEqual(result["status"], "success")
+        self.assertFalse(result["truncated"])
+        by_path = {n["path"]: n for n in result["nodes"]}
+        self.assertEqual(set(by_path.keys()), {
+            "/net/transformpieces1",
+            "/net/transformpieces1/wrangle_a",
+            "/net/transformpieces1/sub_b"})
+        self.assertEqual(
+            by_path["/net/transformpieces1/wrangle_a"]["vex"],
+            "@P.x += 1.0;")
+
+    def test_default_closure_does_not_follow_connections(self):
+        # 默认闭包只沿 children 展开：连线邻居（inputs/outputs）不入队，
+        # include_connected=True 时才扩展（两阶段预算）
+        net = _FakeNode("net")
+        sub = _FakeNode("mysubnet", type_name="subnet", parent=net)
+        sub_inner = _FakeNode("sub_w", type_name="attribwrangle", parent=sub,
+                              parm_values={"snippet": "f@x = 1.0;"})
+        sub._children = [sub_inner]
+        up = _FakeNode("upstream", parent=net)
+        down = _FakeNode("downstream", parent=net)
+        sub._inputs = [up]
+        sub._outputs = [down]
+        self._select([sub])
+        result = self._handler().handle_capture_workflow_snapshot()
+        self.assertEqual(result["status"], "success")
+        self.assertFalse(result["truncated"])
+        self.assertEqual({n["path"] for n in result["nodes"]},
+                         {"/net/mysubnet", "/net/mysubnet/sub_w"})
+        # include_connected=True → 连线邻居进入（用剩余预算）
+        result_conn = self._handler().handle_capture_workflow_snapshot(
+            include_connected=True)
+        self.assertEqual(
+            {n["path"] for n in result_conn["nodes"]},
+            {"/net/mysubnet", "/net/mysubnet/sub_w",
+             "/net/upstream", "/net/downstream"})
+
+    def test_budget_prioritizes_forced_subtree(self):
+        # 预算两阶段：强制子树（EditableNodes 路径）优先完整进入，连接节点
+        # 用剩余预算，不挤占目标子树
+        net = _FakeNode("net")
+        official_def = _FakeDefinition(
+            "C:/PROGRA~1/SIDEEF~1/HOUDIN~1.596/houdini/otls/OPlibDop.hda",
+            editable_nodes=True,
+            editable_nodes_content="dopnet/forces\n")
+        inner = []
+        for i in range(4):
+            inner.append(_FakeNode("inner%02d" % i, type_name="wrangle",
+                                   parent=net))
+        forces = _FakeNode("forces", type_name="forces", parent=net,
+                           category="Dop", children=inner)
+        dopnet = _FakeNode("dopnet", type_name="dopnet", parent=net,
+                           category="Dop", children=[forces])
+        solver = _FakeNode("rbdbulletsolver1", type_name="rbdbulletsolver",
+                           parent=net, definition=official_def,
+                           is_editable=False, children=[dopnet])
+        for node in inner:
+            node._parent = forces
+        forces._parent = dopnet
+        dopnet._parent = solver
+        connected = [_FakeNode("conn%02d" % i, parent=net)
+                     for i in range(6)]
+        for i in range(5):
+            connected[i]._inputs = [connected[i + 1]]
+        solver._inputs = [connected[0]]
+        self._select([solver])
+        result = self._handler().handle_capture_workflow_snapshot(
+            include_hda_internals=True, include_connected=True,
+            max_nodes=10)
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["truncated"])
+        by_path = {n["path"]: n for n in result["nodes"]}
+        # 强制子树完整（根 + dopnet + forces + 4 inner = 7）
+        for expected in ("/net/rbdbulletsolver1",
+                         "/net/rbdbulletsolver1/dopnet",
+                         "/net/rbdbulletsolver1/dopnet/forces",
+                         "/net/rbdbulletsolver1/dopnet/forces/inner00",
+                         "/net/rbdbulletsolver1/dopnet/forces/inner03"):
+            self.assertIn(expected, by_path)
+        # 连接节点用剩余预算（10 - 7 = 3），其余被截断
+        conn_paths = [p for p in by_path if "/net/conn" in p]
+        self.assertEqual(len(conn_paths), 3)
+        self.assertIn("/net/conn00", conn_paths)
+        self.assertIn("/net/conn02", conn_paths)
+
+    def test_summary_and_pagination(self):
+        # 输出摘要/分页：完整 JSON 超阈值 → 精简摘要 + 全量落盘
+        # （summary_file basename，无敏感路径）+ offset/limit 续读全量
+        # 详情节点（page.total / next_offset）
+        net = _FakeNode("net")
+        nodes = []
+        for i in range(5):
+            nodes.append(_FakeNode("N%02d" % i, parent=net,
+                                   comment="x" * 500))
+        for i in range(4):
+            nodes[i]._inputs = [nodes[i + 1]]
+        self._select([nodes[0]])
+        original = self.server_mod._SNAPSHOT_SUMMARY_THRESHOLD
+        self.server_mod._SNAPSHOT_SUMMARY_THRESHOLD = 2048
+        self.addCleanup(
+            setattr, self.server_mod, "_SNAPSHOT_SUMMARY_THRESHOLD",
+            original)
+        result = self._handler().handle_capture_workflow_snapshot(
+            include_connected=True)
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result.get("summary"))
+        # summary_file 只是 basename（不含路径分隔符）
+        summary_file = result.get("summary_file")
+        self.assertTrue(summary_file)
+        self.assertNotIn("/", summary_file)
+        self.assertNotIn("\\", summary_file)
+        # 摘要行：精简字段 + 计数，无详情参数
+        entry = result["nodes"][0]
+        self.assertEqual(set(entry.keys()), {
+            "path", "name", "type", "type_full", "is_hda",
+            "has_vex", "param_count"})
+        self.assertNotIn("params", entry)
+        self.assertEqual(result["node_count"], 5)
+        # 清理落盘文件
+        full_path = os.path.join(
+            tempfile.gettempdir(), summary_file)
+        if os.path.isfile(full_path):
+            os.remove(full_path)
+        # 分页续读：offset/limit 返回全量详情条目
+        page = self._handler().handle_capture_workflow_snapshot(
+            include_connected=True, offset=2, limit=2)
+        self.assertEqual(page["status"], "success")
+        self.assertNotIn("summary", page)
+        self.assertEqual(len(page["nodes"]), 2)
+        self.assertEqual(page["nodes"][0]["path"], "/net/N02")
+        self.assertIn("comment", page["nodes"][0])
+        self.assertEqual(page["page"]["total"], 5)
+        self.assertEqual(page["page"]["next_offset"], 4)
+        last = self._handler().handle_capture_workflow_snapshot(
+            include_connected=True, offset=4, limit=2)
+        self.assertEqual(len(last["nodes"]), 1)
+        self.assertIsNone(last["page"]["next_offset"])
+
+    def test_official_hda_non_default_params_not_empty(self):
+        # 锁定官方 HDA（无 EditableNodes）仅参数：非默认参数必须可靠产出
+        # （与 get_node_info 统一 isAtDefault 语义，修复快照 params 恒空）
+        net = _FakeNode("net")
+        official_def = _FakeDefinition(
+            "C:/PROGRA~1/SIDEEF~1/HOUDIN~1.596/houdini/otls/OPlibSop.hda")
+        official = _FakeNode(
+            "official_asset", type_name="attribwrangle", parent=net,
+            definition=official_def, is_editable=False,
+            templates=[
+                _FakeParmTemplate("scale", 101, 1.0),     # Float 非默认
+                _FakeParmTemplate("size", 101, 1.0),       # Float 默认
+                _FakeParmTemplate("toggle", 104, True),    # Toggle 非默认
+            ],
+            parm_values={"scale": 2.5, "size": 1.0,
+                         "toggle": False})
+        self._select([official])
+        result = self._handler().handle_capture_workflow_snapshot(
+            include_hda_internals=True)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["node_count"], 1)
+        entry = result["nodes"][0]
+        # 官方 HDA 非默认参数非空（size 保持默认被排除）
+        self.assertEqual(entry["params"], {"scale": 2.5, "toggle": False})
+
+    def test_invalid_probe_mode_returns_structured_error(self):
+        net = _FakeNode("net")
+        a = _FakeNode("A", parent=net)
+        self._select([a])
+        result = self._handler().handle_capture_workflow_snapshot(
+            probe_mode="bogus")
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error"]["code"], "invalid_probe_mode")
+        self.assertIn("auto", result["error"]["message"])
 
     def test_plain_network_container_expanded(self):
         # 非 HDA 普通容器（subnet，definition None）+ children 非空 →
@@ -855,7 +1166,7 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
             chain[i]._inputs = [chain[i + 1]]
         self._select([chain[0]])
         result = self._handler().handle_capture_workflow_snapshot(
-            max_nodes=60)
+            max_nodes=60, include_connected=True)
         self.assertEqual(result["status"], "success")
         self.assertIsInstance(result, dict)
         self.assertIn("_truncated", result)
