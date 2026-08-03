@@ -189,7 +189,14 @@ MUTATION_PATTERNS = [
 # Section 4: detection helpers
 # ---------------------------------------------------------------------------
 def _detect_dangerous_code(code):
-    """先正则匹配 DANGEROUS_PATTERNS，再走 AST 别名检测（核心安全要求）。"""
+    """先正则匹配 DANGEROUS_PATTERNS，再走 AST 别名检测（核心安全要求）。
+
+    只读求值白名单：``hou.Parm`` 接收者的 ``eval()`` / ``evalAsString()`` /
+    ``rawValue()`` 调用（静态可证明接收者为参数对象，如
+    ``node.parm('x').eval()`` 或 ``p = node.parm('x'); p.eval()``）**不**
+    命中 "eval 动态执行"；裸 ``eval(`` / ``exec(`` / ``compile(`` 维持拦截；
+    无法静态判定接收者时保守拦截。
+    """
     hits = []
     if not isinstance(code, str):
         return hits
@@ -242,7 +249,97 @@ def _detect_dangerous_code(code):
                             hits.append(
                                 "AST alias: {0} = __import__('{1}')".format(tgt.id, mod)
                             )
+
+    # 只读求值白名单：全部 eval 类调用可静态证明接收者为 hou.Parm 且无裸
+    # eval/exec/compile/__import__ 调用时，移除 "eval 动态执行" 命中。
+    if "eval 动态执行" in hits:
+        unsafe_bare = False
+        eval_calls = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in (
+                    "eval", "exec", "compile", "__import__"):
+                unsafe_bare = True
+            elif isinstance(func, ast.Attribute) and func.attr in (
+                    "eval", "evalAsString", "rawValue"):
+                eval_calls.append(node)
+        parm_like = _parm_like_names(tree)
+        if eval_calls and not unsafe_bare and all(
+                _receiver_is_parm_like(call, parm_like)
+                for call in eval_calls):
+            hits.remove("eval 动态执行")
     return hits
+
+
+def _chain_contains_parm_call(expr):
+    """属性 / 调用链中是否含 ``.parm(`` / ``.parms(`` 调用（hou.Parm 来源）。
+
+    如 ``node.parm('x')``、``hou.node('/obj').parm('s')``；深度受限防深链。
+    """
+    current = expr
+    depth = 0
+    while current is not None and depth < 12:
+        if isinstance(current, ast.Call):
+            func = current.func
+            if isinstance(func, ast.Attribute) and getattr(
+                    func, "attr", "") in ("parm", "parms"):
+                return True
+            current = func
+        elif isinstance(current, ast.Attribute):
+            current = current.value
+        elif isinstance(current, ast.Name):
+            return False
+        else:
+            return False
+        depth += 1
+    return False
+
+
+def _parm_like_names(tree):
+    """静态收集绑定到 hou.Parm 对象的变量名（保守分析）。
+
+    - ``x = <链>.parm('name')`` / ``x = <链>.parms()`` 的赋值目标；
+    - ``for x in <链>.parms()`` 的循环变量。
+    无法证明来源的变量**不**加入集合（后续调用保守拦截）。
+    """
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            if _chain_contains_parm_call(node.value):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name):
+                        names.add(tgt.id)
+        elif isinstance(node, ast.For):
+            if _chain_contains_parm_call(node.iter) and isinstance(
+                    node.target, ast.Name):
+                names.add(node.target.id)
+    return names
+
+
+def _receiver_is_parm_like(call, parm_like):
+    """判定 ``X.eval()`` 类调用的接收者 X 是否可静态证明为 hou.Parm。
+
+    - 接收者链中直接含 ``.parm(`` / ``.parms(`` 调用（如
+      ``node.parm('x').eval()``）→ 可证明；
+    - 接收者根变量名在 ``parm_like`` 集合（由赋值 / 循环推导）→ 可证明；
+    - 其余（含裸 ``eval(...)``）→ 不可证明，保守拦截。
+    """
+    func = call.func
+    if not isinstance(func, ast.Attribute):
+        return False
+    receiver = func.value
+    if _chain_contains_parm_call(receiver):
+        return True
+    root = receiver
+    depth = 0
+    while isinstance(root, ast.Attribute) and depth < 12:
+        root = root.value
+        depth += 1
+    if isinstance(root, ast.Name):
+        return root.id in parm_like
+    return False
 
 
 def _detect_heavy_geometry_code(code):
@@ -642,8 +739,9 @@ def check_execute_code_policy(code, policy, allow_dangerous,
     - normal + heavy + 未 allow → 拒绝
     - privileged + dangerous + 未 allow → 拒绝（即便 bypass ON）
     - privileged + dangerous + allow_dangerous + bypass_enabled → 通过
-    - import hou 在所有 policy 下都被记录到 hits.import_hou；
-      read-only 下额外拒绝（避免 import hou 绕过 mutation 校验）
+    - import hou 在所有 policy 下都被记录到 hits.import_hou；read-only
+      下**允许**（import 本身不构成场景 mutation，只读遍历可用），实际
+      mutation 调用仍被拒绝
     """
     norm_policy = validate_policy(policy)
     dangerous_hits = _detect_dangerous_code(code)
@@ -659,7 +757,8 @@ def check_execute_code_policy(code, policy, allow_dangerous,
         "import_hou": import_hou,
     }
 
-    # read-only 永远禁止 mutation / import hou
+    # read-only 永远禁止 mutation；import hou 放行（只读遍历），dangerous /
+    # heavy 仍双层防御
     if norm_policy == "read-only":
         if mutation_hits:
             return {
@@ -670,14 +769,6 @@ def check_execute_code_policy(code, policy, allow_dangerous,
                 "hits": hits,
                 "policy": norm_policy,
             }
-        if import_hou:
-            return {
-                "allowed": False,
-                "reason": "read-only policy forbids import hou",
-                "hits": hits,
-                "policy": norm_policy,
-            }
-        # 即使 dangerous / heavy，read-only 也拒绝（双层防御）
         if dangerous_hits:
             return {
                 "allowed": False,
