@@ -930,10 +930,11 @@ def _validate_recipe_fields(fields, root_name):
     verified_versions 缺省 "unknown"；severity 必须是 ``RECIPE_SEVERITIES``
     （注意 recipes 与 lesson 的 severity 枚举不同，只有 3 值）；advisory 必须
     为 True（固定 advisory 语义）；source 不接受用户传入（由 ``_agent_source``
-    系统标注）；正文（problem/symptom/fix）必须单行且不以 ``- `` / ``#`` /
-    ``>`` / ``###`` 起始（否则写出的文件无法被 ``parse_best_practices``
-    round-trip）。title 可选（非空 + 单行）。非法抛 ``LessonsError
-    ('ls_write_error')``。
+    系统标注）；**title / problem / symptom / fix 全部必须单行**（strict
+    parser 的 field 值是单行的），校验失败错误信息列出**全部**违规字段
+    （details.fields），不以第一个为限；正文不以 ``- `` / ``#`` / ``>`` /
+    ``###`` 起始（否则写出的文件无法被 ``parse_best_practices`` round-trip）。
+    title 可选（非空 + 单行）。非法抛 ``LessonsError('ls_write_error')``。
     """
     if not isinstance(fields, dict):
         raise LessonsError(
@@ -953,9 +954,8 @@ def _validate_recipe_fields(fields, root_name):
         if not isinstance(title, str) or not title.strip():
             raise LessonsError(
                 "ls_write_error", "title 不得为空", {"field": "title"})
-        if "\n" in title:
-            raise LessonsError(
-                "ls_write_error", "title 必须单行", {"field": "title"})
+        # title 的单行检查并入下方统一收集（与 problem/symptom/fix 一起
+        # 列出全部违规字段，避免只提示其中一个）
         recipe["title"] = title.strip()
 
     for key in ("category", "affected_versions", "problem", "symptom", "fix"):
@@ -996,14 +996,17 @@ def _validate_recipe_fields(fields, root_name):
 
     # source 不接受用户传入：由 save_recipe 按 root 归属用 _agent_source 标注。
 
-    # 所有落盘字段值必须单行（strict parser 的 field 值是单行的）
-    for key in recipe:
-        value = recipe[key]
-        if isinstance(value, str) and "\n" in value:
-            raise LessonsError(
-                "ls_write_error",
-                "{0} 必须单行（recipes 字段值为单行）".format(key),
-                {"field": key})
+    # 所有落盘字段值必须单行（strict parser 的 field 值是单行的）。
+    # title/problem/symptom/fix 均受约束：收集**全部**违规字段（不以第一
+    # 个为限），错误消息与 details.fields 完整列出，避免写入方多行试错。
+    bad_fields = [key for key in recipe
+                  if isinstance(recipe[key], str) and "\n" in recipe[key]]
+    if bad_fields:
+        raise LessonsError(
+            "ls_write_error",
+            "以下字段必须单行（recipes 字段值为单行）：{0}".format(
+                ", ".join(bad_fields)),
+            {"field": bad_fields[0], "fields": bad_fields})
 
     # 正文行前缀安全（否则写出的文件无法 round-trip）
     for key in BODY_FIELDS:
@@ -1147,7 +1150,10 @@ def save_recipe(root_path, fields, recipe_id=None):
 
     两条路径共用：source 由系统标注（个人库 ``"agent"``，团队 root
     ``"agent@<用户名>"``）；advisory 固定 true；verified_versions 缺省
-    ``"unknown"``。title 可选：仅用于校验、首块 ``> title`` 注释行渲染
+    ``"unknown"``。**title/problem/symptom/fix 均单行存储**（strict parser
+    的 field 值为单行）；校验失败错误信息列出全部受限字段名，允许在单行内
+    用中文标点 / 分号压缩长内容。title 可选：仅用于校验、首块 ``> title``
+    注释行渲染
     （title 仅供调用方自行使用/汇报）；追加到已有块的文件时 title 不落盘
     （strict parser 只允许首个 heading 前的 ``>`` 行，块间仅允许
     ``- field`` 行与空行；9 字段 schema 无 title 字段）。文件缺失/为空 →

@@ -8,7 +8,9 @@
 - 仅依赖 Python 标准库（R4 零新增 pip），不在顶层 import ``hou``。
 - tokenizer：复用 ``_rag.tokenize``（hou API / 节点路径 token），并补充中文
   CJK 连续串的 2-gram shingles（如 ``渲染失败`` → ``渲染失败/渲染/染失/失败``），
-  单字 CJK 保留自身。
+  单字 CJK 保留自身；无下划线字母数字复合词（``transformpieces1``）追加
+  「数字化前缀」弱匹配 token（``transformpieces``，索引侧 0.5 权重，不挤占
+  精确命中——查询 ``transformpieces`` 可命中含 ``transformpieces1`` 的文档）。
 - per-root 独立 BM25（Okapi k1=1.5、b=0.75、+1 平滑 IDF），索引 JSON 缓存落在
   ``_lessons.cache_index_dir(root_name)/index.v1.json``：schema-versioned、
   source_sig（lessons/*.md + recipes/BEST_PRACTICES.md 的 mtime_ns+size）校验，
@@ -26,7 +28,9 @@
   （affected_versions 子串），组合 AND。
 - hint：lesson 结果其 fingerprint 在 inbox 累计 count>=3 → ``hint`` 字段
   （"已踩 N 次，请补充 fix"）；顶层 ``draft_suggestions`` 列出 count>=3 的
-  draft 骨架。inbox 读取复用 ``_lessons._read_inbox`` / ``_record_count``。
+  draft 骨架，并追加最近 ``RECENT_DRAFT_DAYS`` 天内写入的 draft（symptom
+  相关度 + 写入时间），新 draft 写入后立即可见（正式 results 语义不动）。
+  inbox 读取复用 ``_lessons._read_inbox`` / ``_record_count``。
 - envelope：``{status, query, top_k, matched, returned_count, truncated,
   results, _warning?, draft_suggestions}``；``returned_count`` 恒等于
   ``len(results)``，整体过 ``apply_response_cap``（defense-in-depth）后重新
@@ -82,7 +86,9 @@ except ImportError:
 # 常量与 schema
 # ---------------------------------------------------------------------------
 SCHEMA_NAME = "houdinimcp.lessons-search"
-SCHEMA_VERSION = 1
+# v2：postings tf 支持 float（数字化前缀弱匹配 token 按 0.5 权重计数）；
+# 旧 v1 缓存自动失效重建。
+SCHEMA_VERSION = 2
 
 INDEX_FILENAME = "index.v1.json"
 RECIPES_RELPATH = os.path.join("recipes", "BEST_PRACTICES.md")
@@ -106,6 +112,11 @@ SUMMARY_MAX = 200            # symptom / fix 摘要截断字符数
 DEFAULT_MAX_BYTES = 16384
 
 DRAFT_SUGGESTIONS_MAX = 5       # draft_suggestions 最多返回条数
+
+# 数字化前缀弱匹配 token 的最短长度（与 tokenizer 短词阈值一致）
+_PREFIX_MIN_LEN = 2
+# 最近写入的 draft 计入可见性（天）；symptom 与 query 相关度 + 写入时间
+RECENT_DRAFT_DAYS = 7.0
 
 HINT_THRESHOLD = 3           # inbox 同 fingerprint 累计 >= 3 → hint / draft 建议
 HINT_TEXT = "已踩 {0} 次，请补充 fix"
@@ -142,7 +153,9 @@ def tokenize(text):
     """把文本切分为稳定小写 token 列表（_rag.tokenize + CJK shingles）。
 
     中文连续串（如 ``渲染失败``）同时产出整串与 2-gram（渲染/染失/失败），
-    便于与文档侧同一 tokenizer 产出的 postings 对齐。
+    便于与文档侧同一 tokenizer 产出的 postings 对齐。数字化前缀弱匹配
+    （``transformpieces1`` → ``transformpieces``）由 ``_prefix_terms``
+    单独产出（0.5 权重，不挤占精确 token 命中），本函数只出精确 token。
     """
     if not isinstance(text, str):
         return []
@@ -153,6 +166,34 @@ def tokenize(text):
     if _rag is not None:
         tokens.extend(_rag.tokenize(remainder))
     return tokens
+
+
+def _strip_trailing_digits(tok):
+    """去掉 token 尾部的数字（transformpieces1 → transformpieces）。"""
+    end = len(tok)
+    while end > 0 and tok[end - 1].isdigit():
+        end -= 1
+    return tok[:end]
+
+
+def _prefix_terms(tokens):
+    """无下划线字母数字复合词的「数字化前缀」弱匹配 token。
+
+    如 ``transformpieces1`` → 追加 ``transformpieces``：查询
+    ``transformpieces`` 可前缀命中含 ``transformpieces1`` 的文档。剥离
+    纯数字尾巴后与原文相同（如 ``rbdbulletsolver``）或过短 → 不追加；
+    下划线复合词（``csr_voronoi_advanced``）维持"完整 + 拆分"双路匹配，
+    不追加前缀。索引侧按 0.5 权重计数（弱匹配维度，不挤占精确命中）。
+    """
+    out = []
+    for tok in tokens:
+        if "_" in tok:
+            continue
+        stripped = _strip_trailing_digits(tok)
+        if not stripped or stripped == tok or len(stripped) < _PREFIX_MIN_LEN:
+            continue
+        out.append(stripped)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -311,10 +352,16 @@ def _build_root_index(root_path, root_name):
     total_len = 0
     for doc in docs:
         toks = tokenize(doc["search_text"])
-        doc["length"] = len(toks)
-        total_len += len(toks)
+        prefix = _prefix_terms(toks)
+        doc["length"] = len(toks) + len(prefix)
+        total_len += doc["length"]
         for tok, tf in Counter(toks).items():
             postings.setdefault(tok, {})[doc["id"]] = tf
+        # 数字化前缀弱匹配 token：tf 按 0.5 权重计数（弱匹配维度，不与
+        # 精确 token 命中同权；与同文档精确 token 叠加时取和）
+        for tok, tf in Counter(prefix).items():
+            posting = postings.setdefault(tok, {})
+            posting[doc["id"]] = posting.get(doc["id"], 0.0) + 0.5 * tf
     avgdl = (float(total_len) / len(docs)) if docs else 0.0
     index = {
         "docs": docs,
@@ -426,7 +473,9 @@ def _validate_cached(raw_text, sig):
         for doc_id, tf in plist.items():
             if doc_id not in doc_ids:
                 return None
-            if isinstance(tf, bool) or not isinstance(tf, int) or tf < 0:
+            # tf 支持 int（精确 token）与 float（数字化前缀弱匹配 0.5 权重）
+            if isinstance(tf, bool) or not isinstance(tf, (int, float)) \
+                    or tf < 0:
                 return None
     return {"docs": docs, "postings": postings,
             "avgdl": avgdl, "document_count": doc_count}
@@ -632,28 +681,61 @@ def _inbox_fingerprint_counts(root_path):
     return counts
 
 
-def _draft_suggestions(root_path, root_name):
-    """count>=3 的 draft 骨架列表 [{id, root, count, symptom}]。
+def _draft_suggestions(root_path, root_name, query_str=None, q_tokens=None):
+    """draft 骨架建议列表（最多 ``DRAFT_SUGGESTIONS_MAX`` 条）。
 
-    count 降序（并列按 id 升序），最多 ``DRAFT_SUGGESTIONS_MAX`` 条；
-    symptom 与摘要一致截断到 ``SUMMARY_MAX`` 字符，避免全量正文泄漏。
+    既有语义：inbox 同 fingerprint count>=3 的 draft 优先（count 降序，
+    并列按 id 升序），最多 5 条。**新增可见性**：最近 ``RECENT_DRAFT_DAYS``
+    天内写入的 draft（含新写入、count<3）按 symptom 与 query 的相关度 +
+    写入时间追加，保证新 draft 写入后从检索侧立即可感知；正式 ``results``
+    语义不动（draft 仍绝不进索引）。symptom 与摘要一致截断到
+    ``SUMMARY_MAX`` 字符，避免全量正文泄漏。
     """
     lessons, _errors = _lessons.load_root_lessons(root_path)
     counts = _inbox_fingerprint_counts(root_path)
-    suggestions = []
+    # 查询词集：精确 token + 数字化前缀弱匹配（transformpieces1 ↔
+    # transformpieces 相互相关）
+    q_terms = set(q_tokens or []) | set(_prefix_terms(q_tokens or []))
+    priority = []
+    recent = []
+    now = datetime.now().astimezone()
     for lesson in lessons:
         if lesson["status"] != "draft":
             continue
         fp = lesson.get("fingerprint")
         count = counts.get(fp, 0)
+        entry = {
+            "id": lesson["id"],
+            "root": root_name,
+            "count": count,
+            "symptom": _truncate(lesson.get("symptom", ""), SUMMARY_MAX),
+        }
         if count >= HINT_THRESHOLD:
-            suggestions.append({
-                "id": lesson["id"],
-                "root": root_name,
-                "count": count,
-                "symptom": _truncate(lesson.get("symptom", ""), SUMMARY_MAX),
-            })
-    suggestions.sort(key=lambda item: (-item["count"], item["id"]))
+            priority.append(entry)
+            continue
+        # 最近写入的 draft：按 symptom 相关度 + 写入时间排序
+        updated_at = lesson.get("updated_at")
+        age_days = None
+        if isinstance(updated_at, str):
+            try:
+                parsed = datetime.fromisoformat(updated_at)
+            except ValueError:
+                parsed = None
+            if parsed is not None and parsed.tzinfo is not None:
+                age_days = (now - parsed).total_seconds() / 86400.0
+        if age_days is None or age_days > RECENT_DRAFT_DAYS:
+            continue
+        symptom_terms = set(tokenize(entry["symptom"]))
+        symptom_terms |= set(_prefix_terms(list(symptom_terms)))
+        relevance = len(q_terms & symptom_terms)
+        recent.append((relevance, age_days, lesson["id"], entry))
+    recent.sort(key=lambda item: (-item[0], item[1], item[2]))
+    priority.sort(key=lambda item: (-item["count"], item["id"]))
+    suggestions = list(priority)
+    for _relevance, _age, _lesson_id, entry in recent:
+        if len(suggestions) >= DRAFT_SUGGESTIONS_MAX:
+            break
+        suggestions.append(entry)
     return suggestions[:DRAFT_SUGGESTIONS_MAX]
 
 
@@ -773,7 +855,8 @@ def search_lessons(query=None, category=None, severity=None, node_type=None,
             desc, _root_source_sig(root_path))
         warnings.extend(root_warnings)
         fp_counts = _inbox_fingerprint_counts(root_path)
-        draft_suggestions.extend(_draft_suggestions(root_path, name))
+        draft_suggestions.extend(_draft_suggestions(
+            root_path, name, query_str=query_str, q_tokens=q_tokens))
         for score, doc in _score_root(index, q_tokens, query_str, desc,
                                       category, severity, node_type,
                                       houdini_version):
