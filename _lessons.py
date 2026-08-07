@@ -28,11 +28,14 @@ BM25 检索与 bridge 工具注册由后续 agent 基于本模块的公开 API �
   **永不抛异常**。count >= 3 自动生成 draft 骨架（category unclassified /
   severity medium / source inbox-auto，symptom 已知、problem/fix 为空）。
 - registry（``config.json``）：只声明**额外**团队 root；personal root
-  自动发现、永不进 registry、永远可写。path 只接受 ``${VAR}`` 占位符或
-  相对路径（相对 base dir），裸绝对路径（盘符 / 前导 ``/`` / UNC）被拒绝。
-  占位符未定义 → state ``unconfigured``（静默跳过，单机模式）；已定义但
-  目录不可读 → state ``unavailable``（由 bridge 层据此加 ``_warning``）；
-  两者均不影响 personal。非法 root 逐项报错并跳过。
+  自动发现、永不进 registry、永远可写。path 接受三种形式：``${VAR}``
+  占位符、相对路径（相对 base dir）、绝对路径（盘符 / 前导 ``/`` / UNC /
+  前导 ``\\``，支持团队协作各成员 NAS 盘符不同的本机配置场景——
+  config.json 是本机配置，每台机器各一份，无跨机器误导）。占位符未定义
+  → state ``unconfigured``（静默跳过，单机模式）；已定义占位符但目录不可读、
+  或绝对/相对路径指向的目录不存在 → state ``unavailable``（由 bridge 层
+  据此加 ``_warning``）；上述降级均不影响 personal。含 ``${`` 但非纯占位符
+  的混合形式（如 ``${VAR}/sub``）仍拒绝。非法 root 逐项报错并跳过。
 - writability 门禁：registry 声明 ``writable=false`` 的 root 上
   ``save_lesson`` 返回结构化错误 ``root_not_writable``，零写入。
 - recipes（``recipes/BEST_PRACTICES.md``）：``save_recipe`` 以 ``### BP-NNN``
@@ -1421,16 +1424,22 @@ def _looks_absolute(path):
 
 
 def _validate_registry_path(raw_path):
-    """校验 registry path：只接受 ${VAR} 占位符或相对路径。
+    """校验 registry path：接受 ``${VAR}`` 占位符、相对路径或绝对路径。
 
-    返回 None（合法）或错误消息（含提示用户改用 ${VAR} / 相对路径）。
-    含 ``${`` 但非纯占位符（如 ``${TEAM}/sub``）同样拒绝。
+    返回 None（合法）或错误消息。三种合法形式：
+    - ``${VAR}`` 纯占位符 → 接受（resolve 时若 env 未定义则 unconfigured）；
+    - 相对路径（相对 base dir）→ 接受；
+    - 绝对路径（盘符 / 前导 ``/`` / UNC / 前导 ``\\``）→ 接受
+      （config.json 是本机配置，各成员 NAS 盘符不同各自指定，无跨机器误导）。
+
+    含 ``${`` 但非纯占位符的形式（如 ``${VAR}/sub``）仍拒绝——避免引入
+    "占位符部分解析 + 字面后缀拼接"的半解析复杂度；NAS 场景已由绝对路径覆盖。
     """
     if _PLACEHOLDER_RE.match(raw_path):
         return None
-    if "${" in raw_path or _looks_absolute(raw_path):
-        return ("root path 必须是 ${{VAR}} 环境占位符或相对路径（相对 "
-                "{0}），裸绝对路径被拒绝: {1!r}").format(_base_dir(), raw_path)
+    if "${" in raw_path:
+        return ("root path 含 ${{}} 但非纯占位符（如 ${{VAR}}/sub），混合形式"
+                "不支持；请用纯 ${{VAR}}、相对路径或绝对路径: {0!r}").format(raw_path)
     return None
 
 
@@ -1521,8 +1530,10 @@ def resolve_roots():
     ``ok | unconfigured | unavailable``：
     - personal：自动发现，path=base/knowledge，priority=1.0，writable=True，
       state 恒为 ok；
-    - 注册 root：相对路径对 base dir 解析；${VAR} 未定义 → state=
-      ``unconfigured``、path=None（单机模式静默跳过）；已定义但目录不可读
+    - 注册 root：path 三种形式分别解析——
+      ``${VAR}`` 未定义 → state=``unconfigured``、path=None（单机模式静默跳过）；
+      相对路径 → 对 base dir 解析；绝对路径 → 直接使用原值（不拼 base）。
+      已解析路径目录不存在（绝对/相对）或占位符已定义但目录不可读
       → state=``unavailable``（bridge 层据此加 ``_warning``）。
     非法声明（path 格式 / priority / writable 等）已被 ``load_registry``
     排除，不出现在本列表。
@@ -1550,6 +1561,9 @@ def resolve_roots():
                 })
                 continue
             resolved_path = env_value
+        elif _looks_absolute(raw_path):
+            # 绝对路径直接使用，不拼 base（config.json 本机配置，各成员盘符不同）
+            resolved_path = raw_path
         else:
             resolved_path = os.path.join(base, raw_path)
         resolved_path = os.path.abspath(os.path.normpath(resolved_path))

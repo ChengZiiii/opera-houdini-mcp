@@ -205,14 +205,28 @@ draft 骨架并在检索时提示「已踩 N 次，请补充 fix」）。
 └── cache/index/<root-name>/ # 各 root BM25 索引缓存
 ```
 
-**团队库注册**（`config.json`，可选）：路径只接受 `${VAR}` 环境占位符或相对路径
-（相对 `~/.opera-houdini-mcp/`），拒绝裸绝对路径；`writable` 默认 `false`（AI 只读，
-晋升人工把关）；占位符未定义 → `unconfigured` 静默跳过，路径不可达 → `unavailable`
-跳过并附 `_warning`，均不影响个人库。
+**团队库注册**（`config.json`，可选）：`path` 接受三种形式——`${VAR}` 环境占位符、
+相对路径（相对 `~/.opera-houdini-mcp/`）、或**绝对路径**（Windows 盘符 `C:\` / `C:/`、
+POSIX 前导 `/`、UNC `\\server\share`、前导 `\`）。绝对路径支持团队协作中各成员 NAS
+映射盘符不同的场景——`config.json` 是本机配置（位于 `~/.opera-houdini-mcp/`，每台
+机器各一份），各成员各自写自己盘符的绝对路径即可，无需统一环境变量，无跨机器误导。
+`writable` 默认 `false`（AI 只读，晋升人工把关）；占位符未定义 → `unconfigured`
+静默跳过，路径不可达（绝对/相对路径指向的目录不存在、或占位符已定义但目录不可读）
+→ `unavailable` 跳过并附 `_warning`，均不影响个人库。含 `${` 但非纯占位符的混合
+形式（如 `${VAR}/sub`）仍被拒绝。
 
 ```json
 [
   { "name": "team_knowledge", "path": "${TEAM_SHARE}/houdini/knowledge", "priority": 0.8, "writable": false }
+]
+```
+
+团队协作 NAS 示例（各成员盘符不同，各自在**本机** `config.json` 写绝对路径；同事若
+把同一 NAS 映射到其他盘符，则改成自己的盘符即可）：
+
+```json
+[
+  { "name": "team_knowledge", "path": "Z:\\team\\houdini\\knowledge", "priority": 0.8, "writable": false }
 ]
 ```
 

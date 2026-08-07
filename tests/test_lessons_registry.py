@@ -4,8 +4,9 @@ root 白名单 / 可写门禁）。
 覆盖（对应 OpenSpec delta）：
 - 2.1：config.json 只声明额外 root；personal 自动发现且永不出现在 registry；
   默认 priority 0.5 / writable false；personal 名保留。
-- 2.2：path 只接受 ${VAR} 占位符或相对路径；裸绝对路径（盘符 / 前导斜杠 / UNC）
-  被拒绝并提示；registry 逐 root 报错、非法 root 跳过。
+- 2.2：path 接受 ${VAR} 占位符 / 相对路径 / 绝对路径三种形式；含 ${ 但非纯
+  占位符的混合形式（${VAR}/sub）被拒绝并提示；registry 逐 root 报错、非法
+  root 跳过。
 - 2.3：占位符未定义 → unconfigured；已定义但目录不可读 → unavailable；
   均不影响 personal；resolve_roots / resolve_root_for_read / resolve_root_for_write。
 - 2.4：normalize_root_name 拒绝任意路径，只认注册 root 名或 personal。
@@ -144,20 +145,67 @@ class RegistryPathValidationTests(_BaseDirFixture):
         if message_fragment:
             self.assertIn(message_fragment, errors["badroot"])
 
-    def test_windows_drive_absolute_rejected(self):
-        self._assert_skipped_with_error(r"C:\team\share", "${VAR}")
+    def _assert_path_accepted(self, path):
+        """绝对/相对路径被接受：root 进入 resolve_roots，state ∈ {ok, unavailable}。
 
-    def test_posix_leading_slash_rejected(self):
-        self._assert_skipped_with_error("/team/share", "${VAR}")
+        不再被校验器跳过；state 取决于目录是否真实存在（本机路径 mkdir 成功
+        → ok，系统级路径通常不可创建 → unavailable，均符合契约）。
+        """
+        self._write_config([{"name": "badroot", "path": path}])
+        _loaded, errors = _lessons.load_registry()
+        self.assertNotIn("badroot", errors)
+        found = [d for d in _lessons.resolve_roots() if d["name"] == "badroot"]
+        self.assertEqual(len(found), 1)
+        self.assertIn(found[0]["state"], ("ok", "unavailable"))
+        return found[0]
 
-    def test_unc_absolute_rejected(self):
-        self._assert_skipped_with_error(r"\\server\share", "${VAR}")
+    def test_windows_drive_absolute_accepted(self):
+        # 盘符绝对路径（C:\...）现在被接受
+        self._assert_path_accepted(r"C:\team\share")
 
-    def test_single_backslash_rejected(self):
-        self._assert_skipped_with_error(r"\team", "${VAR}")
+    def test_posix_leading_slash_accepted(self):
+        # POSIX 前导 / 现在被接受
+        self._assert_path_accepted("/team/share")
+
+    def test_unc_absolute_accepted(self):
+        # UNC（\\server\share）现在被接受
+        self._assert_path_accepted(r"\\server\share")
+
+    def test_single_backslash_accepted(self):
+        # 前导 \ 现在被接受
+        self._assert_path_accepted(r"\team")
 
     def test_mixed_placeholder_with_suffix_rejected(self):
+        # 含 ${ 但非纯占位符的混合形式仍被拒绝
         self._assert_skipped_with_error("${TEAM}/sub", "${VAR}")
+
+    def test_absolute_path_resolves_directly(self):
+        # 绝对路径直接使用，不与 base 拼接：用一个独立于 base 的绝对路径证明
+        with tempfile.TemporaryDirectory() as outside:
+            abs_dir = os.path.join(outside, "team_nas")
+            os.makedirs(abs_dir)
+            self._write_config([{"name": "absroot", "path": abs_dir}])
+            desc = [d for d in _lessons.resolve_roots()
+                    if d["name"] == "absroot"][0]
+            # 目录存在 → ok
+            self.assertEqual(desc["state"], "ok")
+            # resolved 必须等于原绝对路径的规范化，而非 base 下的子目录
+            self.assertEqual(
+                desc["path"], os.path.abspath(os.path.normpath(abs_dir)))
+
+    def test_absolute_path_missing_dir_is_unavailable(self):
+        # 绝对路径指向不存在的目录 → unavailable，但不影响 personal
+        missing = os.path.join(self.base, "no_such_drive_dir")
+        self.assertFalse(os.path.exists(missing))
+        self._write_config([{"name": "absroot", "path": missing}])
+        roots = _lessons.resolve_roots()
+        desc = [d for d in roots if d["name"] == "absroot"][0]
+        self.assertEqual(desc["state"], "unavailable")
+        self.assertEqual(
+            desc["path"], os.path.abspath(os.path.normpath(missing)))
+        # personal 不受影响
+        self.assertEqual(
+            [d for d in roots if d["name"] == "personal"][0]["state"], "ok")
 
     def test_invalid_priority_rejected(self):
         for bad in ("high", 1.5, -0.1):
