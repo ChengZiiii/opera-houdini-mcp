@@ -366,15 +366,34 @@ class QueryAndCountTests(unittest.TestCase):
             bp.query_best_practices(self.entries, bp_id="BP-999"), [])
 
     def test_cap_truncation_and_counts(self):
+        # 极紧预算（fix-mcp-help-cap-protocol 契约）：200 字节连 per-field
+        # 截断元数据都装不下 → apply_response_cap 按降级路径返回
+        # metadata-only envelope（response_too_large），绝不返回未封顶原数据。
         env = bp.get_best_practices(
             path=self.path, max_bytes=200, response_cap_fn=None)
-        # 200 字节装不下完整 recipe → 截断
-        self.assertEqual(env["status"], "success")
-        self.assertEqual(env["matched_count"], 1)
+        self.assertEqual(env["status"], "error")
+        self.assertEqual(env["error"]["code"], "response_too_large")
+        self.assertIn("_original_size_bytes", env)
+        self.assertGreater(env["_original_size_bytes"], 200)
+        # 降级后 practices 归空、returned_count 与列表长度对齐
+        self.assertEqual(env["practices"], [])
         self.assertEqual(env["returned_count"], len(env["practices"]))
-        self.assertLessEqual(env["returned_count"], env["matched_count"])
-        if env["returned_count"] < env["matched_count"]:
-            self.assertEqual(env["truncated"], True)
+
+        # 中等预算（>=1000）：success + 截断路径不变，count 不失真。
+        # 单条 fixture 整体放得下（无截断），构造 8 条 recipe 复现截断。
+        block = VALID_RECIPE.split("# title\n\n> intro\n\n", 1)[1]
+        text = "# kb\n\n" + "".join(
+            block.replace("BP-001", "BP-{0:03d}".format(i))
+                 .replace("the problem", "problem {0}".format(i))
+            for i in range(1, 9))
+        multi_path = _write(self.tmp.name, "bp_multi.md", text)
+        env2 = bp.get_best_practices(
+            path=multi_path, max_bytes=1000, response_cap_fn=None)
+        self.assertEqual(env2["status"], "success")
+        self.assertEqual(env2["matched_count"], 8)
+        self.assertEqual(env2["returned_count"], len(env2["practices"]))
+        self.assertLess(env2["returned_count"], env2["matched_count"])
+        self.assertEqual(env2["truncated"], True)
 
     def test_cap_no_truncation_when_fits(self):
         env = bp.get_best_practices(path=self.path, max_bytes=100000)
