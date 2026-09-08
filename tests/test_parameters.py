@@ -174,18 +174,41 @@ class _FakeMenuParmTemplate(_FakeFloatParmTemplate):
         self._menu_labels = list(menu_labels)
 
 
+class _FakeFolderParmTemplate(object):
+    """folder template stub：记录 name 与 kind（find-or-create 判定用）。"""
+
+    def __init__(self, name, label, folder_type=None):
+        self._name = name
+        self._label = label
+        self._kind = "folder"
+
+    def name(self):
+        return self._name
+
+
+class _FakeFolderType(object):
+    Simple = "simple"
+
+
 class _FakeParmTemplateGroup(object):
-    """group.append(name, tpl) / group.appendToFolder(folder, tpl) 记录。"""
+    """group.append / appendToFolder / find 记录（folder find-or-create）。"""
 
     def __init__(self):
         self.appended = []
         self.folder_appended = []
+        self._folders = {}
 
     def append(self, tpl):
+        name = getattr(tpl, "_name", None)
+        if name is not None and getattr(tpl, "_kind", "") == "folder":
+            self._folders[name] = tpl
         self.appended.append(tpl)
 
     def appendToFolder(self, folder, tpl):
         self.folder_appended.append((folder, tpl))
+
+    def find(self, name):
+        return self._folders.get(name)
 
 
 class _FakeNode(object):
@@ -262,6 +285,8 @@ class _FakeHou(object):
         self.StringParmTemplate = _FakeStringParmTemplate
         self.ToggleParmTemplate = _FakeToggleParmTemplate
         self.MenuParmTemplate = _FakeMenuParmTemplate
+        self.FolderParmTemplate = _FakeFolderParmTemplate
+        self.folderType = _FakeFolderType
 
     def add_node(self, path, node):
         self._nodes[path] = node
@@ -469,6 +494,8 @@ class CreateSpareParameterTests(unittest.TestCase):
         self.assertEqual(tpl._menu_labels, ["AAA", "BBB", "CCC"])
 
     def test_create_spare_with_folder_uses_appendToFolder(self):
+        # fix-mcp-h21-api-parity #4：folder 不存在时 find-or-create——
+        # 先 append FolderParmTemplate 再 appendToFolder。
         _parameters.create_spare_parameter(
             self.hou, "/obj/n", "myFloat", "float",
             folder="MyFolder",
@@ -476,6 +503,19 @@ class CreateSpareParameterTests(unittest.TestCase):
         self.assertEqual(len(self.node._ptg.folder_appended), 1)
         folder, _tpl = self.node._ptg.folder_appended[0]
         self.assertEqual(folder, "MyFolder")
+        folder_tpls = [t for t in self.node._ptg.appended
+                       if getattr(t, "_kind", "") == "folder"]
+        self.assertEqual(len(folder_tpls), 1)
+        self.assertEqual(folder_tpls[0].name(), "MyFolder")
+        # 第二次往同 folder 追加：不重复建 folder
+        _parameters.create_spare_parameter(
+            self.hou, "/obj/n", "myFloat2", "float",
+            folder="MyFolder",
+        )
+        folder_tpls2 = [t for t in self.node._ptg.appended
+                        if getattr(t, "_kind", "") == "folder"]
+        self.assertEqual(len(folder_tpls2), 1)
+        self.assertEqual(len(self.node._ptg.folder_appended), 2)
 
     def test_create_spare_invalid_data_type_raises(self):
         with self.assertRaises(ValueError):
@@ -541,6 +581,11 @@ class CreateSpareParametersTests(unittest.TestCase):
         self.assertEqual(len(self.node._ptg.folder_appended), 2)
         for folder, _ in self.node._ptg.folder_appended:
             self.assertEqual(folder, "Settings")
+        # find-or-create：folder template 只建一次
+        folder_tpls = [t for t in self.node._ptg.appended
+                       if getattr(t, "_kind", "") == "folder"]
+        self.assertEqual(len(folder_tpls), 1)
+        self.assertEqual(folder_tpls[0].name(), "Settings")
 
 
 # ===========================================================================

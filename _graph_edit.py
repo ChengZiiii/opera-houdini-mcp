@@ -435,32 +435,41 @@ def reorder_inputs(hou, node_path, new_order):
     if node is None:
         raise ValueError(u"节点不存在: {0}".format(node_path))
 
-    # 收集当前所有已连接输入 (input_index, output_node, output_index)
-    current = []
-    for conn in node.inputConnectors():
-        current.append((conn.input_index, conn.output_node,
-                        getattr(conn, "output_index", 0)))
+    # 收集当前所有已连接输入 {input_index: (source_node, output_index)}。
+    # H21 实测 inputConnectors() 返回 tuple-of-tuple（外层按输入索引，
+    # 内层是该索引的连接列表，元素为 hou.NodeConnection）。对**输入**
+    # 连接，源节点是 inputNode()（outputNode() 返回连接的输出端即节点
+    # 自身，用它会造成自连接；与 _node_info._collect_input_connectors
+    # 的消费方式一致），outputIndex() 是源节点的输出索引。
+    current = {}
+    for input_index, connections in enumerate(node.inputConnectors()):
+        for connection in connections:
+            try:
+                source = connection.inputNode()
+            except Exception:
+                continue
+            if source is None:
+                continue
+            try:
+                output_index = connection.outputIndex()
+            except Exception:
+                output_index = 0
+            current[input_index] = (source, output_index)
 
-    old_order = sorted(idx for idx, _, _ in current)
+    old_order = sorted(current)
 
-    # 全部断开
-    for idx, _, _ in current:
+    # 全部断开。倒序（大 index 先）：multi-input 节点（merge 等）断开
+    # 输入时槽会收缩前移，正序断开会让后续连接滑进未处理的槽位。
+    for idx in reversed(old_order):
         node.setInput(idx, None)
 
     # 按 new_order 重连：new_order[i] 是 old input index，要放到新位置 i
     for new_idx, old_idx in enumerate(new_order):
-        src_node = None
-        src_out = 0
-        found = False
-        for idx, candidate, out_idx in current:
-            if idx == old_idx:
-                src_node = candidate
-                src_out = out_idx
-                found = True
-                break
-        if not found:
+        entry = current.get(old_idx)
+        if entry is None:
             # old_idx 没在 current 中（可能原本就没连接），跳过
             continue
+        src_node, src_out = entry
         node.setInput(new_idx, src_node, src_out)
 
     return {

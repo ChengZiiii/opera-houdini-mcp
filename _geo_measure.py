@@ -864,9 +864,11 @@ def set_detail_attrib(hou, node_path, name, value,
         try:
             new_node = parent.createNode("attribcreate",
                                           node_name=node_name)
-            # H21 attribcreate SOP parm 命名：``class1``、``name1``、
-            # ``type1``、``value1v1..v4``、``string1``、``size1``、
-            # ``writevalues1``（与 H20 / H22 兼容）。
+            # H21.0.596 实测 attribcreate SOP parm 命名（fix-mcp-h21-api-parity
+            # §0.1 探针）：``class1``、``name1``、``type1``、``size1``、
+            # ``writevalues1``、``string1``、``value1v1..value1v4``。
+            # （numattr multiparm 第一个 slot 全部带 "1" 后缀；value 分量
+            # 组件名是 value1vN，不是 value1x/valuex。）
             class_parm = new_node.parm("class1")
             name_parm = new_node.parm("name1")
             type_parm = new_node.parm("type1")
@@ -874,13 +876,14 @@ def set_detail_attrib(hou, node_path, name, value,
                     or type_parm is None):
                 raise RuntimeError(
                     "attribcreate parms missing (class1/name1/type1)")
-            # class1: 0=detail, 1=prim, 2=point, 3=vertex
+            # class1 menu: detail=0, primitive=1, point=2, vertex=3
             class_parm.set(0)
             name_parm.set(name)
-            # type1 menu 实际数据映射（H21.0.596 实测）：
-            # 0=float, 1=int, 2=vector（size>1）, 3=string,
-            # 4-6=*array, 7+=dict/dictarray（与设计 _VALID_DETAIL_TYPES
-            # 一一对应）。
+            # type1 menu 实测（H21.0.596）：tokens = [float, int, vector,
+            # index, floatarray, intarray, stringarray, dict, dictarray]，
+            # labels = [Float, Integer, Vector, String, ...]。注意 index 3
+            # 的 token 是 'index'（旧名）而 label 是 String，因此按 menu
+            # index set 而非 token set。
             type_map = {"float": 0, "int": 1, "vector": 2, "string": 3}
             type_parm.set(type_map[attrib_type])
             # writevalues1 必须打开，否则 value 不写入。

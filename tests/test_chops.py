@@ -195,8 +195,40 @@ class _ChopNetParent(object):
         return child
 
 
+class _ParmTemplate(object):
+    """hou.ParmTemplate mock：numComponents 等于所属 tuple 分量数
+    （H21.0.596 实测：组件的 template 是整个 tuple 的 template）。"""
+
+    def __init__(self, num_components):
+        self._num_components = num_components
+
+    def numComponents(self):
+        return self._num_components
+
+
+class _ParmTuple(object):
+    """hou.ParmTuple mock：len() 即分量数，组件经 [i] 访问。"""
+
+    def __init__(self, name, parms):
+        self._name = name
+        self._parms = list(parms)
+
+    def name(self):
+        return self._name
+
+    def __len__(self):
+        return len(self._parms)
+
+    def __getitem__(self, index):
+        return self._parms[index]
+
+
 class _Parm(object):
-    """hou.Parm mock；scalar numeric + expression/keyframe 状态。"""
+    """hou.Parm mock；scalar numeric + expression/keyframe 状态。
+
+    H21 真机：hou.Parm 无 numComponents 属性；分量数经
+    parmTemplate().numComponents()（等于所属 tuple 分量数）。
+    """
 
     def __init__(self, name="tx", num_components=1, expression=None,
                  keyframes=()):
@@ -209,8 +241,8 @@ class _Parm(object):
     def name(self):
         return self._name
 
-    def numComponents(self):
-        return self._num_components
+    def parmTemplate(self):
+        return _ParmTemplate(self._num_components)
 
     def expression(self):
         return self._expression
@@ -224,17 +256,21 @@ class _Parm(object):
 
 
 class _TargetNode(object):
-    """目标节点 mock；parm(name) -> _Parm。"""
+    """目标节点 mock；parm(name) -> _Parm，parmTuple(name) -> _ParmTuple。"""
 
-    def __init__(self, path="/obj/geo1", parms=None):
+    def __init__(self, path="/obj/geo1", parms=None, tuples=None):
         self._path = path
         self._parms = parms or {}
+        self._tuples = tuples or {}
 
     def path(self):
         return self._path
 
     def parm(self, name):
         return self._parms.get(name)
+
+    def parmTuple(self, name):
+        return self._tuples.get(name)
 
 
 class _ExprLanguage(object):
@@ -587,13 +623,23 @@ class ChopsExportTests(unittest.TestCase):
         chop = _ChopNode("/ch/src3", clip=_Clip(
             [_Track("tx", [1.0])], sample_range=(0, 0)))
         hou.register("/ch/src3", chop)
-        vector_parm = _Parm("p", num_components=3)
-        target = _TargetNode("/obj/vec", {"p": vector_parm})
+        # H21 真机语义：向量整组名（'p'）经 parmTuple() 解析为多分量
+        # tuple → 守门拒绝；组件 template 的 numComponents()==len(tuple)。
+        vector_tuple = _ParmTuple("p", [
+            _Parm("px", num_components=3),
+            _Parm("py", num_components=3),
+            _Parm("pz", num_components=3)])
+        target = _TargetNode(
+            "/obj/vec", {"px": _Parm("px")}, tuples={"p": vector_tuple})
         hou.register("/obj/vec", target)
         result = self.chops.export_chop_to_parm(
             hou, "/ch/src3", "tx", "/obj/vec", "p")
+        self.assertEqual(result["status"], "error")
         self.assertEqual(result["error"]["code"], "parm_not_scalar")
-        self.assertEqual(len(vector_parm.set_calls), 0)
+        self.assertEqual(result["num_components"], 3)
+        # 整组拒绝时不得触碰任何组件（无写入副作用）
+        for comp in vector_tuple:
+            self.assertEqual(len(comp.set_calls), 0)
 
     def test_export_rejects_missing_target_parm(self):
         hou, _, _, _, _ = _make_hou()

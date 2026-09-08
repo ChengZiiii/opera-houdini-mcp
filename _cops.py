@@ -5,9 +5,12 @@
 - 仅支持 H21+ Copernicus ``hou.CopNode``；旧 ``/img`` COP2 节点一律返回
   ``unsupported_legacy_cop2``，绝不调用旧 COP2 pixel-plane 类 API 或虚构方法。
 - 读取统一走官方入口 ``geometry``/``geometryAtFrame``、``layer``/
-  ``layerAtFrame``、``vdb``/``vdbAtFrame``、``cable``/``cableAtFrame``、
-  ``inputDataTypes``/``outputDataTypes``/``outputCableStructure``；cable
-  wire 枚举只读 ``hasattr`` 实测确认存在的属性（反射式探针），不猜方法名。
+  ``layerAtFrame``、``vdb``/``vdbAtFrame``（``*AtFrame`` 实测签名
+  ``(frame, output_index=0)``）、``inputDataTypes``/``outputDataTypes``/
+  ``outputCableStructure``。H21.0.596 实测 CopNode **没有**
+  ``cable()``/``cableAtFrame()`` 方法；代码中同名 fallback 仅作 getattr
+  探测（不存在即跳过），wire 信息以 ``outputCableStructure`` 的
+  ``wireCount()/wireName(i)/wireDataType(i)`` 枚举为准。
 - geometry/layer/VDB 只返回有界 metadata、counts、bbox、统计；绝不回传完整
   几何、原始像素或体素。
 - 读取可能触发 COP cook；响应中披露 ``cook_errors`` / ``cook_warnings``。
@@ -258,13 +261,17 @@ def _cook_report(node):
 def _call_output_entry(node, base_name, at_frame_name, output_index, frame):
     """优先调官方 frame 变体；缺失时退回 base；都不存在返 (None, entry_name)。
 
+    H21 实测 ``*AtFrame`` 签名是 ``(frame, output_index=0)`` —— frame 在
+    前（fix-mcp-h21-api-parity #8：旧实参顺序 ``(output_index, frame)`` 会
+    静默得到 None，如 ``layerAtFrame(0, 1)`` 实测返回 None）。
+
     返回 (value, used_entry_name)；used_entry_name 用于响应中披露实际入口。
     """
     if frame is not None:
         method = getattr(node, at_frame_name, None)
         if callable(method):
             try:
-                return method(output_index, frame), at_frame_name
+                return method(frame, output_index), at_frame_name
             except Exception:
                 return None, at_frame_name
     method = getattr(node, base_name, None)
@@ -336,9 +343,12 @@ def _cable_metadata(cable):
 
 
 def _cable_structure(node, output_index=0):
-    """读 outputCableStructure(output_index)；反射枚举 wire 名/类型，不调虚构方法。
+    """读 outputCableStructure(output_index) 并按 wireCount 枚举 wire。
 
-    H21 真实签名要求 output_index；缺失时回退无参形式以兼容旧假设。
+    H21 实测 ``CopCableStructure`` **不可迭代**（list() 抛 TypeError），唯一
+    枚举面是 ``wireCount()`` / ``wireName(i)`` / ``wireDataType(i)`` /
+    ``appearanceIndex(i)``（fix-mcp-h21-api-parity #8 实机探针确认）。
+    保留 dict 兼容分支供 mock / 未来版本。
     """
     getter = getattr(node, "outputCableStructure", None)
     if not callable(getter):
@@ -354,7 +364,28 @@ def _cable_structure(node, output_index=0):
     if structure is None:
         return {"available": False, "wires": []}
     wires = []
-    # structure 可能是 dict {name: type}、list of tuple 或 list of wire 对象。
+    # 优先 H21 真实 surface：wireCount/wireName/wireDataType 枚举。
+    count_getter = getattr(structure, "wireCount", None)
+    if callable(count_getter):
+        try:
+            count = int(count_getter())
+        except Exception:
+            count = None
+        if count is not None:
+            for i in range(min(count, _MAX_FIELD_ITEMS)):
+                wire_name = ""
+                wire_type = ""
+                try:
+                    wire_name = str(structure.wireName(i))
+                except Exception:
+                    wire_name = ""
+                try:
+                    wire_type = str(structure.wireDataType(i))
+                except Exception:
+                    wire_type = ""
+                wires.append({"name": wire_name, "type": wire_type})
+            return {"available": True, "wires": wires}
+    # 兼容分支：dict {name: type} 或可迭代 pair 序列（mock / 未来版本）。
     if isinstance(structure, dict):
         for name in sorted(structure, key=lambda item: str(item)):
             wires.append({
@@ -518,7 +549,8 @@ def _select_wire_payload(node, output_index, frame, want, primary_base,
     """先试官方入口 (layer/vdb)，缺失时反射 cable 按 wire 类型选 ImageLayer/NanoVDB。
 
     want: image / vdb。返回 (payload, entry_name, fallback_used)。
-    cable wire 枚举只读 hasattr 确认存在的属性，不调虚构方法。
+    H21 实测 CopNode 无 ``cable()``/``cableAtFrame()``，此 cable fallback
+    走 getattr 探测（不存在即返回 None），真实命中面是官方 layer/vdb 入口。
     """
     value, entry = _call_output_entry(
         node, primary_base, primary_at_frame, output_index, frame)
@@ -545,8 +577,9 @@ def _select_wire_payload(node, output_index, frame, want, primary_base,
 def get_cop_info(hou, node_path):
     """返回 Copernicus 节点的 input/output data types、cable structure 与 metadata。
 
-    读取 ``inputDataTypes``/``outputDataTypes``/``outputCableStructure`` 与
-    每个 output 的 ``cable()``；cable wire surface 由反射探针如实汇报。
+    读取 ``inputDataTypes``/``outputDataTypes``/``outputCableStructure``；
+    H21 实测 CopNode 无 ``cable()`` 方法，outputs[].cable_available 如实
+    反映 getattr 探测结果（通常 False）。wire 枚举见 ``_cable_structure``。
     响应经过 ``apply_response_cap``。
     """
     node, kind, error = _resolve_cop_node(hou, node_path)

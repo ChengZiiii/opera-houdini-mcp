@@ -34,17 +34,21 @@ _MAX_HANDLES = 256
 _DEFAULT_TIMEOUT = 300
 _POLL_INTERVAL = 0.1
 
-# cook state 名归一化后判定 terminal 的 token 集合。cook 进入 cooked
-# （hou.topCookState.Cooked，即成功完成）/failed/canceled 即视为完成；
-# 其余（cooking/uncooked/空/未知）继续轮询，由 timeout 兜底。仅显式列举
-# 已知终态，避免把未知态误判为完成。
-_TERMINAL_STATE_TOKENS = frozenset((
-    "cooked", "success", "succeeded", "failed", "failure",
-    "canceled", "cancelled", "complete", "completed",
+# 非终态 cook state 白名单（fix-mcp-h21-api-parity #7）：H21.0.596 实测
+# hou.topCookState 枚举 = Uncooked/Cooking/Cooked/Failed/Warning/Waiting/
+# Incomplete，其中取消 / 告警的 cook 落 Warning（无 Canceled）。此前用
+# 显式终态集合会把 Warning/Incomplete 误判为"未完成"，blocking 轮询耗尽
+# timeout。改为非终态白名单：uncooked/cooking/waiting 之外的任意状态
+# （含空/未知——空态保守按非终态处理，由 timeout 兜底）一律视为终态。
+_NONTERMINAL_STATE_TOKENS = frozenset((
+    "uncooked", "cooking", "waiting", "",
 ))
 
-# pdg.workItemState 序号 -> 状态名（Houdini 公开枚举，H18+ 稳定）。
-# hou.TopNode.workItemStates() 返回按此序号索引的计数 tuple（非 dict）。
+# pdg.workItemState 序号 -> 状态名（H21.0.596 实测 dir(pdg.workItemState)
+# 按 int 值排序 = Undefined/Uncooked/Waiting/Scheduled/Cooking/
+# CookedSuccess/CookedCache/CookedFail/CookedCancel/Dirty，共 10 项）。
+# hou.TopNode.workItemStates() 返回该序号索引的计数 tuple，且末位是
+# 全部 work item 总数（文档明示）——长度为 len(enum)+1=11。
 _WORK_ITEM_STATE_ORDINALS = (
     "undefined",     # 0
     "uncooked",      # 1
@@ -56,7 +60,6 @@ _WORK_ITEM_STATE_ORDINALS = (
     "cookedfail",    # 7
     "cookedcancel",  # 8
     "dirty",         # 9
-    "unknown",       # 10
 )
 
 # 进程内有界 cook handle registry。cook_id -> entry(dict)。
@@ -175,7 +178,8 @@ def _state_name(state):
 
 
 def _is_terminal(state_name):
-    return state_name in _TERMINAL_STATE_TOKENS
+    """非终态白名单判定：uncooked/cooking/waiting（含空）之外一律终态。"""
+    return state_name not in _NONTERMINAL_STATE_TOKENS
 
 
 def _probe_state(hou, node):
@@ -242,6 +246,13 @@ def _work_item_states(node):
 
     # tuple/list of int：按 pdg.workItemState 序号索引。
     if all(isinstance(x, int) and not isinstance(x, bool) for x in sequence):
+        # H21 文档：workItemStates() 末位是全部 work item 总数
+        # （fix-mcp-h21-api-parity #7：此前把它并入 'unknown' 计数导致
+        # total 翻倍）。长度 == 枚举数 + 1 时剥离末位作 total。
+        declared_total = None
+        if len(sequence) == len(_WORK_ITEM_STATE_ORDINALS) + 1:
+            declared_total = _safe_count(sequence[-1])
+            sequence = sequence[:-1]
         for index, count in enumerate(sequence):
             value = _safe_count(count)
             if value <= 0:
@@ -252,6 +263,8 @@ def _work_item_states(node):
                 label = "state_{0}".format(index)
             counts[label] = counts.get(label, 0) + value
             total += value
+        if declared_total is not None and declared_total >= total:
+            total = declared_total
         return counts, total
 
     # 兼容 (state, count) 对序列 / dict 元素。

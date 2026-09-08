@@ -82,15 +82,25 @@ class _DopObject(object):
 
 
 class _Relationship(object):
-    def __init__(self, name, objects):
+    """H21 真实形状（fix-mcp-h21-api-parity #10）：DopRelationship 无
+    objects() 方法；成员存放在 ObjInGroup/ObjInAffectors records 的
+    objid 字段，名字经 simulation.objects()[objid].name() 反查。"""
+
+    def __init__(self, name, members):
         self._name = name
-        self._objects = tuple(objects)
+        self._members = list(members)
 
     def name(self):
         return self._name
 
-    def objects(self):
-        return self._objects
+    def recordTypes(self):
+        return ("Options", "ObjInGroup", "ObjInAffectors")
+
+    def records(self, record_type):
+        if record_type == "ObjInGroup":
+            return tuple(_Record({"objid": m.objid()})
+                         for m in self._members)
+        return ()
 
 
 class _RelationshipRecordOnly(object):
@@ -102,10 +112,11 @@ class _RelationshipRecordOnly(object):
         return ("Options", "ObjInGroup", "ObjInAffectors")
 
     def records(self, record_type):
+        # 真机 record 只有 objid（无 objname）
         if record_type == "ObjInGroup":
-            return (_Record({"objname": "obj0", "objid": 0}),)
+            return (_Record({"objid": 0}),)
         if record_type == "ObjInAffectors":
-            return (_Record({"objname": "gravity", "objid": 1}),)
+            return (_Record({"objid": 1}),)
         return ()
 
 
@@ -334,6 +345,8 @@ class DopsQueryTests(unittest.TestCase):
 
     def test_h21_relationship_record_members_are_bounded(self):
         hou = _Hou()
+        # objid 反查需要 simulation.objects() 覆盖两个 id
+        hou.sim._objects.append(_DopObject(name="gravity", objid=1))
         hou.sim._relationships = [_RelationshipRecordOnly()]
         result = self.dops.get_dop_relationships(
             hou, "/obj/dopnet1", max_objects=10)

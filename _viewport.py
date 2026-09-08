@@ -35,22 +35,32 @@ _GEOMETRY_VIEWPORT_TYPE_MAP = {
 }
 
 
+# H21.0.596 实测 hou.displaySetType 真实成员：CurrentModel / DisplayModel /
+# GhostObject / SceneObject / SelectedObject / TemplateModel（fix-mcp-h21-
+# api-parity #5；旧表的 Main/Object/Stereo/Material/Compositing 均不存在）。
 _DISPLAY_SET_MAP = {
-    "main": "Main",
-    "object": "Object",
-    "scene": "Scene",
-    "stereo": "Stereo",
-    "material": "Material",
-    "compositing": "Compositing",
+    "current_model": "CurrentModel",
+    "display_model": "DisplayModel",
+    "ghost": "GhostObject",
+    "scene": "SceneObject",
+    "selected": "SelectedObject",
+    "template": "TemplateModel",
 }
 
 
+# H21.0.596 实测 hou.glShadingType 真实成员（hou.shadingMode 不存在）。
 _SHADED_MODE_MAP = {
-    "wireframe": "Wireframe",
-    "wire_shade": "WireShade",
-    "shaded": "Shaded",
-    "ghost": "Ghost",
-    "hidden_line": "HiddenLine",
+    "wireframe": "Wire",
+    "wire_shade": "SmoothWire",
+    "shaded": "Smooth",
+    "flat": "Flat",
+    "flat_wire": "FlatWire",
+    "matcap": "MatCap",
+    "matcap_wire": "MatCapWire",
+    "wire_bbox": "WireBoundingBox",
+    "shaded_bbox": "ShadedBoundingBox",
+    "wire_ghost": "WireGhost",
+    "hidden_line_ghost": "HiddenLineGhost",
 }
 
 
@@ -130,6 +140,7 @@ def get_viewport_info(hou):
         "shaded_mode": "",
         "hydra_renderer": "",
     }
+    warnings = []
     if viewport is not None:
         try:
             camera_node = viewport.camera()
@@ -146,23 +157,34 @@ def get_viewport_info(hou):
         try:
             settings = viewport.settings()
             if settings is not None:
-                display_set = settings.displaySet()
+                # H21 实测 settings.displaySet(settype) 必须显式传参；
+                # SceneObject 是常规几何显示集。异常不静默：置 _warning。
+                display_set = settings.displaySet(
+                    hou.displaySetType.SceneObject)
                 if display_set is not None:
-                    info["display_set"] = str(display_set).split(".")[-1].lower()
-                try:
-                    info["shaded_mode"] = str(
-                        display_set.shadedMode()).split(".")[-1].lower()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                    info["display_set"] = "scene"
+                    try:
+                        info["shaded_mode"] = str(
+                            display_set.shadedMode()).split(".")[-1].lower()
+                    except Exception as error:
+                        warnings.append(
+                            "shadedMode() unavailable: {0}".format(error))
+        except Exception as error:
+            warnings.append(
+                "displaySet(SceneObject) unavailable: {0}".format(error))
     if _is_lop_context(hou):
         try:
             current = scene_viewer.currentHydraRenderer()
             if current:
                 info["hydra_renderer"] = str(current)
-        except Exception:
-            pass
+        except Exception as error:
+            warnings.append(
+                "currentHydraRenderer() unavailable: {0}".format(error))
+    if warnings:
+        info["_warning"] = {
+            "code": "viewport_info_partial",
+            "message": "; ".join(warnings),
+        }
     return info
 
 
@@ -207,10 +229,12 @@ def set_viewport_display(hou, display_set, shaded_mode):
                 "message": "shaded_mode must be one of: " +
                 ", ".join(sorted(_SHADED_MODE_MAP))}
     display_set_enum = getattr(hou.displaySetType, set_attr_name, None)
-    shaded_mode_enum = getattr(hou.shadingMode, mode_attr_name, None)
+    # H21 实测着色模式枚举是 hou.glShadingType（hou.shadingMode 不存在）。
+    shaded_mode_enum = getattr(hou.glShadingType, mode_attr_name, None)
     if display_set_enum is None or shaded_mode_enum is None:
         return {"status": "error", "error": "enum_unavailable",
-                "message": "Houdini version missing displaySetType/shadingMode enum"}
+                "message": "Houdini version missing displaySetType/"
+                           "glShadingType enum"}
     try:
         viewport.settings().displaySet(display_set_enum).setShadedMode(
             shaded_mode_enum)

@@ -571,15 +571,34 @@ def get_dop_field(hou, dop_path, object_name, data_name, field_name,
     return _cap(result)
 
 
-def _relationship_record_names(relationship, record_type, max_objects):
-    """读取 H21 DopRelationship ObjInGroup/ObjInAffectors records。"""
+def _relationship_record_names(simulation, relationship, record_type,
+                               max_objects):
+    """读取 H21 DopRelationship ObjInGroup/ObjInAffectors 成员对象名。
+
+    H21 实测（fix-mcp-h21-api-parity #10）：relationship record 只有
+    ``objid`` 字段（int，无 ``objname``）；成员名须经
+    ``simulation.objects()[objid].name()`` 反查。objid 越界 / 反查失败
+    时回退 ``str(objid)`` 如实汇报。
+    """
+    objects = None
+    try:
+        objects = list(simulation.objects() or ())
+    except Exception:
+        objects = None
     names = []
     for record in _records(relationship, record_type):
-        value = _record_field(record, "objname", "")
-        if value in (None, "", "unavailable"):
-            value = _record_field(record, "name", "")
-        if value not in (None, "", "unavailable"):
-            names.append(str(value))
+        objid = _record_field(record, "objid", None)
+        if objid in (None, "", "unavailable"):
+            continue
+        name = None
+        if isinstance(objid, int) and not isinstance(objid, bool):
+            if objects is not None and 0 <= objid < len(objects):
+                name = _name_of(objects[objid])
+            if not name:
+                name = str(objid)
+        else:
+            name = str(objid)
+        names.append(name)
         if len(names) >= max_objects:
             break
     return names
@@ -604,26 +623,20 @@ def get_dop_relationships(hou, dop_path, offset=0, limit=100,
         page = relationships[safe_offset:safe_offset + safe_limit]
         entries = []
         for relationship in page:
-            object_getter = getattr(relationship, "objects", None)
-            try:
-                objects = list(object_getter() or ()) \
-                    if callable(object_getter) else []
-            except Exception:
-                objects = []
-            direct_names = [_name_of(item)
-                            for item in objects[:safe_max_objects]]
+            # fix-mcp-h21-api-parity #10：H21 DopRelationship 无 objects()
+            # 方法（旧直接枚举分支为死代码，已删）；成员一律经
+            # ObjInGroup/ObjInAffectors record 的 objid 字段反查。
             group_names = _relationship_record_names(
-                relationship, "ObjInGroup", safe_max_objects)
+                simulation, relationship, "ObjInGroup", safe_max_objects)
             affector_names = _relationship_record_names(
-                relationship, "ObjInAffectors", safe_max_objects)
+                simulation, relationship, "ObjInAffectors", safe_max_objects)
             combined = []
-            for name in direct_names + group_names + affector_names:
+            for name in group_names + affector_names:
                 if name and name not in combined:
                     combined.append(name)
                 if len(combined) >= safe_max_objects:
                     break
-            member_count = max(
-                len(objects), len(group_names) + len(affector_names))
+            member_count = len(group_names) + len(affector_names)
             entries.append({
                 "name": _name_of(relationship),
                 "objects": combined,

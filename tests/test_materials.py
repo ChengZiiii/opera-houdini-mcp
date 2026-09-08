@@ -278,15 +278,18 @@ class CreateMaterialTests(unittest.TestCase):
         self.assertIn("metallic", result["parameters_set"])
 
     def test_parameters_missing_parm_skipped_no_error(self):
-        """A non-existent parm name must be skipped silently, not raise."""
+        """A non-existent parm name must be skipped, not raise.
+
+        fix-mcp-h21-api-parity #13：跳过项进 parameters_skipped，
+        parameters_set 只收真实写入成功的 key。
+        """
         hou = _make_hou()
         result = mat_mod.create_material(
             hou, "principledshader", name="skipMat",
             parameters={"does_not_exist": 1.0, "rough": 0.5})
-        # Existing one applied; missing one appears in parameters_set but is
-        # silently skipped — verify no exception and known parm took effect.
         self.assertIn("rough", result["parameters_set"])
-        self.assertIn("does_not_exist", result["parameters_set"])
+        self.assertNotIn("does_not_exist", result["parameters_set"])
+        self.assertIn("does_not_exist", result["parameters_skipped"])
 
     def test_empty_parameters_no_error(self):
         hou = _make_hou()

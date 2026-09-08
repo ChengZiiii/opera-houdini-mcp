@@ -281,7 +281,7 @@ def _build_hou_with_definition(definition, library_path,
                                 loaded_files=None):
     """Build a _FakeHou whose ``Sop/<name>`` resolves to ``definition``."""
     nt = _FakeNodeType(definition, category=category, name=name)
-    cat = _FakeCategory(category, {"%s/%s" % (category, name): nt})
+    cat = _FakeCategory(category, {name: nt})
     hou = _FakeHou(categories={category: cat})
     if loaded_files is None:
         loaded_files = [library_path]
@@ -399,13 +399,13 @@ class TestHdaGet(unittest.TestCase):
             min_inputs=1, max_inputs=4)
         # category routing via hou.nodeTypeCategories()
         nt = _FakeNodeType(definition)
-        cat = _FakeCategory("Sop", {"Sop/box": nt})
+        cat = _FakeCategory("Sop", {"box": nt})
         hou = _FakeHou(categories={"Sop": cat})
         result = _hda.hda_get(hou, "Sop/box")
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["node_type"], "Sop/box")
         self.assertEqual(result["category"], "Sop")
-        self.assertEqual(result["version"], 2)
+        self.assertEqual(result["version"], "2")
         self.assertEqual(result["description"], "Box SOP")
         self.assertEqual(result["min_num_inputs"], 1)
         self.assertEqual(result["max_num_inputs"], 4)
@@ -419,9 +419,9 @@ class TestHdaGet(unittest.TestCase):
         nt_other = _FakeNodeType(definition)
         nt_other._category = "Object"
         cat_sop = _FakeCategory(
-            "Sop", {"Sop/box": nt})
+            "Sop", {"box": nt})
         cat_obj = _FakeCategory(
-            "Object", {"Object/box": nt_other})
+            "Object", {"box": nt_other})
         hou = _FakeHou(categories={"Sop": cat_sop, "Object": cat_obj})
         # bare 'box' has no category -> invalid
         r1 = _hda.hda_get(hou, "box")
@@ -575,7 +575,7 @@ class TestSectionWriteAllowlist(unittest.TestCase):
         self.definition = _FakeDefinition(
             sections={}, library_path=self.tmp_path)
         nt = _FakeNodeType(self.definition)
-        self.cat = _FakeCategory("Sop", {"Sop/box": nt})
+        self.cat = _FakeCategory("Sop", {"box": nt})
         self.hou = _FakeHou(categories={"Sop": self.cat})
 
     def tearDown(self):
@@ -662,7 +662,7 @@ class TestSectionContentPagination(unittest.TestCase):
         self.definition = _FakeDefinition(
             sections={}, library_path=self.tmp_path)
         nt = _FakeNodeType(self.definition)
-        self.cat = _FakeCategory("Sop", {"Sop/box": nt})
+        self.cat = _FakeCategory("Sop", {"box": nt})
         self.hou = _FakeHou(categories={"Sop": self.cat})
 
     def tearDown(self):

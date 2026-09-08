@@ -174,13 +174,19 @@ def _category_from_node_type(raw):
 def _resolve_node_type(hou, node_type):
     """把 ``node_type`` 解析为 ``hou.NodeType``；不接受短名称。
 
-    解析顺序：
-    1) ``hou.nodeTypeCategories()`` 中精确匹配 ``category/base``。
-    2) 若 category 不存在或 base 在该 category 中未注册（H21 刚
-       ``createDigitalAsset`` 后的 HDA 可能只在 ``loadedFiles`` 中
-       而尚未在 ``nodeTypeCategories`` 注册），回退扫描
-       ``loadedFiles`` + ``definitionsInFile``，按 ``nodeType().
-       nameWithCategory()`` 精确匹配。
+    H21 实测（fix-mcp-h21-api-parity #9）：``category.nodeTypes()`` 的 key
+    **无 category 前缀**（如 ``"box"``、``"filecache::2.0"``）。解析顺序：
+
+    1) ``hou.nodeTypeCategories()`` 中先按 remainder 全名（含 ``::version``
+       限定符，如 ``Sop/filecache::2.0`` → ``filecache::2.0``）精确匹配；
+       未限定版本时按 base 名（``filecache``）收集，唯一命中直接返回，
+       多版本并存（如 ``filecache`` 与 ``filecache::2.0``）报
+       ``ambiguous_node_type``。
+    2) 若 category 不存在或 Step1 未命中（H21 刚 ``createDigitalAsset``
+       后的 HDA 可能只在 ``loadedFiles`` 中而尚未在 ``nodeTypeCategories``
+       注册），回退扫描 ``loadedFiles`` + ``definitionsInFile``，按
+       ``nodeType().nameWithCategory()`` 以相同"全名精确 / base 唯一"规则
+       匹配。
 
     Returns:
         tuple: ``(node_type_obj, error_dict)``；任一成功时
@@ -197,8 +203,36 @@ def _resolve_node_type(hou, node_type):
                              "node_type must be a full nameWithCategory() "
                              "such as 'Sop/box'; got %r" % raw,
                              {"field": "node_type", "value": raw})
-    target_full = "%s/%s" % (category, base)
-    # Step 1: ``nodeTypeCategories()`` 精确匹配
+    # remainder 保留完整类型名（含 ::version / ::namespace 限定符）。
+    remainder = raw.split("/", 1)[1] if "/" in raw else raw
+
+    def _match_in_types(type_table):
+        """按 全名精确 → base 唯一 规则匹配；返回 (nt, matched_full_names)。"""
+        exact = type_table.get(remainder)
+        if exact is not None:
+            return exact, []
+        matched = []
+        names = []
+        for key in type_table:
+            candidate = type_table.get(key)
+            if candidate is None:
+                continue
+            if key.split("::", 1)[0] == base:
+                matched.append(candidate)
+                names.append(key)
+        if len(matched) == 1:
+            return matched[0], []
+        return None, names
+
+    def _ambiguous(names):
+        return _error(
+            "ambiguous_node_type",
+            "node_type %r is ambiguous; %d candidates: %s"
+            % (raw, len(names), sorted(set(names))),
+            {"field": "node_type", "value": raw,
+             "candidates": sorted(set(names))})
+
+    # Step 1: ``nodeTypeCategories()`` —— key 无 category 前缀。
     categories = hou.nodeTypeCategories()
     category_obj = categories.get(category)
     if category_obj is not None:
@@ -206,19 +240,18 @@ def _resolve_node_type(hou, node_type):
             node_types = category_obj.nodeTypes()
         except Exception:
             node_types = {}
-        if target_full in node_types:
-            nt = node_types[target_full]
-            if nt is not None:
-                return nt, None
-    # Step 2: 回退扫描 ``loadedFiles`` + ``definitionsInFile``；H21
-    # 刚 ``createDigitalAsset`` 后的 HDA 可能只在 ``loadedFiles`` 中
-    # 而尚未在 ``nodeTypeCategories`` 注册。
+        nt, conflicts = _match_in_types(node_types)
+        if nt is not None:
+            return nt, None
+        if conflicts:
+            return None, _ambiguous(conflicts)
+    # Step 2: 回退扫描 ``loadedFiles`` + ``definitionsInFile``。
     try:
         loaded = hou.hda.loadedFiles()
     except Exception:
         loaded = []
-    matched_full_names = []
     matched_nt = None
+    matched_full_names = []
     for file_path in loaded:
         try:
             definitions = hou.hda.definitionsInFile(file_path)
@@ -229,29 +262,22 @@ def _resolve_node_type(hou, node_type):
                 nt = defn.nodeType()
             except Exception:
                 continue
+            if nt is None:
+                continue
             try:
                 full_name = nt.nameWithCategory()
             except Exception:
                 full_name = ""
-            if full_name == target_full:
-                return nt, None
             if full_name == raw:
+                return nt, None
+            c, b = _category_from_node_type(full_name)
+            if c == category and b == base:
                 matched_nt = nt
                 matched_full_names.append(full_name)
-            else:
-                # base 名字相同但 category 不同时记录为歧义候选
-                c, b = _category_from_node_type(full_name)
-                if c and b == base:
-                    matched_nt = nt
-                    matched_full_names.append(full_name)
     if matched_full_names:
-        return None, _error(
-            "ambiguous_node_type",
-            "node_type %r is ambiguous; %d candidates: %s"
-            % (raw, len(matched_full_names),
-               sorted(set(matched_full_names))),
-            {"field": "node_type", "value": raw,
-             "candidates": sorted(set(matched_full_names))})
+        if len(matched_full_names) == 1:
+            return matched_nt, None
+        return None, _ambiguous(matched_full_names)
     if category_obj is None:
         return None, _error("unknown_node_type",
                              "unknown category %r in node_type %r"
@@ -349,9 +375,11 @@ def hda_list(hou, category=None):
         except Exception:
             name = ""
         try:
-            version = _safe_int(definition.version())
+            # fix-mcp-h21-api-parity #9：definition.version() 返回 str
+            # （如 '' / '2.0'），保持字符串透传，不再 _safe_int 截断。
+            version = str(definition.version())
         except Exception:
-            version = 0
+            version = ""
         hdas.append({
             "name": name,
             "node_type": node_type_name,
@@ -384,9 +412,10 @@ def hda_get(hou, node_type):
     except Exception:
         name = ""
     try:
-        version = _safe_int(definition.version())
+        # fix-mcp-h21-api-parity #9：version 保持真实字符串透传。
+        version = str(definition.version())
     except Exception:
-        version = 0
+        version = ""
     try:
         description = definition.description()
     except Exception:

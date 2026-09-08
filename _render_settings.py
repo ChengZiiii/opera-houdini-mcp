@@ -11,9 +11,11 @@ sync render 与四层 policy gate 全部委托 ``_render_jobs.py``。
 - 引擎推断只接受 ``ifd / opengl / karmarender`` 三种 node type；
   ``karmarender`` 的 ``engine`` parm 只接受 ``cpu / xpu / gpu``（其中
   ``gpu`` 归一为 ``xpu``）。
-- 静态 parm 白名单按 node type 分组；script / callback / command /
-  executable 类型参数明确排除。tuple 长度按 ``parmTuple`` 实际长度
-  校验。
+- 静态 parm 白名单按 node type 分组（H21.0.596 实测 parm 树重列）；
+  script / callback / command / executable 类型参数明确排除。tuple 名
+  （f/res/resolution）走 ``parmTuple`` 通道、长度按实际长度校验；组件名
+  （f1/f2/f3/res1/res2/resolutionx/...）的 ``parmTuple()`` 恒 None，
+  统一走 ``parm()`` 单值通道。
 - ``set_render_settings`` 必须分四阶段：
     1) 预校验所有请求 key/value/parm 可写性/prospective engine；
        任一失败 -> 零写入。
@@ -96,17 +98,28 @@ _POLICY_BY_ENGINE = {
 # 映射"）。``karma`` / ``karmarender`` 两个名字都接受，覆盖 H21 / H22。
 _CREATE_ALLOWLIST = frozenset({"ifd", "opengl", "karma", "karmarender"})
 
-# 静态 parm 白名单（design.md §"设置白名单"）。键 = node type，值为
-# 该 type 允许读写的 parm name 集合；公共 parm 单独列出避免重复。
-# karma / karmarender 共用同一 parm 表。
-_COMMON_PARMS = ("trange", "f1", "f2", "f3", "camera", "picture")
+# 静态 parm 白名单（fix-mcp-h21-api-parity #6 按 H21.0.596 实测 parm 树
+# 重列）。键 = node type，值为该 type 允许读写的 parm name 集合；公共
+# parm 单独列出避免重复。karma / karmarender 共用同一 parm 表。
+#
+# 实测要点：
+# - 三 ROP 的 frame range 都是 tuple ``f``（组件 f1/f2/f3）；
+#   ``parmTuple("f1")`` 对组件名恒返回 None，组件名必须走 ``parm()`` 通道。
+# - opengl 分辨率 tuple ``res``（组件 res1/res2）；karma 分辨率 tuple
+#   ``resolution``（组件 resolutionx/resolutiony）。
+# - karma 真实名：``samplesperpixel`` / ``varianceaa_thresh`` /
+#   ``denoiser`` / ``engine``（menu 只有 cpu/xpu）；无 samples/variance/
+#   denoise 旧名。
+# - ifd 实测仍存在 ``vm_renderengine`` / ``vm_samples``，保留并新增
+#   ``vm_picture``。
+_COMMON_PARMS = ("trange", "f", "f1", "f2", "f3", "camera", "picture")
 _TYPE_PARMS = {
-    "ifd": ("vm_renderengine", "vm_samples",
-             "override_camerares", "res1", "res2"),
-    "opengl": ("scenepath",
-                "override_camerares", "res1", "res2"),
-    "karmarender": ("engine", "samples", "variance", "denoise",
-                     "override_camerares", "res1", "res2"),
+    "ifd": ("vm_picture", "vm_renderengine", "vm_samples",
+            "override_camerares"),
+    "opengl": ("scenepath", "res", "res1", "res2"),
+    "karmarender": ("engine", "resolution", "resolutionx", "resolutiony",
+                    "samplesperpixel", "varianceaa_thresh", "denoiser",
+                    "override_camerares"),
 }
 
 
@@ -117,6 +130,44 @@ def _whitelist_for(node_type):
     if node_type not in _TYPE_PARMS:
         return frozenset()
     return frozenset(_COMMON_PARMS) | frozenset(_TYPE_PARMS[node_type])
+
+
+def _resolve_parm_entry(node, name):
+    """解析白名单 parm 名；返回 entry 对象或 None。
+
+    tuple 名（f/res/resolution 等）优先走 ``parmTuple()``；组件名
+    （f1/f2/f3/res1/res2/resolutionx/...）的 ``parmTuple()`` 恒 None，
+    回退 ``parm()`` 单值通道（fix-mcp-h21-api-parity #6 实测结论）。
+    """
+    parm_tuple = node.parmTuple(name)
+    if parm_tuple is not None:
+        return parm_tuple
+    return node.parm(name)
+
+
+def _entry_length(entry_obj):
+    """entry（ParmTuple 或 Parm）的分量数；Parm 无 __len__ 时为 1。"""
+    try:
+        return len(entry_obj)
+    except TypeError:
+        return 1
+
+
+def _apply_to_entry(entry, value):
+    """把标量 / 序列值写入 entry（ParmTuple 或单 Parm 组件通道）。
+
+    单分量值优先走 ``entry[0].set``（ParmTuple）；序列值走整体 ``set``；
+    单 Parm（无 ``__getitem__``）直接 ``set`` 标量。
+    """
+    if isinstance(value, (tuple, list)):
+        if len(value) == 1 and hasattr(entry, "__getitem__"):
+            entry[0].set(value[0])
+        else:
+            entry.set(tuple(value))
+    elif hasattr(entry, "__getitem__"):
+        entry[0].set(value)
+    else:
+        entry.set(value)
 
 
 def _policy_renderer_for(node_type, engine=None):
@@ -156,31 +207,33 @@ _ACCEPTABLE_PARM_TYPES = frozenset({
 })
 
 
-def _is_executable_parm(parm_tuple):
-    """parm tuple 是否属于执行型 / 不可安全读写类型。"""
-    template = parm_tuple.parmTemplate()
+def _is_executable_parm(parm_obj):
+    """parm/parmTuple 是否属于执行型 / 不可安全读写类型。"""
+    template = parm_obj.parmTemplate()
     type_name = template.type().name()
     return type_name in _EXECUTABLE_PARM_TYPES
 
 
-def _is_acceptable_parm(parm_tuple):
-    """parm tuple 是否属于允许读写的可安全类型。"""
-    template = parm_tuple.parmTemplate()
+def _is_acceptable_parm(parm_obj):
+    """parm/parmTuple 是否属于允许读写的可安全类型（单 Parm 组件通道同判）。"""
+    template = parm_obj.parmTemplate()
     type_name = template.type().name()
     if type_name in _EXECUTABLE_PARM_TYPES:
         return False
     return type_name in _ACCEPTABLE_PARM_TYPES
 
 
-def _coerce_value_for_parm(parm_tuple, value):
-    """校验 ``value`` 是否匹配 parm tuple 的类型 / 长度约束；返 dict。
+def _coerce_value_for_parm(parm_obj, value):
+    """校验 ``value`` 是否匹配 parm 的类型 / 长度约束；返 dict。
 
-    返回 ``{"value": ...}`` 表示可用值（已转 tuple），或
-    ``{"status": "error", ...}`` 表示拒绝（类型 / 长度不匹配）。
+    ``parm_obj`` 可以是 ParmTuple（tuple 名通道）或单 Parm（组件名通道）；
+    分量数经 ``_entry_length`` 取得。返回 ``{"value": ...}`` 表示可用值
+    （已转 tuple），或 ``{"status": "error", ...}`` 表示拒绝。
     """
-    template = parm_tuple.parmTemplate()
+    template = parm_obj.parmTemplate()
     type_name = template.type().name()
-    expected_len = len(parm_tuple)
+    expected_len = _entry_length(parm_obj)
+    parm_label = getattr(parm_obj, "name", lambda: "?")()
 
     if expected_len == 1:
         # 单值 parm：兼容直接传标量或 list-of-1
@@ -191,9 +244,9 @@ def _coerce_value_for_parm(parm_tuple, value):
             else:
                 return {"status": "error", "message": (
                     "%r expects a single value; got a list of %d")
-                    % (parm_tuple.name(), len(value)),
-                    "field": parm_tuple.name()}
-        scalar = _coerce_scalar(type_name, scalar_input, parm_tuple.name())
+                    % (parm_label, len(value)),
+                    "field": parm_label}
+        scalar = _coerce_scalar(type_name, scalar_input, parm_label)
         if scalar.get("status") == "error":
             return scalar
         return {"value": scalar["value"]}
@@ -201,18 +254,18 @@ def _coerce_value_for_parm(parm_tuple, value):
     if not isinstance(value, (list, tuple)):
         return {"status": "error", "message": (
             "%r expects a list of %d values; got %r")
-            % (parm_tuple.name(), expected_len, value),
-            "field": parm_tuple.name()}
+            % (parm_label, expected_len, value),
+            "field": parm_label}
     if len(value) != expected_len:
         return {"status": "error", "message": (
             "%r expects %d values; got %d")
-            % (parm_tuple.name(), expected_len, len(value)),
-            "field": parm_tuple.name()}
+            % (parm_label, expected_len, len(value)),
+            "field": parm_label}
     coerced = []
     for index, item in enumerate(value):
-        scalar = _coerce_scalar(type_name, item, parm_tuple.name())
+        scalar = _coerce_scalar(type_name, item, parm_label)
         if scalar.get("status") == "error":
-            scalar["field"] = "{0}[{1}]".format(parm_tuple.name(), index)
+            scalar["field"] = "{0}[{1}]".format(parm_label, index)
             return scalar
         coerced.append(scalar["value"])
     return {"value": tuple(coerced)}
@@ -389,27 +442,34 @@ def get_render_settings(hou, node_path):
 
     whitelist = _whitelist_for(type_name)
     parameters = {}
+    missing = []
     for name in whitelist:
-        parm_tuple = node.parmTuple(name)
-        if parm_tuple is None:
+        entry = _resolve_parm_entry(node, name)
+        if entry is None:
+            # 白名单名字在该节点未暴露（如 karma 无 res）：记录后跳过。
+            missing.append(name)
             continue
-        if not _is_acceptable_parm(parm_tuple):
+        if not _is_acceptable_parm(entry):
             continue
         try:
-            value = parm_tuple.eval()
+            value = entry.eval()
         except Exception:
             continue
         if isinstance(value, (tuple, list)):
             value = [v for v in value]
         parameters[name] = value
 
-    return cmn.apply_response_cap({
+    result = {
         "status": "success",
         "node_path": node.path(),
         "node_type": type_name,
         "renderer": renderer,
         "parameters": parameters,
-    })
+    }
+    # spec：白名单不存在的名字在 get 时不得静默丢字段后无任何提示。
+    if missing:
+        result["_skipped"] = missing
+    return cmn.apply_response_cap(result)
 
 
 # ---------------------------------------------------------------------------
@@ -451,7 +511,7 @@ def set_render_settings(hou, node_path, parameters):
 
     # Phase 1: 预校验所有请求 key + value + parm 可写性 + prospective engine
     skipped = []
-    planned = []  # list of dicts: {name, parm_tuple, value, original_eval}
+    planned = []  # list of dicts: {name, entry, value, original_eval}
     for raw_name, raw_value in parameters.items():
         if not isinstance(raw_name, str):
             return {"status": "error", "message": (
@@ -461,25 +521,25 @@ def set_render_settings(hou, node_path, parameters):
             skipped.append({"name": raw_name,
                              "reason": "not in whitelist"})
             continue
-        parm_tuple = node.parmTuple(raw_name)
-        if parm_tuple is None:
+        entry = _resolve_parm_entry(node, raw_name)
+        if entry is None:
             return {"status": "error", "message": (
                 "parameter %r does not exist on node %r")
                 % (raw_name, node.path()),
                 "field": raw_name}
-        if _is_executable_parm(parm_tuple):
+        if _is_executable_parm(entry):
             return {"status": "error", "message": (
                 "parameter %r is executable and cannot be set")
                 % raw_name, "field": raw_name}
-        if not _is_acceptable_parm(parm_tuple):
+        if not _is_acceptable_parm(entry):
             return {"status": "error", "message": (
                 "parameter %r has unsupported type and cannot be set")
                 % raw_name, "field": raw_name}
-        coerced = _coerce_value_for_parm(parm_tuple, raw_value)
+        coerced = _coerce_value_for_parm(entry, raw_value)
         if coerced.get("status") == "error":
             return coerced
         # 记录原值；snapshot 阶段再正式读
-        planned.append({"name": raw_name, "parm_tuple": parm_tuple,
+        planned.append({"name": raw_name, "entry": entry,
                          "value": coerced["value"]})
 
     # 预校验 prospective engine：使用请求中 ``engine``（如有）或当前
@@ -506,39 +566,43 @@ def set_render_settings(hou, node_path, parameters):
 
     # Phase 2: 快照全部待写 parm 旧值
     snapshots = []
-    for entry in planned:
-        parm_tuple = entry["parm_tuple"]
+    for entry_item in planned:
+        entry = entry_item["entry"]
         try:
-            original = parm_tuple.eval()
+            original = entry.eval()
         except Exception as error:
             return {"status": "error", "message": (
                 "failed to snapshot parameter %r: %s")
-                % (entry["name"], error),
-                "field": entry["name"],
+                % (entry_item["name"], error),
+                "field": entry_item["name"],
                 "exception": error.__class__.__name__}
-        snapshots.append({"name": entry["name"],
-                          "parm_tuple": parm_tuple,
-                          "original": original})
+        snapshots.append({"name": entry_item["name"],
+                           "entry": entry,
+                           "original": original})
 
-    # Phase 3: 应用全部 set；若任一失败 -> 进入恢复路径
+    # Phase 3: 应用全部 set；若任一失败 -> 进入恢复路径。
+    # 写入统一走 _apply_to_entry（单分量标量 / 多分量 tuple / 单 Parm
+    # 组件通道三态分派）。
     applied = []
     apply_errors = []
-    for entry, snapshot in zip(planned, snapshots):
-        parm_tuple = entry["parm_tuple"]
+    for entry_item, snapshot in zip(planned, snapshots):
+        entry = entry_item["entry"]
         try:
-            if len(parm_tuple) == 1:
-                parm_tuple[0].set(entry["value"])
-            else:
-                parm_tuple.set(entry["value"])
+            _apply_to_entry(entry, entry_item["value"])
         except Exception as error:
-            apply_errors.append({"name": entry["name"],
+            apply_errors.append({"name": entry_item["name"],
                                   "error": str(error),
                                   "exception": error.__class__.__name__})
             break
-        applied.append(entry["name"])
+        applied.append(entry_item["name"])
 
-    # 应用后重新读取 renderer / engine 校验
+    # 应用后重新读取 renderer / engine 校验。post_type 须做 karma →
+    # karmarender 归一（fix-mcp-h21-api-parity：H21 节点名是 'karma'，
+    # 未归一时 _resolve_policy_renderer 不走 engine 分支恒返回 ''，
+    # 误判 "engine/renderer became unrecognizable"）。
     post_type = _normalize_node_type(node.type().name())
+    if post_type in _KARMA_NODE_TYPES:
+        post_type = _KARMA_NORMALIZED
     post_renderer = _resolve_policy_renderer(node, post_type)
     if not post_renderer:
         apply_errors.append({"name": "(post-apply)",
@@ -551,12 +615,9 @@ def set_render_settings(hou, node_path, parameters):
         restore_errors = []
         restored = []
         for snapshot in snapshots:
-            parm_tuple = snapshot["parm_tuple"]
+            entry = snapshot["entry"]
             try:
-                if len(parm_tuple) == 1:
-                    parm_tuple[0].set(snapshot["original"])
-                else:
-                    parm_tuple.set(snapshot["original"])
+                _apply_to_entry(entry, snapshot["original"])
                 restored.append(snapshot["name"])
             except Exception as error:
                 restore_errors.append({
@@ -660,7 +721,11 @@ def create_render_node(hou, node_type, parent_path="/out", name=None,
             pass
         raise
 
+    # karma → karmarender 归一（同 set_render_settings post-apply 校验；
+    # 未归一会让新建的 H21 'karma' ROP 被误判为不可识别 renderer 而销毁）。
     type_name_post = _normalize_node_type(node.type().name())
+    if type_name_post in _KARMA_NODE_TYPES:
+        type_name_post = _KARMA_NORMALIZED
     renderer = _resolve_policy_renderer(node, type_name_post)
     if not renderer:
         try:

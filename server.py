@@ -1757,7 +1757,10 @@ class HoudiniMCPServer:
             
             node = parent.createNode(node_type, node_name=name)
             if position and len(position) >= 2:
-                node.setPosition([position[0], position[1]])
+                # H21 实测 setPosition 要求 hou.Vector2 实例；raw list 会触发
+                # SWIG type-check 错（严重时挂死 30s+）。float() 兼容字符串入参。
+                node.setPosition(hou.Vector2(
+                    float(position[0]), float(position[1])))
             if parameters:
                 for p_name, p_val in parameters.items():
                     parm = node.parm(p_name)
@@ -1796,7 +1799,10 @@ class HoudiniMCPServer:
             changes.append(f"Renamed from {old_name} to {name}")
 
         if position and len(position) >= 2:
-            node.setPosition([position[0], position[1]])
+            # H21 实测 setPosition 要求 hou.Vector2 实例；raw list 会触发
+            # SWIG type-check 错（严重时挂死 30s+）。float() 兼容字符串入参。
+            node.setPosition(hou.Vector2(
+                float(position[0]), float(position[1])))
             changes.append(f"Position set to {position}")
 
         if parameters:
@@ -2414,16 +2420,27 @@ class HoudiniMCPServer:
     # VEX Wrangles
     # -------------------------------------------------------------------------
 
+    # run_over 复数特例映射（fix-mcp-h21-api-parity #12）：rstrip("s") 会把
+    # "vertices" 剥成 "vertice" 而永远匹配不上 "vertex"，改为显式复数字典。
+    _RUN_OVER_PLURAL_MAP = {
+        "points": "point",
+        "primitives": "primitive",
+        "vertices": "vertex",
+        "numbers": "number",
+        "details": "detail",
+    }
+
     def _set_run_over(self, node, run_over):
         """Match 'run_over' against the wrangle's class menu (token or label)."""
         class_parm = node.parm("class")
         if class_parm is None:
             return None  # e.g. volumewrangle has no class parm
-        want = run_over.lower().rstrip("s")
+        want = run_over.strip().lower()
+        want = self._RUN_OVER_PLURAL_MAP.get(want, want)
         tokens = list(class_parm.menuItems())
         labels = list(class_parm.menuLabels())
         for index, (token, label) in enumerate(zip(tokens, labels)):
-            if want in (token.lower().rstrip("s"), label.lower().rstrip("s")):
+            if want in (token.lower(), label.lower()):
                 class_parm.set(index)
                 return token
         raise ValueError(

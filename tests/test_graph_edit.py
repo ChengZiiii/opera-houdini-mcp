@@ -110,13 +110,26 @@ class _FakeVector2(object):
         return "_FakeVector2({0!r}, {1!r})".format(self.x, self.y)
 
 
-class _FakeConnector(object):
-    """Mimics hou.Node.inputConnectors() output tuples."""
+class _FakeConnection(object):
+    """Mimics hou.NodeConnection（H21.0.596 实测形状）。
 
-    def __init__(self, input_index, output_node, output_index=0):
-        self.input_index = input_index
-        self.output_node = output_node
-        self.output_index = output_index
+    源节点经 ``inputNode()`` 取（``outputNode()`` 是连接的输出端即
+    目标节点自身）；``inputIndex()/outputIndex()`` 是方法不是属性。
+    """
+
+    def __init__(self, input_index, input_node, output_index=0):
+        self._input_index = input_index
+        self._input_node = input_node
+        self._output_index = output_index
+
+    def inputIndex(self):
+        return self._input_index
+
+    def inputNode(self):
+        return self._input_node
+
+    def outputIndex(self):
+        return self._output_index
 
 
 class _FakeNode(object):
@@ -156,10 +169,19 @@ class _FakeNode(object):
             self._inputs[input_index] = (output_node, output_index)
 
     def inputConnectors(self):
-        return tuple(
-            _FakeConnector(idx, src, oidx)
-            for idx, (src, oidx) in sorted(self._inputs.items())
-        )
+        # H21 真实形状：tuple-of-tuple——外层按输入索引（含未连接的
+        # 空 slot），内层是该 slot 的连接列表（元素为 hou.NodeConnection）。
+        if not self._inputs:
+            return ()
+        n_slots = max(self._inputs) + 1
+        slots = []
+        for idx in range(n_slots):
+            if idx in self._inputs:
+                src, oidx = self._inputs[idx]
+                slots.append((_FakeConnection(idx, src, oidx),))
+            else:
+                slots.append(())
+        return tuple(slots)
 
     def setPosition(self, pos):
         # 保留原始类型：测试可断言传入的是 hou.Vector2 实例

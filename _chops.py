@@ -760,6 +760,33 @@ def _resolve_target_parm(hou, target_path, target_parm):
             "parm_unavailable",
             "Target node does not expose parm()",
             target_path=target_path)
+    # scalar numeric 校验（fix-mcp-h21-api-parity #11，H21.0.596 实测）：
+    # - hou.Parm 无 numComponents 属性（旧守门恒被跳过）；
+    # - 组件（tx）的 parmTemplate().numComponents() 返回**所属 tuple**
+    #   的分量数（3），因此该值不能单独用作"拒绝单通道"的判据；
+    # - 向量整组名（'t'）经 parm() 恒返回 None，但 parmTuple() 返回多
+    #   分量 tuple。守门以 parmTuple 通道识别向量目标，组件数经
+    #   tuple[0].parmTemplate().numComponents() 披露（== len(tuple)）。
+    tuple_getter = getattr(target_node, "parmTuple", None)
+    if callable(tuple_getter):
+        try:
+            target_tuple = tuple_getter(target_parm)
+        except Exception:
+            target_tuple = None
+        if target_tuple is not None and len(target_tuple) != 1:
+            num_components = len(target_tuple)
+            try:
+                num_components = int(
+                    target_tuple[0].parmTemplate().numComponents()) \
+                    or len(target_tuple)
+            except Exception:
+                num_components = len(target_tuple)
+            return target_node, None, _error(
+                "parm_not_scalar",
+                "Target parm is not scalar (numComponents={0})".format(
+                    num_components),
+                target_path=target_path, target_parm=target_parm,
+                num_components=num_components)
     try:
         parm = parm_getter(target_parm)
     except Exception as error:
@@ -771,15 +798,18 @@ def _resolve_target_parm(hou, target_path, target_parm):
             "parm_not_found",
             "Parameter not found: " + target_parm,
             target_path=target_path, target_parm=target_parm)
-    # scalar numeric 校验：numComponents==1（拒绝 vector/multi）
-    num_components = _call_value(parm, "numComponents", None)
-    if num_components is not None and num_components != 1:
-        return target_node, parm, _error(
+    # 请求名与解析名不一致（某些版本 parm() 对整组名容错解析到首个
+    # 组件）时按向量目标拒绝。
+    try:
+        resolved_name = parm.name()
+    except Exception:
+        resolved_name = target_parm
+    if resolved_name != target_parm:
+        return target_node, None, _error(
             "parm_not_scalar",
-            "Target parm is not scalar (numComponents={0})".format(
-                num_components),
-            target_path=target_path, target_parm=target_parm,
-            num_components=num_components)
+            "Target parm is not scalar (resolves to component {0} of a "
+            "multi-component tuple)".format(resolved_name),
+            target_path=target_path, target_parm=target_parm)
     # 可编辑性（parm 上的 setStatus / isEditable 不稳定，用 node 级 isEditable
     # 已在 caller 之外；这里只拒绝明显的 non-numeric 类型）。
     return target_node, parm, None

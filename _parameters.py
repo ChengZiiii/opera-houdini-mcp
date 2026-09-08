@@ -272,11 +272,40 @@ def _commit_spare_templates(hou, node, templates, folder_name):
     """把一组 template 追加到 PTG，然后单次 setParmTemplateGroup 提交。
 
     任何前置校验失败：抛 ValueError 且不修改 PTG（D2 / D4 约束）。
+
+    ``folder_name`` 为 find-or-create：PTG 中不存在该 folder 时先 append
+    一个 ``hou.FolderParmTemplate(hou.folderType.Simple, folder_name)``
+    再 appendToFolder（fix-mcp-h21-api-parity #4：直接对不存在 folder 调
+    appendToFolder 会抛 ``<hou.OperationFailed>``）。
     """
     group = node.parmTemplateGroup()
+    if folder_name:
+        if not isinstance(folder_name, str) or not folder_name.strip():
+            raise ValueError(
+                u"folder 必须为非空字符串: {0!r}".format(folder_name))
+        existing = None
+        try:
+            existing = group.find(folder_name)
+        except Exception:
+            existing = None
+        if existing is None:
+            try:
+                # H21 实测：FolderParmTemplate(name, label, ...) 的
+                # folder_type 必须用关键字传（位置参数 3 是 children
+                # vector，design 草稿的位置传法会抛 SWIG type 错）。
+                group.append(hou.FolderParmTemplate(
+                    folder_name, folder_name,
+                    folder_type=hou.folderType.Simple))
+            except Exception as error:
+                raise ValueError(
+                    u"创建 folder {0!r} 失败: {1}".format(folder_name, error))
     for tpl in templates:
         if folder_name:
-            group.appendToFolder(folder_name, tpl)
+            try:
+                group.appendToFolder(folder_name, tpl)
+            except Exception as error:
+                raise ValueError(
+                    u"追加到 folder {0!r} 失败: {1}".format(folder_name, error))
         else:
             group.append(tpl)
     node.setParmTemplateGroup(group)

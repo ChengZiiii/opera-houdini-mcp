@@ -161,25 +161,33 @@ class HeadlessWarningTests(unittest.TestCase):
 
 class DisplaySetWhitelistTests(unittest.TestCase):
     def setUp(self):
-        self.vp = _Vp(display_set="Main", shaded_mode="Shaded")
+        # H21.0.596 真实枚举成员（fix-mcp-h21-api-parity #5）：
+        # hou.displaySetType = CurrentModel/DisplayModel/GhostObject/
+        # SceneObject/SelectedObject/TemplateModel；着色枚举是
+        # hou.glShadingType（hou.shadingMode 不存在）。
+        self.vp = _Vp(display_set="SceneObject", shaded_mode="Smooth")
         self.hou = _fake_hou_with_scene_viewer(
             _scene_viewer_with_viewport(self.vp))
         self.hou.displaySetType = types.SimpleNamespace(
-            Main="DST_MAIN", Object="DST_OBJ", Scene="DST_SCENE")
-        self.hou.shadingMode = types.SimpleNamespace(
-            Wireframe="M_W", WireShade="M_WS", Shaded="M_SH",
-            Ghost="M_GH", HiddenLine="M_HL")
+            CurrentModel="DST_CUR", DisplayModel="DST_DISP",
+            GhostObject="DST_GHOST", SceneObject="DST_SCENE",
+            SelectedObject="DST_SEL", TemplateModel="DST_TMPL")
+        self.hou.glShadingType = types.SimpleNamespace(
+            Wire="M_W", SmoothWire="M_WS", Smooth="M_SH", Flat="M_FLAT",
+            FlatWire="M_FW", MatCap="M_MC", MatCapWire="M_MCW",
+            WireBoundingBox="M_WBB", ShadedBoundingBox="M_SBB",
+            WireGhost="M_WG", HiddenLineGhost="M_HLG")
 
     def test_unsupported_display_set(self):
         result = _viewport.set_viewport_display(self.hou, "bogus", "shaded")
         self.assertEqual(result["error"], "unsupported_display_set")
 
     def test_unsupported_shaded_mode(self):
-        result = _viewport.set_viewport_display(self.hou, "main", "bogus")
+        result = _viewport.set_viewport_display(self.hou, "scene", "bogus")
         self.assertEqual(result["error"], "unsupported_shaded_mode")
 
     def test_valid(self):
-        result = _viewport.set_viewport_display(self.hou, "main", "shaded")
+        result = _viewport.set_viewport_display(self.hou, "scene", "shaded")
         self.assertEqual(result["status"], "success")
 
 

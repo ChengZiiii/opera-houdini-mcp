@@ -132,6 +132,54 @@ def is_texture_reference(value):
     return False
 
 
+# vector 值按 tuple→multi-parm 子键逐通道写入时的分量后缀（H21 实测
+# principledshader::2.0 的 basecolor 等 color parm 是 r/g/b 子键，无整体
+# tuple set 入口）。长度 2-4 的 list/tuple 值走该映射。
+_VECTOR_COMPONENT_SUFFIXES = ("r", "g", "b", "a")
+
+
+def _set_material_parm(mat, parm_name, value):
+    """在材质节点上写入一个参数；返回 (written: bool, used_names: list)。
+
+    规则（与 server.set_parameters 的 tuple→子键语义对齐，
+    fix-mcp-h21-api-parity #13）：
+    - 标量：``parm(name)`` 直接 set；
+    - vector（len 2-4 的 list/tuple）：先按 ``parm(name)`` 整体 set 尝试
+      （H21 principledshader::2.0 的 ``parm("basecolor")`` 实测返回 None，
+      该尝试自然跳过），再按 ``<name>r/g/b[/a]`` 子键逐通道 set；
+    - 任何一步真实写入成功即 written=True。
+    """
+    used_names = []
+    pt = mat.parm(parm_name)
+    if isinstance(value, (list, tuple)) and 2 <= len(value) <= 4:
+        if pt is not None:
+            try:
+                pt.set(list(value))
+                return True, [parm_name]
+            except Exception:
+                pass
+        written = False
+        for i, suffix in enumerate(
+                _VECTOR_COMPONENT_SUFFIXES[:len(value)]):
+            sub = mat.parm("{0}{1}".format(parm_name, suffix))
+            if sub is None:
+                continue
+            try:
+                sub.set(value[i])
+            except Exception:
+                continue
+            used_names.append(sub.name())
+            written = True
+        return written, used_names
+    if pt is None:
+        return False, used_names
+    try:
+        pt.set(value)
+        return True, [pt.name()]
+    except Exception:
+        return False, used_names
+
+
 def create_material(hou, material_type, name=None, parent_path="/mat",
                     parameters=None):
     """创建材质节点。
@@ -141,11 +189,15 @@ def create_material(hou, material_type, name=None, parent_path="/mat",
         material_type: 材质类型字符串，如 "principledshader" / "vopsurface"
         name: 节点名（默认 None -> Houdini 自动命名）
         parent_path: 父路径（默认 "/mat"；不存在时回退 /mat）
+        parameters: 可选 dict。vector 值（len 2-4 的 list/tuple）走与
+            set_parameters 相同的 tuple→子键映射（H21 principledshader::2.0
+            的 basecolor 等按 basecolorr/g/b 子键写入）。
 
     Returns:
-        dict {"path", "type", "name", "parameters_set"}
-            parameters_set 是已成功调用 parm.set 的 key 列表
-            （含虽然节点未暴露而静默跳过的 key，便于上层 UI 给反馈）
+        dict {"path", "type", "name", "parameters_set", "parameters_skipped"}
+            parameters_set：真实写入成功的 key（fix-mcp-h21-api-parity #13
+            起语义修正——不再把节点未暴露的 key 混入）
+            parameters_skipped：节点未暴露（或写入失败）而被跳过的 key
     """
     parent = hou.node(parent_path) if parent_path else None
     if parent is None:
@@ -153,18 +205,21 @@ def create_material(hou, material_type, name=None, parent_path="/mat",
     mat = parent.createNode(material_type, node_name=name)
 
     parameters_set = []
+    parameters_skipped = []
     if parameters:
         for parm_name, value in parameters.items():
-            pt = mat.parm(parm_name)
-            if pt is not None:
-                pt.set(value)
-            parameters_set.append(parm_name)
+            written, _used = _set_material_parm(mat, parm_name, value)
+            if written:
+                parameters_set.append(parm_name)
+            else:
+                parameters_skipped.append(parm_name)
 
     return {
         "path": mat.path(),
         "type": mat.type().name(),
         "name": mat.name(),
         "parameters_set": parameters_set,
+        "parameters_skipped": parameters_skipped,
     }
 
 
