@@ -498,18 +498,21 @@ class PR18BridgeStyleTests(unittest.TestCase):
     def test_function_named_verify_hou_api(self):
         self.assertEqual(self.fn.name, "verify_hou_api")
 
-    def test_no_type_annotations(self):
+    def test_numeric_bool_annotations(self):
+        # fix-mcp-dead-tools-p0：数值/布尔参数必须注解 int/float/bool（如
+        # timeout: int）；字符串参数保持无注解；返回值保持无注解。
         args = self.fn.args
-        has_arg_annot = any(
-            a.annotation is not None for a in
-            (args.posonlyargs + args.args + args.kwonlyargs))
+        for a in (args.posonlyargs + args.args + args.kwonlyargs):
+            ann = a.annotation
+            if ann is None:
+                continue
+            self.assertIsInstance(ann, ast.Name)
+            self.assertIn(ann.id, ("int", "float", "bool"),
+                          "verify_hou_api.%s" % a.arg)
         if args.vararg and args.vararg.annotation is not None:
-            has_arg_annot = True
+            self.fail("verify_hou_api must not annotate *args")
         if args.kwarg and args.kwarg.annotation is not None:
-            has_arg_annot = True
-        self.assertFalse(
-            has_arg_annot,
-            "verify_hou_api must not have parameter type annotations")
+            self.fail("verify_hou_api must not annotate **kwargs")
         self.assertIsNone(
             self.fn.returns,
             "verify_hou_api must not have a return type annotation")

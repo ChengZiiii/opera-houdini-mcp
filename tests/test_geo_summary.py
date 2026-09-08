@@ -871,14 +871,19 @@ class PR12BridgeStyleTests(unittest.TestCase):
             "Expected 1 PR 12 bridge tool, found {0}: {1}".format(
                 len(self.tools), list(self.tools.keys())))
 
-    def test_get_geo_summary_no_type_annotations(self):
+    def test_get_geo_summary_numeric_bool_annotations(self):
+        # fix-mcp-dead-tools-p0：数值/布尔参数必须注解 int/float/bool；字符
+        # 串参数保持无注解；返回值保持无注解。
         fn = self.tools["get_geo_summary"]
-        kinds = _signature_annotation_kinds(fn)
+        for arg in (fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs):
+            ann = arg.annotation
+            if ann is None:
+                continue
+            self.assertIsInstance(ann, ast.Name)
+            self.assertIn(ann.id, ("int", "float", "bool"),
+                          "get_geo_summary.%s" % arg.arg)
         self.assertFalse(
-            kinds["arg_annotations"],
-            "get_geo_summary must not have parameter type annotations")
-        self.assertFalse(
-            kinds["return_annotation"],
+            _signature_annotation_kinds(fn)["return_annotation"],
             "get_geo_summary must not have return type annotation")
 
     def test_get_geo_summary_chinese_docstring(self):

@@ -1303,9 +1303,18 @@ class PR13BridgeStyleTests(unittest.TestCase):
         ])
         self.assertEqual(self.names, self.expected)
 
-    def test_capture_pane_screenshot_no_annotations(self):
+    def test_capture_pane_screenshot_numeric_bool_annotations(self):
+        # fix-mcp-dead-tools-p0：数值/布尔参数必须注解 int/float/bool（如
+        # fit_contents: bool）；字符串参数保持无注解。
         fn = next(f for f in self.fns if f.name == "capture_pane_screenshot")
-        self.assertFalse(_signature_has_annotations(fn))
+        for arg in (fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs):
+            ann = arg.annotation
+            if ann is None:
+                continue
+            self.assertIsInstance(ann, ast.Name)
+            self.assertIn(ann.id, ("int", "float", "bool"),
+                          "capture_pane_screenshot.%s" % arg.arg)
+        self.assertIsNone(fn.returns)
 
     def test_list_visible_panes_no_annotations(self):
         fn = next(f for f in self.fns if f.name == "list_visible_panes")
@@ -1315,9 +1324,18 @@ class PR13BridgeStyleTests(unittest.TestCase):
         fn = next(f for f in self.fns if f.name == "capture_multiple_panes")
         self.assertFalse(_signature_has_annotations(fn))
 
-    def test_render_node_network_no_annotations(self):
+    def test_render_node_network_numeric_bool_annotations(self):
+        # fix-mcp-dead-tools-p0：数值/布尔参数必须注解 int/float/bool（如
+        # fit_contents: bool）；字符串参数保持无注解。
         fn = next(f for f in self.fns if f.name == "render_node_network")
-        self.assertFalse(_signature_has_annotations(fn))
+        for arg in (fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs):
+            ann = arg.annotation
+            if ann is None:
+                continue
+            self.assertIsInstance(ann, ast.Name)
+            self.assertIn(ann.id, ("int", "float", "bool"),
+                          "render_node_network.%s" % arg.arg)
+        self.assertIsNone(fn.returns)
 
     def test_capture_pane_screenshot_chinese_docstring(self):
         fn = next(f for f in self.fns if f.name == "capture_pane_screenshot")

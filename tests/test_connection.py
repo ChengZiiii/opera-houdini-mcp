@@ -472,11 +472,17 @@ class PR16BridgeStyleTests(unittest.TestCase):
             fn.returns,
             "check_connection must not have a return type annotation")
 
-    def test_ping_houdini_no_type_annotations(self):
+    def test_ping_houdini_numeric_bool_annotations(self):
+        # fix-mcp-dead-tools-p0：数值/布尔参数必须注解 int/float/bool（如
+        # timeout: float）；字符串参数保持无注解；返回值保持无注解。
         fn = self._get("ping_houdini")
-        self.assertFalse(
-            self._has_arg_annotations(fn),
-            "ping_houdini must not have parameter type annotations")
+        for arg in (fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs):
+            ann = arg.annotation
+            if ann is None:
+                continue
+            self.assertIsInstance(ann, ast.Name)
+            self.assertIn(ann.id, ("int", "float", "bool"),
+                          "ping_houdini.%s" % arg.arg)
         self.assertIsNone(
             fn.returns,
             "ping_houdini must not have a return type annotation")

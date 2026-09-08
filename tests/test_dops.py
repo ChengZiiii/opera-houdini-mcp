@@ -532,7 +532,9 @@ class RegistrationPolicyTests(unittest.TestCase):
             self.assertIn("cmn.apply_response_cap", segment)
             self.assertNotIn("undos.group", segment)
 
-    def test_bridge_has_exact_eight_unannotated_chinese_tools(self):
+    def test_bridge_has_exact_eight_chinese_tools_numeric_bool_annotations(self):
+        # fix-mcp-dead-tools-p0：数值/布尔参数必须注解 int/float/bool；字符
+        # 串 / JSON-list 参数保持无注解；返回值保持无注解。
         source = open(BRIDGE_PATH, "r", encoding="utf-8").read()
         tree = ast.parse(source)
         found = {}
@@ -549,9 +551,15 @@ class RegistrationPolicyTests(unittest.TestCase):
         self.assertEqual(set(found), DOPS_8)
         for name, node in found.items():
             args = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
-            self.assertEqual(args[0].arg, "ctx")
-            self.assertTrue(all(arg.annotation is None for arg in args))
-            self.assertIsNone(node.returns)
+            self.assertEqual(args[0].arg, "ctx", name)
+            for arg in args:
+                ann = arg.annotation
+                if ann is None:
+                    continue
+                self.assertIsInstance(ann, ast.Name, name)
+                self.assertIn(ann.id, ("int", "float", "bool"),
+                              "%s.%s" % (name, arg.arg))
+            self.assertIsNone(node.returns, name)
             doc = ast.get_docstring(node) or ""
             self.assertTrue(any("\u4e00" <= char <= "\u9fff" for char in doc),
                             name)

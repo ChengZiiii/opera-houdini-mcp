@@ -521,14 +521,29 @@ def _try_str_truncate(obj, max_bytes):
 # Section 6: pagination
 # ---------------------------------------------------------------------------
 def paginate_list(items, limit, cursor):
-    """分页切片。cursor 越界返回空页；limit<=0 返回空页；末尾 cursor 为 None。"""
+    """分页切片（fix-mcp-dead-tools-p0 契约收紧）。
+
+    - ``limit<=0`` clamp 到 1（不再返回空页），上限 500（防误传巨型 limit）
+    - ``cursor`` 负数 clamp 到 0；越界（``start >= len(items)``）返回空页
+      且 ``next_cursor=None``（MUST NOT 返回非 None 整数导致客户端死循环翻页）
+    """
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 1
     if limit <= 0:
-        return [], 0
+        limit = 1
+    if limit > 500:
+        limit = 500
+    try:
+        cursor = int(cursor)
+    except (TypeError, ValueError):
+        cursor = 0
     start = max(0, cursor)
-    end = start + limit
     if start >= len(items):
-        return [], cursor
-    page = items[start:end]
+        return [], None
+    page = items[start:start + limit]
+    end = start + limit
     next_cursor = end if end < len(items) else None
     return page, next_cursor
 

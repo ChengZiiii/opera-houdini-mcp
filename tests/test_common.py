@@ -371,20 +371,39 @@ class ApplyResponseCapTests(unittest.TestCase):
 # Section I: paginate_list
 # ===========================================================================
 class PaginateListTests(unittest.TestCase):
+    """fix-mcp-dead-tools-p0 契约：limit<=0 clamp 1、上限 500、越界
+    start 返回空页 + next_cursor=None（不得回显非 None 导致死循环翻页）。"""
+
     def test_empty_list(self):
         page, cursor = cmn.paginate_list([], limit=10, cursor=0)
         self.assertEqual(page, [])
-        self.assertEqual(cursor, 0)
+        self.assertIsNone(cursor)
 
-    def test_limit_zero_returns_empty(self):
+    def test_limit_zero_clamps_to_one(self):
         page, cursor = cmn.paginate_list([1, 2, 3], limit=0, cursor=0)
-        self.assertEqual(page, [])
-        self.assertEqual(cursor, 0)
+        self.assertEqual(page, [1])
+        self.assertEqual(cursor, 1)
 
-    def test_cursor_out_of_range(self):
+    def test_negative_limit_clamps_to_one(self):
+        page, cursor = cmn.paginate_list([1, 2, 3], limit=-5, cursor=0)
+        self.assertEqual(page, [1])
+        self.assertEqual(cursor, 1)
+
+    def test_cursor_out_of_range_returns_none_cursor(self):
         page, cursor = cmn.paginate_list([1, 2, 3], limit=10, cursor=99)
         self.assertEqual(page, [])
-        self.assertEqual(cursor, 99)  # cursor echoed; consumer clamps
+        self.assertIsNone(cursor)
+
+    def test_negative_cursor_clamped_to_zero(self):
+        page, cursor = cmn.paginate_list([1, 2, 3], limit=2, cursor=-7)
+        self.assertEqual(page, [1, 2])
+        self.assertEqual(cursor, 2)
+
+    def test_limit_above_500_clamped(self):
+        items = list(range(600))
+        page, cursor = cmn.paginate_list(items, limit=999, cursor=0)
+        self.assertEqual(len(page), 500)
+        self.assertEqual(cursor, 500)
 
     def test_normal_pagination(self):
         items = list(range(25))

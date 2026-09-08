@@ -608,13 +608,19 @@ class PR10BridgeStyleTests(unittest.TestCase):
     def setUp(self):
         self.fn = _find_pr10_tool_node()
 
-    def test_no_type_annotations(self):
-        kinds = _signature_annotation_kinds(self.fn)
+    def test_numeric_bool_annotations(self):
+        # fix-mcp-dead-tools-p0：数值/布尔参数必须注解 int/float/bool；字符
+        # 串参数保持无注解；返回值保持无注解。
+        fn = self.fn
+        for arg in (fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs):
+            ann = arg.annotation
+            if ann is None:
+                continue
+            self.assertIsInstance(ann, ast.Name)
+            self.assertIn(ann.id, ("int", "float", "bool"),
+                          "get_node_info.%s" % arg.arg)
         self.assertFalse(
-            kinds["arg_annotations"],
-            "get_node_info bridge must not have parameter type annotations")
-        self.assertFalse(
-            kinds["return_annotation"],
+            _signature_annotation_kinds(fn)["return_annotation"],
             "get_node_info bridge must not have return type annotation")
 
     def test_chinese_docstring(self):

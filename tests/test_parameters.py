@@ -779,7 +779,10 @@ class BridgeToolTests(unittest.TestCase):
                              set(self.EXPECTED) - set(tools.keys()),
                              set(tools.keys()) - set(self.EXPECTED)))
 
-    def test_no_type_annotations(self):
+    def test_numeric_bool_annotations(self):
+        # fix-mcp-dead-tools-p0：数值/布尔参数必须注解 int/float/bool（如
+        # locked: bool / num_components: int）；字符串 / JSON-list 参数保持
+        # 无注解；返回值保持无注解。
         tools = self._find_tool_funcs()
         for name, fn in tools.items():
             self.assertIsNone(
@@ -787,10 +790,12 @@ class BridgeToolTests(unittest.TestCase):
                 "{0} must not have return annotation".format(name))
             for arg in (fn.args.posonlyargs + fn.args.args
                         + fn.args.kwonlyargs):
-                self.assertIsNone(
-                    arg.annotation,
-                    "{0} arg {1} must not have annotation".format(
-                        name, arg.arg))
+                ann = arg.annotation
+                if ann is None:
+                    continue
+                self.assertIsInstance(ann, ast.Name, name)
+                self.assertIn(ann.id, ("int", "float", "bool"),
+                              "%s.%s" % (name, arg.arg))
 
     def test_chinese_docstring(self):
         tools = self._find_tool_funcs()

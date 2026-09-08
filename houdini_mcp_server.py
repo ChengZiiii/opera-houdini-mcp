@@ -902,7 +902,7 @@ mcp.lifespan = server_lifespan
 # Houdini Event Tools（bridge-only names；server registry 使用 pending 命令）
 # -------------------------------------------------------------------
 @mcp.tool()
-def get_houdini_events(ctx, limit=100, cursor=None):
+def get_houdini_events(ctx, limit: int = 100, cursor=None):
     """分页拉取 Houdini 进程级事件；cursor 由上一页响应返回。"""
     return _houdini_call("get_pending_events", {
         "limit": limit,
@@ -962,7 +962,7 @@ def get_best_practices(ctx, query=None, category=None, id=None):
 # search_docs / get_doc 面向跨文档主题检索，只读已校验本地 JSON 索引。
 # -------------------------------------------------------------------
 @mcp.tool()
-def search_docs(ctx, query, limit=10):
+def search_docs(ctx, query, limit: int = 10):
     """跨 Houdini 文档做 BM25 检索（bridge-local，无 Houdini 连接）。
 
     本工具 **不建立 Houdini TCP 连接**，直接在 bridge 进程内加载并查询
@@ -1013,7 +1013,8 @@ def get_doc(ctx, path):
 
 
 @mcp.tool()
-def parse_hip_offline(ctx, file_path, include_params=False, max_depth=10):
+def parse_hip_offline(ctx, file_path, include_params: bool = False,
+                      max_depth: int = 10):
     """离线 best-effort 解析 .hip/.hiplc/.hipnc（bridge-local，无 Houdini 连接）。
 
     本工具 **不建立 Houdini TCP 连接、不 import hou**，直接在 bridge 进程
@@ -1314,11 +1315,11 @@ def knowledge_stats(ctx: Context, scope=None):
 
 
 @mcp.tool()
-def capture_workflow_snapshot(ctx, node_path=None, include_vex=True,
-                              max_nodes=50, probe_mode="auto",
-                              include_connected=False,
-                              include_hda_internals=None,
-                              offset=None, limit=None):
+def capture_workflow_snapshot(ctx, node_path=None, include_vex: bool = True,
+                              max_nodes: int = 50, probe_mode="auto",
+                              include_connected: bool = False,
+                              include_hda_internals: bool = None,
+                              offset: int = None, limit: int = None):
     """把用户选中（或 node_path 指定）的节点子网络捕获为结构化工作流快照
     （add-workflow-knowledge-capture，readOnly relay，不修改场景）。
 
@@ -1781,7 +1782,10 @@ def find_nodes(ctx: Context, root_path: str = "/", pattern: str = None,
 def manage_cache(ctx: Context, action: str = "stats") -> dict:
     """Manage the Houdini-side NodeTypeCache.
 
-    action="stats"     -> return cache hits/misses/size/last_populated_at
+    action="stats"     -> return per-cache stats aligned with the main spec:
+                          {node_types: {valid, hits, misses, hit_rate,
+                          invalidations, entry_count, last_populate_ms},
+                          parameter_schemas: {same shape}}
     action="invalidate"-> clear all registered caches (calls
                           cmn.invalidate_all_caches under the hood)
     action="warmup"    -> pre-populate the NodeTypeCache
@@ -2033,8 +2037,8 @@ def layout_network(ctx: Context, path: str) -> dict:
 
 
 @mcp.tool()
-def find_error_nodes(ctx, root_path="/", include_warnings=True,
-                     max_warnings=50, max_errors=None):
+def find_error_nodes(ctx, root_path="/", include_warnings: bool = True,
+                     max_warnings: int = 50, max_errors: int = None):
     """扫描场景中的错误与警告节点。
 
     从 root_path 出发，单次调用 node.allSubChildren() 收集所有后代节点，
@@ -2057,8 +2061,8 @@ def find_error_nodes(ctx, root_path="/", include_warnings=True,
 
 
 @mcp.tool()
-def get_geo_summary(ctx, node_path, max_points_for_full=1000000,
-                    sample_size=10):
+def get_geo_summary(ctx, node_path, max_points_for_full: int = 1000000,
+                    sample_size: int = 10):
     """获取几何节点的轻量级概要信息。
 
     返回 SOP 节点的 point / primitive / vertex 计数、bbox 6 元、attributes /
@@ -2498,7 +2502,8 @@ def reorder_inputs(ctx, node_path, new_order=None, order=None):
 
 @mcp.tool()
 def layout_children(ctx, parent_path=None, parent=None,
-                    horizontal_spacing=None, vertical_spacing=None,
+                    horizontal_spacing: float = None,
+                    vertical_spacing: float = None,
                     direction=None):
     """布局父节点下的子节点（按间距参数手动 setPosition，跨 Houdini
     版本可移植）。
@@ -2526,7 +2531,7 @@ def layout_children(ctx, parent_path=None, parent=None,
 
 
 @mcp.tool()
-def set_node_position(ctx, node_path, x, y):
+def set_node_position(ctx, node_path, x: float, y: float):
     """设置节点在 network editor 中的位置。
 
     参数说明：
@@ -2543,7 +2548,7 @@ def set_node_position(ctx, node_path, x, y):
 
 
 @mcp.tool()
-def set_node_color(ctx, node_path, r, g, b):
+def set_node_color(ctx, node_path, r: float, g: float, b: float):
     """设置节点颜色（颜色分量自动 clamp 到 [0, 1]）。
 
     参数说明：
@@ -2580,8 +2585,10 @@ def create_network_box(ctx, parent_path, name=None, node_paths=None):
 # PR 10 Node Info Tool (thin relay to server-side _node_info)
 # -------------------------------------------------------------------
 @mcp.tool()
-def get_node_info(ctx, node_path, include_errors=True, force_cook=False,
-                  include_input_details=False, compact=False):
+def get_node_info(ctx, node_path, include_errors: bool = True,
+                  force_cook: bool = False,
+                  include_input_details: bool = False,
+                  compact: bool = False):
     """获取节点的详细信息。
 
     参数说明：
@@ -2611,7 +2618,7 @@ def get_node_info(ctx, node_path, include_errors=True, force_cook=False,
 # -------------------------------------------------------------------
 @mcp.tool()
 def capture_pane_screenshot(ctx, pane_type_name, save_path=None,
-                            fit_contents=True):
+                            fit_contents: bool = True):
     """截图指定类型 pane（NetworkEditor / SceneViewer / Compositor /
     ChannelEditor 等 30 种）。
 
@@ -2652,7 +2659,7 @@ def capture_multiple_panes(ctx, pane_types, save_dir):
 
 
 @mcp.tool()
-def render_node_network(ctx, node_path, fit_contents=True,
+def render_node_network(ctx, node_path, fit_contents: bool = True,
                         save_path=None):
     """定位到节点所在 NetworkEditor pane，cd 到节点，再截图。
 
@@ -2673,7 +2680,7 @@ def render_node_network(ctx, node_path, fit_contents=True,
 @mcp.tool()
 def capture_sceneviewer_flipbook_views(ctx, views=None, save_dir=None,
                                        desktop_name=None, pane_name=None,
-                                       fit_contents=True):
+                                       fit_contents: bool = True):
     """采集 SceneViewer 的 Top / Front / Right flipbook，可显式请求 Perspective。
 
     views=None 时严格按 top、front、right 顺序采集；传入 views 时保留调用方
@@ -2815,7 +2822,7 @@ def get_frame(ctx):
 
 
 @mcp.tool()
-def set_frame(ctx, frame):
+def set_frame(ctx, frame: float):
     """设置当前帧（PR 19，运行态时间线写，no-undo）。
 
     ``frame`` 接受 int / float；拒绝 bool / NaN / ±inf / 非数值；
@@ -2827,7 +2834,7 @@ def set_frame(ctx, frame):
 
 
 @mcp.tool()
-def set_frame_range(ctx, start, end):
+def set_frame_range(ctx, start: float, end: float):
     """设置全局 frame range（PR 19，场景写，可 undo）。
 
     ``start`` / ``end`` 必须为有限浮点且 ``start <= end``；end
@@ -2839,7 +2846,7 @@ def set_frame_range(ctx, start, end):
 
 
 @mcp.tool()
-def set_playback_range(ctx, start, end):
+def set_playback_range(ctx, start: float, end: float):
     """设置 playback range（PR 19，场景写，可 undo）。
 
     校验同 ``set_frame_range``；调 ``hou.playbar.setPlaybackRange``。
@@ -2849,7 +2856,7 @@ def set_playback_range(ctx, start, end):
 
 
 @mcp.tool()
-def set_keyframe(ctx, path, parameter, frame, value):
+def set_keyframe(ctx, path, parameter, frame: float, value: float):
     """单关键帧写入（PR 19，场景写，可 undo）。
 
     ``path`` / ``parameter`` 必为非空字符串；``frame`` / ``value``
@@ -2881,7 +2888,7 @@ def set_keyframes(ctx, keyframes):
 
 
 @mcp.tool()
-def delete_keyframe(ctx, path, parameter, frame):
+def delete_keyframe(ctx, path, parameter, frame: float):
     """删除指定帧的关键帧（PR 19，场景写，可 undo）。
 
     ``frame`` 必须为有限浮点（删除 sub-frame 精确点）。目标帧
@@ -3373,7 +3380,7 @@ def get_groups(ctx, node_path):
 
 @mcp.tool()
 def get_group_members(ctx, node_path, group_type, group_name,
-                      offset=0, limit=1000):
+                      offset: int = 0, limit: int = 1000):
     """分页读取 group 成员
     （add-geometry-export-and-measure，NO_UNDO）。
 
@@ -3391,7 +3398,7 @@ def get_group_members(ctx, node_path, group_type, group_name,
 
 @mcp.tool()
 def get_attrib_values(ctx, node_path, attribute, attrib_class="point",
-                      offset=0, limit=1000):
+                      offset: int = 0, limit: int = 1000):
     """按 owner/storage/tuple-size 分派读取属性，原生分页
     （add-geometry-export-and-measure，NO_UNDO）。
 
@@ -3406,7 +3413,7 @@ def get_attrib_values(ctx, node_path, attribute, attrib_class="point",
 
 
 @mcp.tool()
-def get_prim_intrinsics(ctx, node_path, prim_index, names=None):
+def get_prim_intrinsics(ctx, node_path, prim_index: int, names=None):
     """仅查询指定 ``prim_index`` 的 intrinsics
     （add-geometry-export-and-measure，NO_UNDO）。
 
@@ -3420,7 +3427,7 @@ def get_prim_intrinsics(ctx, node_path, prim_index, names=None):
 
 
 @mcp.tool()
-def find_nearest_point(ctx, node_path, position, max_distance=1.0):
+def find_nearest_point(ctx, node_path, position, max_distance: float = 1.0):
     """最近点查询：``Point | None`` 双路径
     （add-geometry-export-and-measure，NO_UNDO）。
 
@@ -3455,7 +3462,8 @@ def set_detail_attrib(ctx, node_path, name, value, attrib_type="float",
 
 
 @mcp.tool()
-def geo_export(ctx, node_path, format, output_path, overwrite=False):
+def geo_export(ctx, node_path, format, output_path,
+               overwrite: bool = False):
     """translator 驱动的原子几何导出
     （add-geometry-export-and-measure，NO_UNDO）。
 
@@ -3577,7 +3585,7 @@ def link_parameters(ctx, source, target):
 
 
 @mcp.tool()
-def lock_parameter(ctx, path, parameter, locked):
+def lock_parameter(ctx, path, parameter, locked: bool):
     """切换 parm 锁定状态（add-node-parameter-vex-tools，MUTATING）。
 
     ``locked`` 接受 bool；单 undo group。响应过 ``apply_response_cap``。
@@ -3588,9 +3596,9 @@ def lock_parameter(ctx, path, parameter, locked):
 
 @mcp.tool()
 def create_spare_parameter(ctx, path, name, data_type, label=None,
-                            default=None, min_value=None, max_value=None,
-                            menu_items=None, menu_labels=None, folder=None,
-                            num_components=1):
+                           default=None, min_value=None, max_value=None,
+                           menu_items=None, menu_labels=None, folder=None,
+                           num_components: int = 1):
     """单项 spare 参数创建（add-node-parameter-vex-tools，MUTATING）。
 
     通过 ``parmTemplateGroup()`` 复制 + 一次性
@@ -3687,7 +3695,8 @@ def create_vex_expression(ctx, parent_path, code, attrib_class="point",
 # / add-node-parameter-vex-tools 的放置策略保持一致）。
 # -------------------------------------------------------------------
 @mcp.tool()
-def get_network_overview(ctx, parent_path, max_depth=2, max_nodes=500):
+def get_network_overview(ctx, parent_path, max_depth: int = 2,
+                         max_nodes: int = 500):
     """有界 BFS 遍历 parent 节点的网络拓扑（add-scene-context-selection-materials，READ_ONLY）。
 
     ``max_depth`` 控制 BFS 深度（0 = 仅 parent_path），
@@ -3704,7 +3713,7 @@ def get_network_overview(ctx, parent_path, max_depth=2, max_nodes=500):
 
 
 @mcp.tool()
-def get_cook_chain(ctx, node_path, max_depth=20, max_nodes=500):
+def get_cook_chain(ctx, node_path, max_depth: int = 20, max_nodes: int = 500):
     """有界 DFS 上游 cook chain（add-scene-context-selection-materials，READ_ONLY）。
 
     从 ``node_path`` 沿 ``inputs()`` 关系向上递归；path-based
@@ -3720,7 +3729,8 @@ def get_cook_chain(ctx, node_path, max_depth=20, max_nodes=500):
 
 
 @mcp.tool()
-def explain_node(ctx, node_path, include_params=False, max_params=64):
+def explain_node(ctx, node_path, include_params: bool = False,
+                 max_params: int = 64):
     """单节点结构化摘要（add-scene-context-selection-materials，READ_ONLY）。
 
     字段：``path / name / type / category / input_count /
@@ -3736,7 +3746,7 @@ def explain_node(ctx, node_path, include_params=False, max_params=64):
 
 
 @mcp.tool()
-def get_scene_summary(ctx, max_nodes=2000):
+def get_scene_summary(ctx, max_nodes: int = 2000):
     """全场景 category counts + 时间线（add-scene-context-selection-materials，READ_ONLY）。
 
     ``max_nodes`` 控制 HOM 遍历预算；返回 ``total_nodes /
@@ -3762,7 +3772,7 @@ def get_selection(ctx):
 
 
 @mcp.tool()
-def set_selection(ctx, node_paths, clear_others=True):
+def set_selection(ctx, node_paths, clear_others: bool = True):
     """覆盖节点选择（add-scene-context-selection-materials，NO_UNDO）。
 
     全量预校验 ``node_paths``，任一无效 → 0 部分改变；clear 仅
@@ -3947,7 +3957,7 @@ def get_simulation_info(ctx, dop_path):
 
 
 @mcp.tool()
-def list_dop_objects(ctx, dop_path, offset=0, limit=100):
+def list_dop_objects(ctx, dop_path, offset: int = 0, limit: int = 100):
     """分页列出 DOP objects（add-dops-tools，READ_ONLY）。
 
     每项仅返回 name/object_id 与有界 data/record type 摘要；不展开
@@ -3958,7 +3968,7 @@ def list_dop_objects(ctx, dop_path, offset=0, limit=100):
 
 
 @mcp.tool()
-def get_dop_object(ctx, dop_path, object_name, max_data=64):
+def get_dop_object(ctx, dop_path, object_name, max_data: int = 64):
     """通过 findObject 查询单个 DOP object（add-dops-tools，READ_ONLY）。
 
     ``max_data`` 限制 data 摘要数量；不返回无界 record 内容。
@@ -3970,7 +3980,7 @@ def get_dop_object(ctx, dop_path, object_name, max_data=64):
 
 @mcp.tool()
 def get_dop_field(ctx, dop_path, object_name, data_name, field_name,
-                  record_type="Options", record_index=0):
+                  record_type="Options", record_index: int = 0):
     """读取 DOP data/record 字段（add-dops-tools，READ_ONLY）。
 
     volume/VDB 字段不返回原始体素，只返回可廉价取得的 resolution /
@@ -3983,8 +3993,8 @@ def get_dop_field(ctx, dop_path, object_name, data_name, field_name,
 
 
 @mcp.tool()
-def get_dop_relationships(ctx, dop_path, offset=0, limit=100,
-                          max_objects=100):
+def get_dop_relationships(ctx, dop_path, offset: int = 0, limit: int = 100,
+                          max_objects: int = 100):
     """分页读取 DOP relationships（add-dops-tools，READ_ONLY）。
 
     每个关系的对象名受 ``max_objects`` 硬上限约束；响应经过
@@ -3996,7 +4006,7 @@ def get_dop_relationships(ctx, dop_path, offset=0, limit=100,
 
 
 @mcp.tool()
-def step_simulation(ctx, dop_path, frames=1):
+def step_simulation(ctx, dop_path, frames: int = 1):
     """推进 DOP 模拟（add-dops-tools，NO_UNDO）。
 
     通过 ``hou.setTime(frameToTime(current + frames))`` 后
@@ -4008,7 +4018,7 @@ def step_simulation(ctx, dop_path, frames=1):
 
 
 @mcp.tool()
-def reset_simulation(ctx, dop_path, reset_frame=None):
+def reset_simulation(ctx, dop_path, reset_frame: float = None):
     """时间线优先重置 DOP 模拟（add-dops-tools，NO_UNDO）。
 
     先移动到 reset frame 并 force cook；可选 force-reset 仅在真实签名
@@ -4041,7 +4051,8 @@ def get_sim_memory_usage(ctx, dop_path):
 # 进 undo group。响应经过 server 端 ``apply_response_cap``。
 # -------------------------------------------------------------------
 @mcp.tool()
-def pdg_cook(ctx, node_path, blocking=False, timeout_seconds=300):
+def pdg_cook(ctx, node_path, blocking: bool = False,
+             timeout_seconds: float = 300):
     """启动 PDG/TOPs cook 并返回进程内 handle。blocking=True 时阻塞轮询至终态或超时；handle 进程内有效，server 重启失效。"""
     return _houdini_call("pdg_cook", {
         "node_path": node_path, "blocking": blocking,
@@ -4058,7 +4069,7 @@ def pdg_status(ctx, node_path, cook_id=None):
 
 
 @mcp.tool()
-def pdg_workitems(ctx, node_path, status_filter=None, max_items=1000):
+def pdg_workitems(ctx, node_path, status_filter=None, max_items: int = 1000):
     """读取已生成 work item 摘要（index/name/state）。PDG 未生成时返回空列表；受 status_filter 与 max_items 限制。"""
     params = {"node_path": node_path, "max_items": max_items}
     if status_filter is not None:
@@ -4095,7 +4106,7 @@ def pdg_cancel(ctx, node_path, cook_id=None):
 # 本 change READ_ONLY 为空。composed stage 仅经 ``LopNode.stage()`` 只读读取。
 # -------------------------------------------------------------------
 @mcp.tool()
-def lop_stage_info(ctx, node_path, max_prims=500):
+def lop_stage_info(ctx, node_path, max_prims: int = 500):
     """composed stage 级元数据（add-usd-solaris-tools，NO_UNDO）。
 
     从 ``LopNode.stage()`` 读取 upAxis / metersPerUnit /
@@ -4108,7 +4119,7 @@ def lop_stage_info(ctx, node_path, max_prims=500):
 
 
 @mcp.tool()
-def lop_prim_get(ctx, node_path, prim_path, max_attributes=100):
+def lop_prim_get(ctx, node_path, prim_path, max_attributes: int = 100):
     """单个 prim 的 type / active / loaded / kind + 有界属性
     （add-usd-solaris-tools，NO_UNDO）。
 
@@ -4122,7 +4133,7 @@ def lop_prim_get(ctx, node_path, prim_path, max_attributes=100):
 
 @mcp.tool()
 def lop_prim_search(ctx, node_path, name=None, type_name=None,
-                    max_prims=500, max_depth=5):
+                    max_prims: int = 500, max_depth: int = 5):
     """按 name 子串 / type_name 精确匹配搜索 prim
     （add-usd-solaris-tools，NO_UNDO）。
 
@@ -4139,7 +4150,7 @@ def lop_prim_search(ctx, node_path, name=None, type_name=None,
 
 
 @mcp.tool()
-def lop_layer_info(ctx, node_path, max_layers=20):
+def lop_layer_info(ctx, node_path, max_layers: int = 20):
     """layer stack 摘要（add-usd-solaris-tools，NO_UNDO）。
 
     读取 root / session / sublayer 的 identifier / real path / sublayer
@@ -4150,7 +4161,7 @@ def lop_layer_info(ctx, node_path, max_layers=20):
 
 
 @mcp.tool()
-def list_usd_prims(ctx, node_path, max_depth=5, max_prims=500):
+def list_usd_prims(ctx, node_path, max_depth: int = 5, max_prims: int = 500):
     """受 max_depth / max_prims 限制的 prim 遍历
     （add-usd-solaris-tools，NO_UNDO）。
 
@@ -4163,7 +4174,7 @@ def list_usd_prims(ctx, node_path, max_depth=5, max_prims=500):
 
 
 @mcp.tool()
-def get_usd_attribute(ctx, node_path, prim_path, attribute, time=0):
+def get_usd_attribute(ctx, node_path, prim_path, attribute, time: float = 0):
     """单个属性值 + 类型名（add-usd-solaris-tools，NO_UNDO）。
 
     从 composed stage 读取 attribute 在 ``time`` 的值。响应过 server 端
@@ -4197,7 +4208,7 @@ def get_last_modified_prims(ctx, node_path):
 
 
 @mcp.tool()
-def get_usd_composition(ctx, node_path, prim_path, max_arcs=50):
+def get_usd_composition(ctx, node_path, prim_path, max_arcs: int = 50):
     """composition arc 摘要（add-usd-solaris-tools，NO_UNDO）。
 
     使用 ``Usd.PrimCompositionQuery`` 若可用；否则返回 unsupported。响应
@@ -4219,7 +4230,7 @@ def get_usd_variants(ctx, node_path, prim_path):
 
 
 @mcp.tool()
-def inspect_usd_layer(ctx, node_path, max_layers=20):
+def inspect_usd_layer(ctx, node_path, max_layers: int = 20):
     """layer 自定义元数据 / sublayer 路径（add-usd-solaris-tools，NO_UNDO）。
 
     响应过 server 端 ``apply_response_cap``。
@@ -4229,7 +4240,7 @@ def inspect_usd_layer(ctx, node_path, max_layers=20):
 
 
 @mcp.tool()
-def list_lights(ctx, node_path, max_lights=200):
+def list_lights(ctx, node_path, max_lights: int = 200):
     """灯光识别：优先 UsdLux.LightAPI，再具体 schema IsA
     （add-usd-solaris-tools，NO_UNDO）。
 
@@ -4313,7 +4324,7 @@ def get_cop_info(ctx, node_path):
 
 
 @mcp.tool()
-def get_cop_geometry(ctx, node_path, output_index=0, frame=None):
+def get_cop_geometry(ctx, node_path, output_index: int = 0, frame: float = None):
     """读取 Copernicus output geometry 摘要（add-cops-tools，NO_UNDO）。
 
     调 ``geometry``/``geometryAtFrame``，只返回 point/prim/vertex counts、
@@ -4327,7 +4338,7 @@ def get_cop_geometry(ctx, node_path, output_index=0, frame=None):
 
 
 @mcp.tool()
-def get_cop_layer(ctx, node_path, output_index=0, frame=None):
+def get_cop_layer(ctx, node_path, output_index: int = 0, frame: float = None):
     """读取 Copernicus ImageLayer metadata（add-cops-tools，NO_UNDO）。
 
     先调 ``layer``/``layerAtFrame``；不可得时从 ``cable`` 反射 wire 选择
@@ -4341,7 +4352,7 @@ def get_cop_layer(ctx, node_path, output_index=0, frame=None):
 
 
 @mcp.tool()
-def get_cop_vdb(ctx, node_path, output_index=0, frame=None):
+def get_cop_vdb(ctx, node_path, output_index: int = 0, frame: float = None):
     """读取 Copernicus NanoVDB/grid metadata（add-cops-tools，NO_UNDO）。
 
     先调 ``vdb``/``vdbAtFrame``；不可得时从 ``cable`` 反射 wire 选择
@@ -4388,15 +4399,16 @@ def list_cop_node_types(ctx, category="Cop"):
 
 
 @mcp.tool()
-def list_chop_channels(ctx, node_path, output_index=0):
+def list_chop_channels(ctx, node_path, output_index: int = 0):
     """枚举 CHOP 通道（track）名与采样范围。参数：node_path，output_index 可选。"""
     return _houdini_call("list_chop_channels", {
         "node_path": node_path, "output_index": output_index})
 
 
 @mcp.tool()
-def get_chop_data(ctx, node_path, channels=None, output_index=0,
-                  sample=None, frame=None, time=None, start=None, end=None):
+def get_chop_data(ctx, node_path, channels=None, output_index: int = 0,
+                  sample: int = None, frame: float = None, time: float = None,
+                  start: int = None, end: int = None):
     """有界读取 CHOP 采样。参数：node_path，sample/frame/time/start/end 选一。"""
     params = {"node_path": node_path, "output_index": output_index}
     if channels is not None:
@@ -4425,7 +4437,8 @@ def create_chop_node(ctx, parent_path, node_type, node_name=None):
 
 @mcp.tool()
 def export_chop_to_parm(ctx, chop_path, channel, target_path, target_parm,
-                        output_index=0, replace_existing=False):
+                        output_index: int = 0,
+                        replace_existing: bool = False):
     """建立 chop() 通道引用。参数：chop_path/channel/target_path/target_parm。"""
     params = {
         "chop_path": chop_path, "channel": channel,
@@ -4480,7 +4493,7 @@ def create_take(ctx, name, include_parms=None, parent_take=None):
 
 
 @mcp.tool()
-def list_caches(ctx, parent_path="/", max_nodes=256):
+def list_caches(ctx, parent_path="/", max_nodes: int = 256):
     """枚举白名单 File Cache 节点（BFS，受 max_nodes 限制）。只读。"""
     return _houdini_call("list_caches", {
         "parent_path": parent_path, "max_nodes": max_nodes,
@@ -4494,7 +4507,7 @@ def get_cache_status(ctx, node_path):
 
 
 @mcp.tool()
-def clear_cache(ctx, node_path, remove_disk_file=False):
+def clear_cache(ctx, node_path, remove_disk_file: bool = False):
     """清运行态 cache（remove_disk_file=True 时同步删磁盘文件）。副作用不可 undo。"""
     return _houdini_call("clear_cache", {
         "node_path": node_path,
@@ -4528,7 +4541,7 @@ def check_connection(ctx):
 
 
 @mcp.tool()
-def ping_houdini(ctx, timeout=5):
+def ping_houdini(ctx, timeout: float = 5):
     """轻量级 Houdini 端 ping，验证响应时间（PR 16 连接诊断）。
 
     参数说明：
@@ -4550,7 +4563,7 @@ def ping_houdini(ctx, timeout=5):
 # the PR 14 probe's "next section header" regex stop here)
 # -------------------------------------------------------------------
 @mcp.tool()
-def get_houdini_help(ctx, help_type, item_name, timeout=10):
+def get_houdini_help(ctx, help_type, item_name, timeout: int = 10):
     """从 SideFX 在线文档查询 Houdini 节点、VEX 函数或 hou 方法的帮助（PR 15）。
 
     help_type 支持 11 种："sop" / "obj" / "dop" / "cop2" / "chop" /
@@ -4575,7 +4588,7 @@ def get_houdini_help(ctx, help_type, item_name, timeout=10):
 # also makes the PR 14 probe's "next section header" regex stop here)
 # -------------------------------------------------------------------
 @mcp.tool()
-def verify_hou_api(ctx, item_name, help_type="python_hou", timeout=10):
+def verify_hou_api(ctx, item_name, help_type="python_hou", timeout: int = 10):
     """AI-friendly wrapper over get_houdini_help（PR 18）。
 
     参数说明：

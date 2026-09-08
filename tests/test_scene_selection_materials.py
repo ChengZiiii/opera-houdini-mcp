@@ -1124,16 +1124,26 @@ class BridgeToolStyleTests(unittest.TestCase):
                      "get_material_info"):
             self.assertIn(cmd, names)
 
-    def test_no_type_annotations_on_new_tools(self):
+    def test_numeric_bool_annotations_on_new_tools(self):
+        # fix-mcp-dead-tools-p0：数值/布尔参数必须注解 int/float/bool（如
+        # max_depth: int / include_params: bool）；字符串参数保持无注解。
         funcs = self._find_mcp_tool_functions()
         names_to_check = set(SCENE_MAT_CHANGE_9)
         for fn in funcs:
             if fn.name not in names_to_check:
                 continue
             for arg in fn.args.args:
-                self.assertIsNone(arg.annotation,
-                                   "tool %s arg %s has type annotation"
-                                   % (fn.name, arg.arg))
+                ann = arg.annotation
+                if ann is None:
+                    continue
+                self.assertIsInstance(
+                    ann, ast.Name,
+                    "tool %s arg %s has non-simple annotation"
+                    % (fn.name, arg.arg))
+                self.assertIn(
+                    ann.id, ("int", "float", "bool"),
+                    "tool %s arg %s must only annotate int/float/bool"
+                    % (fn.name, arg.arg))
 
     def test_chinese_docstring_on_new_tools(self):
         for fn in self._find_mcp_tool_functions():

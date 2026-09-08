@@ -178,12 +178,14 @@ class NodeTypeCacheInitTests(unittest.TestCase):
         self.assertEqual(cache.size(), 0)
         self.assertEqual(cache.stats(), {
             "hits": 0, "misses": 0, "size": 0, "last_populated_at": None,
+            "invalidations": 0, "last_populate_ms": None,
         })
 
     def test_stats_have_documented_keys(self):
         cache = disc.NodeTypeCache()
         st = cache.stats()
-        for k in ("hits", "misses", "size", "last_populated_at"):
+        for k in ("hits", "misses", "size", "last_populated_at",
+                  "invalidations", "last_populate_ms"):
             self.assertIn(k, st)
 
 
@@ -418,6 +420,9 @@ class RegistryExportTests(unittest.TestCase):
 # Section E: list_node_types
 # ===========================================================================
 class ListNodeTypesTests(unittest.TestCase):
+    """fix-mcp-dead-tools-p0：list_node_types 返回主 spec 信封
+    {status, node_types, count, total, has_more, cursor}（不再裸元组）。"""
+
     def setUp(self):
         self._snapshot = list(cmn._cache_registry)
 
@@ -432,81 +437,128 @@ class ListNodeTypesTests(unittest.TestCase):
             "Sop": {"box": ("Box", ""), "sphere": ("Sphere", "")},
             "Object": {"geo": ("Geo", "")},
         })
-        page, cursor = disc.list_node_types(hou, limit=2)
-        self.assertEqual(len(page), 2)
-        self.assertIsNotNone(cursor)
+        res = disc.list_node_types(hou, limit=2)
+        self.assertEqual(res["status"], "success")
+        self.assertEqual(res["count"], 2)
+        self.assertEqual(res["total"], 3)
+        self.assertTrue(res["has_more"])
+        self.assertIsNotNone(res["cursor"])
+        self.assertEqual(len(res["node_types"]), 2)
 
     def test_filter_by_category(self):
         hou = _make_hou({
             "Sop": {"box": ("Box", ""), "sphere": ("Sphere", "")},
             "Object": {"geo": ("Geo", "")},
         })
-        page, cursor = disc.list_node_types(hou, category="Object")
-        self.assertEqual(len(page), 1)
-        self.assertEqual(page[0]["name"], "geo")
-        self.assertEqual(page[0]["category"], "Object")
-        self.assertIsNone(cursor)
+        res = disc.list_node_types(hou, category="Object")
+        self.assertEqual(res["count"], 1)
+        self.assertEqual(res["node_types"][0]["name"], "geo")
+        self.assertEqual(res["node_types"][0]["category"], "Object")
+        self.assertFalse(res["has_more"])
+        self.assertIsNone(res["cursor"])
 
     def test_filter_by_name_substring(self):
         hou = _make_hou({
             "Sop": {"box": ("Box", ""), "sphere": ("Sphere", "")},
         })
-        page, _ = disc.list_node_types(hou, name_filter="sphere")
-        self.assertEqual(len(page), 1)
-        self.assertEqual(page[0]["name"], "sphere")
+        res = disc.list_node_types(hou, name_filter="sphere")
+        self.assertEqual(res["count"], 1)
+        self.assertEqual(res["node_types"][0]["name"], "sphere")
 
     def test_empty_returns_empty_page(self):
         hou = _make_hou({"Sop": {"box": ("Box", "")}})
-        page, cursor = disc.list_node_types(hou, category="Nope")
-        self.assertEqual(page, [])
-        self.assertIsNotNone(cursor)  # cursor stays valid for next iter even empty
+        res = disc.list_node_types(hou, category="Nope")
+        self.assertEqual(res["node_types"], [])
+        self.assertEqual(res["count"], 0)
+        self.assertFalse(res["has_more"])
+        self.assertIsNone(res["cursor"])
 
-    def test_limit_zero(self):
+    def test_limit_zero_clamps_to_one(self):
         hou = _make_hou({"Sop": {"box": ("Box", "")}})
-        page, cursor = disc.list_node_types(hou, limit=0)
-        self.assertEqual(page, [])
-        self.assertEqual(cursor, 0)  # paginate_list contract
+        res = disc.list_node_types(hou, limit=0)
+        self.assertEqual(res["count"], 1)
+        self.assertFalse(res["has_more"])
+        self.assertIsNone(res["cursor"])
 
     def test_pagination_cursor_advances(self):
         hou = _make_hou({
             "Sop": {"a": ("A", ""), "b": ("B", ""), "c": ("C", "")},
         })
-        page1, cursor1 = disc.list_node_types(hou, limit=2, cursor=0)
-        self.assertEqual(len(page1), 2)
+        res1 = disc.list_node_types(hou, limit=2, cursor=0)
+        self.assertEqual(res1["count"], 2)
+        self.assertTrue(res1["has_more"])
+        cursor1 = res1["cursor"]
         self.assertIsNotNone(cursor1)
-        page2, cursor2 = disc.list_node_types(hou, limit=2, cursor=cursor1)
-        self.assertEqual(len(page2), 1)
-        self.assertIsNone(cursor2)
+        res2 = disc.list_node_types(hou, limit=2, cursor=cursor1)
+        self.assertEqual(res2["count"], 1)
+        self.assertFalse(res2["has_more"])
+        self.assertIsNone(res2["cursor"])
+
+    def test_has_more_exact_boundary(self):
+        # 恰好取满：total == limit → has_more=False（lookahead 为空）
+        hou = _make_hou({
+            "Sop": {"a": ("A", ""), "b": ("B", "")},
+        })
+        res = disc.list_node_types(hou, limit=2)
+        self.assertEqual(res["count"], 2)
+        self.assertEqual(res["total"], 2)
+        self.assertFalse(res["has_more"])
+        self.assertIsNone(res["cursor"])
+
+    def test_has_more_one_past_boundary(self):
+        # 超出 1 项：has_more=True 且 lookahead 项不进入返回
+        hou = _make_hou({
+            "Sop": {"a": ("A", ""), "b": ("B", ""), "c": ("C", "")},
+        })
+        res = disc.list_node_types(hou, limit=2)
+        self.assertEqual(res["count"], 2)
+        self.assertTrue(res["has_more"])
+        self.assertEqual(res["cursor"], 2)
+        names = [it["name"] for it in res["node_types"]]
+        self.assertNotIn("c", names)
+
+    def test_out_of_range_cursor_returns_empty_envelope(self):
+        hou = _make_hou({"Sop": {"box": ("Box", "")}})
+        res = disc.list_node_types(hou, cursor=99)
+        self.assertEqual(res["node_types"], [])
+        self.assertEqual(res["count"], 0)
+        self.assertFalse(res["has_more"])
+        self.assertIsNone(res["cursor"])
 
 
 # ===========================================================================
 # Section F: list_children
 # ===========================================================================
 class ListChildrenTests(unittest.TestCase):
+    """fix-mcp-dead-tools-p0：list_children 返回信封
+    {status, node_path, children, count, total, has_more, cursor}。"""
+
     def test_lists_direct_children(self):
         root = _make_node("obj", children=[
             ("geo1", "geo"), ("geo2", "geo"),
         ])
         hou = _make_hou_with_node(root)
-        page, cursor = disc.list_children(hou, node_path="/obj")
-        self.assertEqual(len(page), 2)
-        self.assertIsNone(cursor)
+        res = disc.list_children(hou, node_path="/obj")
+        self.assertEqual(res["count"], 2)
+        self.assertEqual(res["node_path"], "/obj")
+        self.assertFalse(res["has_more"])
+        self.assertIsNone(res["cursor"])
 
     def test_full_item_shape(self):
         root = _make_node("obj", children=[("geo1", "geo")])
         hou = _make_hou_with_node(root)
-        page, _ = disc.list_children(hou, node_path="/obj", compact=False)
-        self.assertEqual(len(page), 1)
-        entry = page[0]
+        res = disc.list_children(hou, node_path="/obj", compact=False)
+        self.assertEqual(res["count"], 1)
+        entry = res["children"][0]
         for key in ("path", "type", "category", "children_count"):
             self.assertIn(key, entry)
 
     def test_compact_only_required_keys(self):
         root = _make_node("obj", children=[("geo1", "geo")])
         hou = _make_hou_with_node(root)
-        page, _ = disc.list_children(hou, node_path="/obj", compact=True)
-        self.assertEqual(len(page), 1)
-        entry = page[0]
+        res = disc.list_children(hou, node_path="/obj", compact=True)
+        self.assertEqual(res["count"], 1)
+        entry = res["children"][0]
         self.assertEqual(
             set(entry.keys()),
             {"path", "type", "children_count"},
@@ -521,10 +573,10 @@ class ListChildrenTests(unittest.TestCase):
         root = _FakeSceneNode("a", "geo")
         root._children.append(b)
         hou = _make_hou_with_node(root)
-        page, _ = disc.list_children(hou, node_path="/a", recursive=True,
-                                     max_depth=1, max_nodes=100)
+        res = disc.list_children(hou, node_path="/a", recursive=True,
+                                 max_depth=1, max_nodes=100)
         # 起始节点 a 不应被列入；b 是第一层 child 应被列入；c 因 max_depth=1 不应被列入
-        names = [it["path"].split("/")[-1] for it in page]
+        names = [it["path"].split("/")[-1] for it in res["children"]]
         self.assertNotIn("a", names)
         self.assertIn("b", names)
         self.assertNotIn("c", names)
@@ -537,9 +589,9 @@ class ListChildrenTests(unittest.TestCase):
         root = _FakeSceneNode("a", "geo")
         root._children.append(b)
         hou = _make_hou_with_node(root)
-        page, _ = disc.list_children(hou, node_path="/a", recursive=True,
-                                     max_depth=2, max_nodes=100)
-        names = [it["path"].split("/")[-1] for it in page]
+        res = disc.list_children(hou, node_path="/a", recursive=True,
+                                 max_depth=2, max_nodes=100)
+        names = [it["path"].split("/")[-1] for it in res["children"]]
         self.assertIn("b", names)
         self.assertIn("c", names)
         self.assertNotIn("a", names)
@@ -549,33 +601,42 @@ class ListChildrenTests(unittest.TestCase):
             ("n1", "geo"), ("n2", "geo"), ("n3", "geo"),
         ])
         hou = _make_hou_with_node(root)
-        page, _ = disc.list_children(hou, node_path="/obj", max_nodes=2)
-        self.assertLessEqual(len(page), 2)
+        res = disc.list_children(hou, node_path="/obj", max_nodes=2)
+        self.assertLessEqual(res["count"], 2)
 
     def test_missing_path_returns_empty(self):
         hou = _make_hou_with_node(_make_node("obj"))
-        page, cursor = disc.list_children(hou, node_path="/nope")
-        self.assertEqual(page, [])
+        res = disc.list_children(hou, node_path="/nope")
+        self.assertEqual(res["children"], [])
+        self.assertFalse(res["has_more"])
+        self.assertIsNone(res["cursor"])
 
     def test_pagination_limit(self):
         children = [("n{0}".format(i), "geo") for i in range(5)]
         root = _make_node("obj", children=children)
         hou = _make_hou_with_node(root)
-        page, cursor = disc.list_children(hou, node_path="/obj", limit=2)
-        self.assertEqual(len(page), 2)
-        self.assertIsNotNone(cursor)
-        page2, cursor2 = disc.list_children(hou, node_path="/obj", limit=2, cursor=cursor)
-        self.assertEqual(len(page2), 2)
-        self.assertIsNotNone(cursor2)
-        page3, cursor3 = disc.list_children(hou, node_path="/obj", limit=2, cursor=cursor2)
-        self.assertEqual(len(page3), 1)
-        self.assertIsNone(cursor3)
+        res1 = disc.list_children(hou, node_path="/obj", limit=2)
+        self.assertEqual(res1["count"], 2)
+        self.assertTrue(res1["has_more"])
+        cursor1 = res1["cursor"]
+        self.assertIsNotNone(cursor1)
+        res2 = disc.list_children(hou, node_path="/obj", limit=2, cursor=cursor1)
+        self.assertEqual(res2["count"], 2)
+        self.assertTrue(res2["has_more"])
+        res3 = disc.list_children(hou, node_path="/obj", limit=2,
+                                  cursor=res2["cursor"])
+        self.assertEqual(res3["count"], 1)
+        self.assertFalse(res3["has_more"])
+        self.assertIsNone(res3["cursor"])
 
 
 # ===========================================================================
 # Section G: find_nodes
 # ===========================================================================
 class FindNodesTests(unittest.TestCase):
+    """fix-mcp-dead-tools-p0：find_nodes 返回信封
+    {status, root_path, matches, count, total, has_more, cursor}。"""
+
     def test_substring_match(self):
         root = _make_node("obj", children=[
             ("box1", "geo"),
@@ -583,11 +644,12 @@ class FindNodesTests(unittest.TestCase):
             ("sphere1", "geo"),
         ])
         hou = _make_hou_with_node(root)
-        page, _ = disc.find_nodes(hou, root_path="/obj", pattern="box")
-        names = [it["name"] for it in page]
+        res = disc.find_nodes(hou, root_path="/obj", pattern="box")
+        names = [it["name"] for it in res["matches"]]
         self.assertIn("box1", names)
         self.assertIn("box2", names)
         self.assertNotIn("sphere1", names)
+        self.assertEqual(res["root_path"], "/obj")
 
     def test_glob_match(self):
         root = _make_node("obj", children=[
@@ -596,8 +658,8 @@ class FindNodesTests(unittest.TestCase):
             ("sphere", "geo"),
         ])
         hou = _make_hou_with_node(root)
-        page, _ = disc.find_nodes(hou, root_path="/obj", pattern="*_OUT")
-        names = [it["name"] for it in page]
+        res = disc.find_nodes(hou, root_path="/obj", pattern="*_OUT")
+        names = [it["name"] for it in res["matches"]]
         self.assertEqual(names, ["box_OUT"])
 
     def test_node_type_filter(self):
@@ -607,23 +669,26 @@ class FindNodesTests(unittest.TestCase):
             ("c", "geo"),
         ])
         hou = _make_hou_with_node(root)
-        page, _ = disc.find_nodes(hou, root_path="/obj", node_type="cam")
-        self.assertEqual(len(page), 1)
-        self.assertEqual(page[0]["name"], "b")
+        res = disc.find_nodes(hou, root_path="/obj", node_type="cam")
+        self.assertEqual(res["count"], 1)
+        self.assertEqual(res["matches"][0]["name"], "b")
 
     def test_no_match_returns_empty(self):
         root = _make_node("obj", children=[("a", "geo")])
         hou = _make_hou_with_node(root)
-        page, _ = disc.find_nodes(hou, root_path="/obj", pattern="z")
-        self.assertEqual(page, [])
+        res = disc.find_nodes(hou, root_path="/obj", pattern="z")
+        self.assertEqual(res["matches"], [])
+        self.assertFalse(res["has_more"])
+        self.assertIsNone(res["cursor"])
 
     def test_pagination_limit(self):
         children = [("n{0}".format(i), "geo") for i in range(5)]
         root = _make_node("obj", children=children)
         hou = _make_hou_with_node(root)
-        page, cursor = disc.find_nodes(hou, root_path="/obj", limit=3)
-        self.assertEqual(len(page), 3)
-        self.assertIsNotNone(cursor)
+        res = disc.find_nodes(hou, root_path="/obj", limit=3)
+        self.assertEqual(res["count"], 3)
+        self.assertTrue(res["has_more"])
+        self.assertIsNotNone(res["cursor"])
 
     def test_default_root_path_via_slash(self):
         # Brief D6: find_nodes 默认 root_path 为 "/"；显式传 "/" 与不传 root_path 应等效。
@@ -631,9 +696,9 @@ class FindNodesTests(unittest.TestCase):
         root = _make_node("obj", children=[("a", "geo")])
         hou = _make_hou_with_node(root)
         # 用 / 作 root（nodes_by_path 通过 _FakeSceneNode.path() 注册为 /obj）
-        page, _ = disc.find_nodes(hou, root_path="/obj", pattern="a")
-        self.assertEqual(len(page), 1)
-        self.assertEqual(page[0]["name"], "a")
+        res = disc.find_nodes(hou, root_path="/obj", pattern="a")
+        self.assertEqual(res["count"], 1)
+        self.assertEqual(res["matches"][0]["name"], "a")
 
 
 # ===========================================================================
@@ -718,7 +783,8 @@ class ManageCacheActionTests(unittest.TestCase):
         hou = _make_hou({"Sop": {"box": ("Box", "")}})
         # stats / invalidate / warmup must all succeed
         st = disc.manage_cache(hou, action="stats")
-        self.assertIn("hits", st)
+        self.assertIn("node_types", st)
+        self.assertIn("hits", st["node_types"])
         cmn.invalidate_all_caches()
         # warmup: populate singleton
         res = disc.manage_cache(hou, action="warmup")
@@ -729,6 +795,234 @@ class ManageCacheActionTests(unittest.TestCase):
         hou = _make_hou({"Sop": {"box": ("Box", "")}})
         with self.assertRaises(ValueError):
             disc.manage_cache(hou, action="explode")
+
+
+# ===========================================================================
+# Section J: fix-mcp-dead-tools-p0 — manage_cache stats 主 spec 形状
+# ===========================================================================
+class ManageCacheStatsShapeTests(unittest.TestCase):
+    def setUp(self):
+        self._snapshot = list(cmn._cache_registry)
+
+    def tearDown(self):
+        cmn._cache_registry[:] = self._snapshot
+        from houdinimcp import _discovery as d
+        d.node_type_cache.clear()
+
+    def test_stats_field_set_per_cache(self):
+        hou = _make_hou({"Sop": {"box": ("Box", "")}})
+        disc.manage_cache(hou, action="warmup")
+        st = disc.manage_cache(hou, action="stats")
+        self.assertEqual(st["status"], "success")
+        for cache_key in ("node_types", "parameter_schemas"):
+            self.assertIn(cache_key, st)
+            fields = st[cache_key]
+            for k in ("valid", "hits", "misses", "hit_rate",
+                      "invalidations", "entry_count", "last_populate_ms"):
+                self.assertIn(k, fields, "%s.%s missing" % (cache_key, k))
+
+    def test_stats_node_types_populated(self):
+        hou = _make_hou({"Sop": {"box": ("Box", "")}})
+        disc.manage_cache(hou, action="warmup")
+        st = disc.manage_cache(hou, action="stats")
+        nt = st["node_types"]
+        self.assertTrue(nt["valid"])
+        self.assertGreater(nt["entry_count"], 0)
+        self.assertIsNotNone(nt["last_populate_ms"])
+
+    def test_stats_parameter_schemas_placeholder(self):
+        # parameter_schemas 缓存尚未落地：零值占位 + valid=False（不伪造）
+        hou = _make_hou({"Sop": {"box": ("Box", "")}})
+        st = disc.manage_cache(hou, action="stats")
+        ps = st["parameter_schemas"]
+        self.assertFalse(ps["valid"])
+        self.assertEqual(ps["entry_count"], 0)
+        self.assertEqual(ps["hits"], 0)
+        self.assertEqual(ps["misses"], 0)
+
+    def test_hit_rate_computed(self):
+        # 单例 hits/misses 跨测试累积 — 用增量断言 + hit_rate 自洽校验
+        hou = _make_hou({"Sop": {"box": ("Box", "")}})
+        before = disc.node_type_cache.stats()
+        disc.manage_cache(hou, action="warmup")
+        disc.node_type_cache.get(category="Sop")     # hit
+        disc.node_type_cache.get(category="Sop")     # hit
+        disc.node_type_cache.get(category="Nope")    # miss
+        nt = disc.manage_cache(hou, action="stats")["node_types"]
+        self.assertEqual(nt["hits"] - before["hits"], 2)
+        self.assertEqual(nt["misses"] - before["misses"], 1)
+        self.assertAlmostEqual(
+            nt["hit_rate"],
+            round(float(nt["hits"]) / (nt["hits"] + nt["misses"]), 4))
+
+    def test_invalidate_counts(self):
+        from houdinimcp import _discovery as d
+        d.node_type_cache.clear()
+        st = disc.manage_cache(_make_hou({"Sop": {"box": ("Box", "")}}),
+                               action="stats")
+        base = st["node_types"]["invalidations"]
+        disc.manage_cache(_make_hou({"Sop": {}}), action="invalidate")
+        st2 = disc.manage_cache(_make_hou({"Sop": {}}), action="stats")
+        self.assertEqual(st2["node_types"]["invalidations"], base + 1)
+        self.assertFalse(st2["node_types"]["valid"])
+
+
+# ===========================================================================
+# Section K: fix-mcp-dead-tools-p0 — populate 复用 + H21 label 兜底
+# ===========================================================================
+class PopulateReuseTests(unittest.TestCase):
+    def setUp(self):
+        self._snapshot = list(cmn._cache_registry)
+
+    def tearDown(self):
+        cmn._cache_registry[:] = self._snapshot
+        from houdinimcp import _discovery as d
+        d.node_type_cache.clear()
+
+    def test_second_populate_skips_enumeration(self):
+        calls = {"n": 0}
+
+        class _CountingHou(object):
+            def nodeTypeCategories(self):
+                calls["n"] += 1
+                return {"Sop": _FakeCategory("Sop")}
+
+        set_categories({"Sop": {"box": ("Box", "")}})
+        cache = disc.NodeTypeCache()
+        cache.populate(_CountingHou())
+        self.assertEqual(calls["n"], 1)
+        self.assertGreater(cache.size(), 0)
+        first_ms = cache.stats()["last_populate_ms"]
+        # 第二次 populate：已填充未失效 → 跳过（nodeTypeCategories 不再被调）
+        cache.populate(_CountingHou())
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(cache.stats()["last_populate_ms"], first_ms)
+
+    def test_populate_after_invalidate_reruns(self):
+        calls = {"n": 0}
+
+        class _CountingHou(object):
+            def nodeTypeCategories(self):
+                calls["n"] += 1
+                return {"Sop": _FakeCategory("Sop")}
+
+        set_categories({"Sop": {"box": ("Box", "")}})
+        cache = disc.NodeTypeCache()
+        cache.populate(_CountingHou())
+        cache.invalidate()
+        self.assertEqual(cache.size(), 0)
+        cache.populate(_CountingHou())
+        self.assertEqual(calls["n"], 2)
+        self.assertGreater(cache.size(), 0)
+
+    def test_list_node_types_twice_enumerates_once(self):
+        calls = {"n": 0}
+
+        class _CountingHou(object):
+            def nodeTypeCategories(self):
+                calls["n"] += 1
+                return {"Sop": _FakeCategory("Sop")}
+
+        set_categories({"Sop": {"box": ("Box", "")}})
+        res1 = disc.list_node_types(_CountingHou(), category="Sop")
+        res2 = disc.list_node_types(_CountingHou(), category="Sop")
+        self.assertEqual(calls["n"], 1)
+        self.assertGreater(res1["total"], 0)
+        self.assertGreater(res2["total"], 0)
+        # 两次 get 都命中缓存 → hits >= 2
+        st = disc.node_type_cache.stats()
+        self.assertGreaterEqual(st["hits"], 2)
+
+
+class H21LabelFallbackTests(unittest.TestCase):
+    """H21 hou.NodeType 没有 label()（fix-mcp-dead-tools-p0 根因）——
+    populate 必须回退 description() 且不清空其他 entry。"""
+
+    class _H21FakeNodeType(object):
+        """模拟 H21 NodeType：只有 name()/description()，无 label()。"""
+
+        def __init__(self, name, description=""):
+            self._name = name
+            self._description = description
+
+        def name(self):
+            return self._name
+
+        def description(self):
+            return self._description
+
+    class _H21FakeCategory(object):
+        def __init__(self, name, nt_dict):
+            self._name = name
+            self._nt_dict = nt_dict
+
+        def name(self):
+            return self._name
+
+        def nodeTypes(self):
+            return self._nt_dict
+
+    def _make_hou(self):
+        sop_types = {
+            "box": self._H21FakeNodeType("box", "Box"),
+            "sphere": self._H21FakeNodeType("sphere", "Sphere"),
+        }
+        obj_types = {"geo": self._H21FakeNodeType("geo", "Geometry")}
+
+        class _H(object):
+            def nodeTypeCategories(self2):
+                return {
+                    "Sop": self._H21FakeCategory("Sop", sop_types),
+                    "Object": self._H21FakeCategory("Object", obj_types),
+                }
+
+        return _H()
+
+    def test_populate_fast_survives_missing_label(self):
+        cache = disc.NodeTypeCache()
+        cache.populate(self._make_hou())
+        self.assertGreater(cache.size(), 0)
+        items = cache.get(category="Sop")
+        names = {it["name"] for it in items}
+        self.assertIn("box", names)
+        self.assertIn("sphere", names)
+        # label 回退 description()
+        box = [it for it in items if it["name"] == "box"][0]
+        self.assertEqual(box["label"], "Box")
+        self.assertEqual(box["description"], "Box")
+
+    def test_populate_standard_survives_missing_label(self):
+        cache = disc.NodeTypeCache()
+        disc._populate_standard(cache, self._make_hou())
+        self.assertGreater(cache.size(), 0)
+        items = cache.get(category="Object")
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["name"], "geo")
+        self.assertEqual(items[0]["label"], "Geometry")
+
+    def test_one_bad_category_does_not_clear_others(self):
+        sop_cat = self._H21FakeCategory(
+            "Sop", {"box": self._H21FakeNodeType("box", "Box")})
+
+        class _BadCategory(object):
+            def name(self):
+                raise RuntimeError("boom")
+
+            def nodeTypes(self):
+                return {}
+
+        class _H(object):
+            def nodeTypeCategories(self):
+                return {
+                    "Bad": _BadCategory(),
+                    "Sop": sop_cat,
+                }
+
+        cache = disc.NodeTypeCache()
+        disc._populate_standard(cache, _H())
+        self.assertGreater(cache.size(), 0)
+        names = {it["name"] for it in cache.get(category="Sop")}
+        self.assertIn("box", names)
 
 
 if __name__ == "__main__":

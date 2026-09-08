@@ -1684,25 +1684,42 @@ class HoudiniMCPServer:
                                    max_depth=max_depth)
 
     def list_node_types(self, category=None, name_filter=None, limit=50, cursor=None):
-        """PR 6: 列出 Houdini 节点类型（paginated）。thin wrapper to disc.list_node_types."""
+        """PR 6: 列出 Houdini 节点类型。thin wrapper to disc.list_node_types.
+
+        fix-mcp-dead-tools-p0：返回主 spec 信封
+        ``{status, node_types, count, total, has_more, cursor}``（多取 1 判
+        has_more，不返回 lookahead 项）。
+        """
         return disc.list_node_types(hou, category=category, name_filter=name_filter,
                                     limit=limit, cursor=cursor)
 
     def list_children(self, node_path="/", recursive=False, max_depth=5,
                       max_nodes=1000, compact=False, limit=50, cursor=None):
-        """PR 6: 列出 node_path 的子节点。thin wrapper to disc.list_children."""
+        """PR 6: 列出 node_path 的子节点。thin wrapper to disc.list_children.
+
+        fix-mcp-dead-tools-p0：返回主 spec 信封
+        ``{status, node_path, children, count, total, has_more, cursor}``。
+        """
         return disc.list_children(hou, node_path=node_path, recursive=recursive,
                                   max_depth=max_depth, max_nodes=max_nodes,
                                   compact=compact, limit=limit, cursor=cursor)
 
     def find_nodes(self, root_path="/", pattern=None, node_type=None,
                    limit=50, cursor=None):
-        """PR 6: 在 root_path 下用 pattern / node_type 过滤查找。thin wrapper to disc.find_nodes."""
+        """PR 6: 在 root_path 下用 pattern / node_type 过滤查找。thin wrapper to disc.find_nodes.
+
+        fix-mcp-dead-tools-p0：返回主 spec 信封
+        ``{status, root_path, matches, count, total, has_more, cursor}``。
+        """
         return disc.find_nodes(hou, root_path=root_path, pattern=pattern,
                                node_type=node_type, limit=limit, cursor=cursor)
 
     def manage_cache(self, action="stats"):
-        """PR 6: cache 管理（stats / invalidate / warmup）。thin wrapper to disc.manage_cache."""
+        """PR 6: cache 管理（stats / invalidate / warmup）。thin wrapper to disc.manage_cache.
+
+        fix-mcp-dead-tools-p0：stats 返回主 spec per-cache 形状
+        ``{status, node_types: {...}, parameter_schemas: {...}}``。
+        """
         return disc.manage_cache(hou, action=action)
 
     def create_material(self, material_type, name=None, parent_path="/mat",

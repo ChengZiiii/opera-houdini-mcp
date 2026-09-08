@@ -520,14 +520,20 @@ class PR11BridgeStyleTests(unittest.TestCase):
             "Expected 1 PR 11 bridge tool, found {0}: {1}".format(
                 len(self.tools), list(self.tools.keys())))
 
-    def test_all_tools_no_type_annotations(self):
+    def test_all_tools_numeric_bool_annotations(self):
+        # fix-mcp-dead-tools-p0：数值/布尔参数必须注解 int/float/bool；字符
+        # 串参数保持无注解；返回值保持无注解。
         for name, fn in self.tools.items():
-            kinds = _signature_annotation_kinds(fn)
-            self.assertFalse(
-                kinds["arg_annotations"],
-                "{0} must not have parameter type annotations".format(name))
-            self.assertFalse(
-                kinds["return_annotation"],
+            for arg in (fn.args.posonlyargs + fn.args.args
+                        + fn.args.kwonlyargs):
+                ann = arg.annotation
+                if ann is None:
+                    continue
+                self.assertIsInstance(ann, ast.Name, name)
+                self.assertIn(ann.id, ("int", "float", "bool"),
+                              "%s.%s" % (name, arg.arg))
+            self.assertIsNone(
+                fn.returns,
                 "{0} must not have return type annotation".format(name))
 
     def test_all_tools_chinese_docstring(self):

@@ -1207,13 +1207,22 @@ class BridgeStyleTests(unittest.TestCase):
                          "Expected 15 bridge tools, found {0}: {1}".format(
                              len(self.tools), list(self.tools.keys())))
 
-    def test_no_type_annotations(self):
+    def test_numeric_bool_annotations(self):
+        # fix-mcp-dead-tools-p0：数值/布尔参数必须注解 int/float/bool（如
+        # max_prims: int / time: float）；字符串参数保持无注解；返回值保持
+        # 无注解。
         for name, fn in self.tools.items():
             for arg in (fn.args.posonlyargs + fn.args.args
                         + fn.args.kwonlyargs):
-                self.assertIsNone(arg.annotation,
-                                   "{0} has annotation on {1}".format(
-                                       name, arg.arg))
+                ann = arg.annotation
+                if ann is None:
+                    continue
+                self.assertIsInstance(ann, ast.Name,
+                                      "{0} has non-simple annotation on "
+                                      "{1}".format(name, arg.arg))
+                self.assertIn(ann.id, ("int", "float", "bool"),
+                              "{0} annotation on {1} must be "
+                              "int/float/bool".format(name, arg.arg))
             self.assertIsNone(fn.returns,
                                "{0} has return annotation".format(name))
 
