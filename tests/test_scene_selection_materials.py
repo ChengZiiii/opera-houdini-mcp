@@ -1127,6 +1127,9 @@ class BridgeToolStyleTests(unittest.TestCase):
     def test_numeric_bool_annotations_on_new_tools(self):
         # fix-mcp-dead-tools-p0：数值/布尔参数必须注解 int/float/bool（如
         # max_depth: int / include_params: bool）；字符串参数保持无注解。
+        # 1.4 补漏：create_material.parameters 改 Dict[str, Any]（服务端
+        # _materials 直接 .items()，拒收 JSON 字符串），允许 typing 下标
+        # 注解。
         funcs = self._find_mcp_tool_functions()
         names_to_check = set(SCENE_MAT_CHANGE_9)
         for fn in funcs:
@@ -1135,6 +1138,13 @@ class BridgeToolStyleTests(unittest.TestCase):
             for arg in fn.args.args:
                 ann = arg.annotation
                 if ann is None:
+                    continue
+                if isinstance(ann, ast.Subscript):
+                    base = getattr(ann.value, "id", None)
+                    self.assertIn(
+                        base, ("List", "list", "Dict", "dict"),
+                        "tool %s arg %s subscript annotation base must be "
+                        "List/Dict" % (fn.name, arg.arg))
                     continue
                 self.assertIsInstance(
                     ann, ast.Name,

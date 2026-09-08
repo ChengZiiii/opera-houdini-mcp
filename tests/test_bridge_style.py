@@ -4,6 +4,13 @@ PR 7 brief mandates for the 3 newly added @mcp.tool() functions:
 - No type annotations in the signature (parameters or return).
 - Docstring must be Chinese (CJK characters present), not English.
 
+Amendment (fix-mcp-dead-tools-p0 task 1.4): annotations are now allowed
+where the server-side handler requires a real JSON type. create_material's
+``parameters`` MUST be annotated as a dict type (server-side _materials
+calls ``parameters.items()`` directly; a JSON string crashes with
+"'str' object has no attribute 'items'"). Other PR 7 params stay
+un-annotated; return annotations stay forbidden.
+
 These checks use AST parsing only — they do NOT import houdini_mcp_server.py
 because that module has heavy runtime dependencies (mcp, requests, dotenv,
 langchain). We parse the source file as text and inspect the AST node ranges
@@ -120,13 +127,31 @@ class PR7BridgeStyleTests(unittest.TestCase):
                 len(self.fns), [f.name for f in self.fns]))
 
     def test_create_material_no_type_annotations(self):
+        # fix-mcp-dead-tools-p0 1.4：parameters 改 dict 注解；其余参数与
+        # 返回值保持无注解。
         fn = next(f for f in self.fns if f.name == "create_material")
-        kinds = _signature_annotation_kinds(fn)
-        self.assertFalse(
-            kinds["arg_annotations"],
-            "create_material must not have parameter type annotations")
-        self.assertFalse(
-            kinds["return_annotation"],
+        by_name = {a.arg: a for a in fn.args.args}
+        # parameters 必须是 dict 型注解（dict 或 Dict[...]）
+        ann = by_name["parameters"].annotation
+        self.assertIsNotNone(
+            ann, "create_material.parameters must be annotated (dict type)")
+        is_dict = (
+            (isinstance(ann, ast.Name) and ann.id == "dict")
+            or (isinstance(ann, ast.Subscript)
+                and isinstance(ann.value, ast.Name)
+                and ann.value.id in ("dict", "Dict"))
+        )
+        self.assertTrue(
+            is_dict,
+            "create_material.parameters annotation must be dict, got %s"
+            % (ast.unparse(ann) if ann is not None else None))
+        # 其余参数保持无注解
+        for pname in ("ctx", "material_type", "name", "parent_path"):
+            self.assertIsNone(
+                by_name[pname].annotation,
+                "create_material.%s must stay un-annotated" % pname)
+        self.assertIsNone(
+            fn.returns,
             "create_material must not have return type annotation")
 
     def test_assign_material_no_type_annotations(self):

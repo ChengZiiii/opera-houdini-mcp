@@ -3413,7 +3413,8 @@ def get_attrib_values(ctx, node_path, attribute, attrib_class="point",
 
 
 @mcp.tool()
-def get_prim_intrinsics(ctx, node_path, prim_index: int, names=None):
+def get_prim_intrinsics(ctx, node_path, prim_index: int,
+                        names: List[str] = None):
     """仅查询指定 ``prim_index`` 的 intrinsics
     （add-geometry-export-and-measure，NO_UNDO）。
 
@@ -3427,7 +3428,8 @@ def get_prim_intrinsics(ctx, node_path, prim_index: int, names=None):
 
 
 @mcp.tool()
-def find_nearest_point(ctx, node_path, position, max_distance: float = 1.0):
+def find_nearest_point(ctx, node_path, position: List[float],
+                       max_distance: float = 1.0):
     """最近点查询：``Point | None`` 双路径
     （add-geometry-export-and-measure，NO_UNDO）。
 
@@ -4617,7 +4619,7 @@ def verify_hou_api(ctx, item_name, help_type="python_hou", timeout: int = 10):
 @mcp.tool()
 def create_material(ctx, material_type,
                     name=None, parent_path="/mat",
-                    parameters=None):
+                    parameters: Dict[str, Any] = None):
     """在 Houdini 中创建一个材质节点并返回节点信息。
 
     参数说明：

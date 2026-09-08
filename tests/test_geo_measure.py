@@ -1261,18 +1261,48 @@ class BridgeStyleTests(unittest.TestCase):
     def test_numeric_bool_annotations(self):
         # fix-mcp-dead-tools-p0：数值/布尔参数必须注解 int/float/bool（如
         # offset/limit: int、prim_index: int、max_distance: float、
-        # overwrite: bool）；字符串 / JSON 参数保持无注解；返回值保持无注解。
+        # overwrite: bool）；字符串参数保持无注解；返回值保持无注解。
+        # 1.4 补漏：服务端不做 JSON 字符串解析的列表参数改真实 list 注解
+        # （names: List[str]、position: List[float]——_geo_measure 对
+        # names 做 isinstance(names, list)、对 position 走 _coerce_position
+        # 仅收 list/tuple），故允许 typing.List 下标注解。
         for name, fn in self.tools.items():
             for arg in (fn.args.posonlyargs + fn.args.args
                         + fn.args.kwonlyargs):
                 ann = arg.annotation
                 if ann is None:
                     continue
+                if isinstance(ann, ast.Subscript):
+                    base = getattr(ann.value, "id", None)
+                    self.assertIn(
+                        base, ("List", "list"),
+                        "%s.%s subscript annotation base must be List"
+                        % (name, arg.arg))
+                    continue
                 self.assertIsInstance(ann, ast.Name, name)
                 self.assertIn(ann.id, ("int", "float", "bool"),
                               "%s.%s" % (name, arg.arg))
             self.assertIsNone(fn.returns,
                                "{0} has return annotation".format(name))
+
+    def test_list_params_annotated(self):
+        # fix-mcp-dead-tools-p0 1.4：names / position 必须是 List[...] 注解
+        # （服务端拒收 JSON 字符串，schema 必须声明 array）。
+        by_name = {name: fn for name, fn in self.tools.items()}
+        for tool, pname in (("get_prim_intrinsics", "names"),
+                            ("find_nearest_point", "position")):
+            fn = by_name.get(tool)
+            self.assertIsNotNone(fn, "bridge tool %s missing" % tool)
+            arg = next((a for a in fn.args.args if a.arg == pname), None)
+            self.assertIsNotNone(arg, "%s.%s missing" % (tool, pname))
+            ann = arg.annotation
+            self.assertIsNotNone(
+                ann, "%s.%s must be annotated List[...]" % (tool, pname))
+            self.assertIsInstance(
+                ann, ast.Subscript,
+                "%s.%s annotation must be List[...]" % (tool, pname))
+            self.assertEqual(getattr(ann.value, "id", None), "List",
+                             "%s.%s must use typing.List" % (tool, pname))
 
     def test_chinese_docstring(self):
         for name, fn in self.tools.items():
