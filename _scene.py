@@ -108,8 +108,27 @@ def load_scene(hou, file_path):
 
     加载完成后调用 cmn.invalidate_all_caches() 让上层缓存模块感知场景切换
     （PR 5 占位 no-op，PR 6 替换为真实清空）。
+
+    fix-mcp-help-cap-protocol：捕获 ``hou.LoadWarning``（缺资产 / 缺 HDA
+    等 hip 可加载但带警告的场景）——场景**已实际加载**，先失效缓存再
+    返回 ``status=success`` + ``warning``（截断 500 字符），MUST NOT 当
+    error 上报导致客户端误判加载失败。真异常（LoadError 等）照旧向上
+    传播。stub / 旧版 hou 无 LoadWarning 属性时走原路径。
     """
-    hou.hipFile.load(file_path)
+    load_warning_cls = getattr(hou, "LoadWarning", None)
+    try:
+        hou.hipFile.load(file_path)
+    except Exception as exc:
+        if (load_warning_cls is not None
+                and isinstance(exc, load_warning_cls)):
+            cmn.invalidate_all_caches()
+            return {
+                "loaded": True,
+                "file_path": file_path,
+                "status": "success",
+                "warning": str(exc)[:500],
+            }
+        raise
     cmn.invalidate_all_caches()
     return {
         "loaded": True,
@@ -787,7 +806,7 @@ def list_takes(hou):
     try:
         takes = list(takes_fn() or [])
     except Exception as exc:
-        return cmn.apply_response_cap(_error("takes_query_failed", exc))
+        return cmn.apply_response_cap(_error("takes_query_failed", str(exc)))
     entries = []
     total = len(takes)
     for take in takes[:_DEFAULT_TAKES_LIMIT]:
@@ -819,7 +838,7 @@ def get_current_take(hou):
     try:
         current = current_fn()
     except Exception as exc:
-        return cmn.apply_response_cap(_error("current_take_query_failed", exc))
+        return cmn.apply_response_cap(_error("current_take_query_failed", str(exc)))
     if current is None:
         return cmn.apply_response_cap(_success(
             {"name": "", "path": "", "parent": None, "current": False}))
@@ -877,7 +896,7 @@ def set_current_take(hou, name_or_path):
         set_current(take)
     except Exception as exc:
         return cmn.apply_response_cap(_error(
-            "set_current_take_failed", exc,
+            "set_current_take_failed", str(exc),
             details={"identifier": str(name_or_path),
                      "take_path": _take_attr_str(take, "path")}))
     return cmn.apply_response_cap(_success({
@@ -960,7 +979,7 @@ def create_take(hou, name, include_parms=None, parent_take=None):
             parent = current_fn()
         except Exception as exc:
             return cmn.apply_response_cap(_error(
-                "parent_take_query_failed", exc))
+                "parent_take_query_failed", str(exc)))
     else:
         if isinstance(parent_take, str):
             parent, parent_error = _resolve_take(hou, parent_take)
@@ -1040,7 +1059,7 @@ def create_take(hou, name, include_parms=None, parent_take=None):
         new_take = add_child(trimmed_name)
     except Exception as exc:
         return cmn.apply_response_cap(_error(
-            "add_child_take_failed", exc,
+            "add_child_take_failed", str(exc),
             details={"parent": _take_attr_str(parent, "path"),
                      "name": trimmed_name}))
     if new_take is None:
@@ -1086,7 +1105,7 @@ def create_take(hou, name, include_parms=None, parent_take=None):
                     add_pt(tup)
                 except Exception as exc:
                     return cmn.apply_response_cap(_error(
-                        "add_parm_tuple_failed", exc,
+                        "add_parm_tuple_failed", str(exc),
                         details={"node_path": node_path,
                                  "parm_tuple": parm_tuple_name}))
                 applied.append({

@@ -439,56 +439,94 @@ def _find_truncation_target(obj):
 
 
 def apply_response_cap(data, max_bytes=16384):
-    """二分查找最优截断点：先把列表长度折半试探，直到序列化结果 <= max_bytes。"""
+    """响应体大小封顶（fix-mcp-help-cap-protocol 多 list 迭代加固）。
+
+    截断循环：截当前最大 list → 重算序列化大小 → 仍超限 → 取下一个
+    list，直到 ``len(json.dumps(...).encode()) <= max_bytes`` 或候选
+    耗尽；list 耗尽后再尝试顶层字符串二分截断（既有行为）。
+
+    全部手段用尽仍超限 → 返回 metadata-only 降级 envelope
+    ``{"status": "error", "error": {"code": "response_too_large"},
+    "_original_size_bytes": N}``——**绝不**返回未封顶原数据。
+
+    元数据语义：全局 ``_truncated`` / ``_original_size`` /
+    ``_truncated_count``（被截元素总数）+ 每个被截 field 的
+    ``<field>_original_count`` / ``<field>_preserved_count``。
+    """
     if _serialized_size(data) <= max_bytes:
         return data
     capped = copy.deepcopy(data)
-    target = _find_truncation_target(capped)
-    if target is None:
-        # 没有任何可截断的 list；尝试字符串字段二分截断
-        capped = _try_str_truncate(capped, max_bytes)
-        if not capped.get("_truncated"):
-            capped["_truncated"] = True
-        capped["_original_size"] = _serialized_size(data)
-        return capped
-
-    path, original = target
-    parent = capped
-    for key in path[:-1]:
-        if not isinstance(parent, dict) or key not in parent:
-            return data
-        parent = parent[key]
-    if not isinstance(parent, dict) or path[-1] not in parent:
-        return data
-
     original_size = _serialized_size(data)
-    # 将最终元数据提前加入探针，确保最终结果也受 max_bytes 约束。
     capped["_truncated"] = True
     capped["_original_size"] = original_size
-    capped["_truncated_count"] = 0
+    total_cut = 0
 
-    # 二分搜索前缀长度
-    lo, hi = 0, len(original)
-    best = None
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        parent[path[-1]] = original[:mid]
-        capped["_truncated_count"] = len(original) - mid
-        if _serialized_size(capped) <= max_bytes:
-            best = mid
-            lo = mid + 1
+    while _serialized_size(capped) > max_bytes:
+        target = _find_truncation_target(capped)
+        if target is not None:
+            path, original = target
+            field = path[-1]
+            parent = capped
+            reachable = True
+            for key in path[:-1]:
+                if not isinstance(parent, dict) or key not in parent:
+                    reachable = False
+                    break
+                parent = parent[key]
+            if (not reachable or not isinstance(parent, dict)
+                    or field not in parent
+                    or not isinstance(parent[field], list)):
+                # 结构在迭代中变化（不应发生）；跳出走降级路径
+                break
+            # 二分搜索该 list 的最大可保留前缀
+            lo, hi = 0, len(original)
+            best = None
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                parent[field] = original[:mid]
+                capped["_truncated_count"] = total_cut + (len(original) - mid)
+                if _serialized_size(capped) <= max_bytes:
+                    best = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            if best is None:
+                # 该 list 截空仍超限（单个元素就超大）：置空后取下一候选
+                parent[field] = []
+                capped["%s_original_count" % field] = len(original)
+                capped["%s_preserved_count" % field] = 0
+                total_cut += len(original)
+                continue
+            parent[field] = original[:best]
+            capped["%s_original_count" % field] = len(original)
+            capped["%s_preserved_count" % field] = best
+            total_cut += len(original) - best
+            if best == 0:
+                # 保留既有语义：截空后删除该键
+                del parent[field]
         else:
-            hi = mid - 1
+            # 无 list 可截 → 顶层字符串二分截断（既有行为）。先把
+            # _truncated_count 探针置入（二分自洽，防出口补键后超限）
+            capped["_truncated_count"] = total_cut
+            size_before = _serialized_size(capped)
+            capped = _try_str_truncate(capped, max_bytes)
+            size_after = _serialized_size(capped)
+            if size_after <= max_bytes:
+                break
+            if size_after >= size_before:
+                # 无进展（无顶层长字符串可截）→ 放弃，走降级路径
+                break
 
-    # 列表缩到最短仍超限时，返回原数据，避免伪造截断标记。
-    if best is None:
-        return data
+    if _serialized_size(capped) <= max_bytes:
+        capped["_truncated_count"] = total_cut
+        return capped
 
-    parent[path[-1]] = original[:best]
-    capped["_truncated_count"] = len(original) - best
-    if best == 0:
-        del parent[path[-1]]
-    return capped
+    # 全部截空 / 截断仍超限 → metadata-only 降级（MUST NOT 返回原数据）
+    return {
+        "status": "error",
+        "error": {"code": "response_too_large"},
+        "_original_size_bytes": original_size,
+    }
 
 
 def _try_str_truncate(obj, max_bytes):
@@ -719,6 +757,9 @@ class ExecutionTimeoutError(Exception):
 # ---------------------------------------------------------------------------
 _VALID_POLICIES = ("read-only", "normal", "privileged")
 _BYPASS_TRUTHY = {"1", "true", "yes", "on"}
+# fix-mcp-help-cap-protocol：_run_code_thread 的 timed_out grace poll
+# 窗口（秒）。join 到期后线程在此窗口内退出 → 判正常完成（不误报超时）
+_GRACE_POLL_SECONDS = 0.25
 
 
 def validate_policy(policy):
@@ -1014,6 +1055,16 @@ def _run_code_thread(code, namespace, timeout=30):
     - exception_type / exception_message: 异常时填入
     注：超时情况下线程为 daemon，主进程退出时会被回收；不会自动 undo。
 
+    fix-mcp-help-cap-protocol（timed_out 误报修复）：
+    ``thread.join(timeout)`` 到期返回后立刻 ``is_alive()`` 存在收尾竞态
+    ——代码已完整执行（exec 返回、stdout 已写完、finally 已跑）但线程
+    尚未退出 run 方法时，``is_alive()`` 仍为 True，导致 audit 误报
+    ``timed_out=true, elapsed≈timeout``（实机复现：stdout 完整 + 节点
+    已清理仍报 30006ms 超时）。修法：join 到期后再做一次短 grace poll
+    （``_GRACE_POLL_SECONDS``，默认 0.25s），grace 内线程真退出则改判
+    正常完成并刷新 elapsed_ms；grace 后仍存活才定性 timed_out=True
+    （真超时路径不受影响）。
+
     Caveat — StringIO 写入的线程安全：
     超时返回时子线程（daemon）可能仍在执行，被 exec 中的 print/traceback
     会持续写入 stdout_capture / stderr_capture（io.StringIO）。io.StringIO
@@ -1044,8 +1095,15 @@ def _run_code_thread(code, namespace, timeout=30):
     start = time.time()
     thread.start()
     thread.join(timeout=timeout)
-    elapsed_ms = int((time.time() - start) * 1000)
     timed_out = thread.is_alive()
+    if timed_out:
+        # grace poll：join 到期瞬间线程可能正在收尾（exec 已完成、
+        # stdout 完整、finally 已跑），直接定性会误报 timed_out。
+        # 短等一段后仍存活才是真超时（如 sleep 35 > timeout 30）。
+        thread.join(_GRACE_POLL_SECONDS)
+        if not thread.is_alive():
+            timed_out = False
+    elapsed_ms = int((time.time() - start) * 1000)
 
     result = {
         "stdout": stdout_capture.getvalue(),

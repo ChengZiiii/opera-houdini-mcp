@@ -85,9 +85,12 @@ def _synthesize_ai_hint(item_name, help_result):
 
     规则：
       - 空 / None help_result → "" （防御性）
-      - status == "error"  → F3 fallback：提示用 hou.node(path).help() 或
-        print(hou.<Class>.<method>.__doc__) 拿本地 docstring；若仍失败
-        请在输出 `## Assumptions` 段记录假设。
+      - status == "error"  → 细分两类文案（fix-mcp-help-cap-protocol）：
+          - HTTP 404 → "页面/方法不存在（URL 构造正常）"，建议确认拼写
+            或改用 `hou.<Class>.__doc__` / hasattr 兜底
+          - 其余（URLError / timeout / 5xx / 白屏）→ F3 fallback：提示用
+            hou.node(path).help() 或 print(hou.<Class>.<method>.__doc__)
+            拿本地 docstring；若仍失败请在输出 `## Assumptions` 段记录假设
       - status == "success" 且 methods == []：
           - python_hou + item_name.startswith("ObjNode.") → F-C known
             pattern：OBJ 容器无 setDisplayNode 等 display 方法，改用
@@ -107,6 +110,16 @@ def _synthesize_ai_hint(item_name, help_result):
     if status == "error":
         # F3 fallback：本地 hou help + 假设日志
         err = help_result.get("error") or help_result.get("message") or ""
+        if "404" in str(err):
+            # fix-mcp-help-cap-protocol：404 ≠ 文档站不可达——URL 构造
+            # 正常但页面/方法不存在，提示确认拼写 / 改用本地 docstring
+            return (
+                "⚠ 页面/方法不存在（HTTP 404，URL 构造正常）: %s。"
+                "请确认拼写，或改用 print(hou.<Class>.<method>.__doc__) / "
+                "hasattr(obj, %r) 在本地验证； 若仍失败请在输出 "
+                "`## Assumptions` 段记录假设。"
+                % (err, item_name.split(".")[-1])
+            )
         return (
             "⚠ SideFX 文档站不可达: %s。 fallback: 试 "
             "hou.node(item_path).help() 或 print(hou.<Class>.<method>.__doc__)"
@@ -135,6 +148,24 @@ def _synthesize_ai_hint(item_name, help_result):
 
     # Unknown status
     return ""
+
+# ---------------------------------------------------------------------------
+# fix-mcp-help-cap-protocol：help 工具入口 timeout 规范化
+# ---------------------------------------------------------------------------
+def _clamp_help_timeout(timeout, default=10.0):
+    """``float(timeout)`` + clamp [1, 60]；非数值 / NaN / ±inf 回退默认。
+
+    双保险：bridge 侧参数注解修复合入前，字符串（如 ``"10"``）可能渗入
+    server 入口；直接透传给 urllib 会 TypeError。
+    """
+    try:
+        value = float(timeout)
+    except (TypeError, ValueError):
+        return default
+    if value != value or value in (float("inf"), float("-inf")):
+        return default
+    return max(1.0, min(value, 60.0))
+
 
 # Imports for OPUS import
 import zipfile
@@ -167,6 +198,13 @@ def _safe_server_print(message):
 _BATCH_DEFAULT_MAX_OPERATIONS = 50
 _BATCH_MIN_OPERATIONS = 1
 _BATCH_MAX_OPERATIONS = 200
+# 单条消息（长度前缀声明的 payload）硬上限；与 tests/_e2e_helpers.py 的
+# MAX_MSG_LEN 保持一致（fix-mcp-help-cap-protocol 3.3 提为模块常量）
+_MAX_MSG_LEN = 50 * 1024 * 1024
+# fix-mcp-help-cap-protocol（3.3 出站）：阻塞发送时的写超时（秒）——防
+# 恶意 / 挂死客户端让 sendall 永久阻塞 Houdini 主线程；正常慢读客户端
+# 在此窗口内足以收完 200KB 级响应
+_SEND_TIMEOUT_SECONDS = 30.0
 
 
 def _evaluate_render_policy_command(command, params):
@@ -976,11 +1014,31 @@ class HoudiniMCPServer:
                     if data:
                         self._last_activity = time.monotonic()
                         self.buffer += data
+                        # fix-mcp-help-cap-protocol（3.3 入站）：每 tick
+                        # 循环 recv 直到无数据（BlockingIOError），消除
+                        # 每 tick 8KB ≈ 80KB/s 的人为吞吐上限；同 tick 累积
+                        # 超过 4+MAX_MSG_LEN 字节时丢弃并断开（恶意前缀）。
+                        while True:
+                            try:
+                                more = self.client.recv(65536)
+                            except BlockingIOError:
+                                break
+                            if not more:
+                                break
+                            self.buffer += more
+                            if len(self.buffer) > 4 + _MAX_MSG_LEN:
+                                _safe_server_print(
+                                    "Receive buffer exceeded {0} bytes, "
+                                    "disconnecting client".format(
+                                        4 + _MAX_MSG_LEN))
+                                self.buffer = b''
+                                self._cleanup_client()
+                                break
                         while True:
                             if len(self.buffer) < 4:
                                 break
                             msg_len = struct.unpack('>I', self.buffer[:4])[0]
-                            MAX_MSG_LEN = 50 * 1024 * 1024
+                            MAX_MSG_LEN = _MAX_MSG_LEN
                             if msg_len > MAX_MSG_LEN:
                                 _safe_server_print(
                                     "Message too large ({0} bytes), disconnecting client".format(msg_len))
@@ -993,10 +1051,29 @@ class HoudiniMCPServer:
                             try:
                                 command = json.loads(payload.decode('utf-8'))
                                 response = self.execute_command(command)
-                                response_bytes = json.dumps(response).encode('utf-8')
+                                # default=str 兜底（fix-mcp-help-cap-protocol）：
+                                # 任何漏网的非可序列化值（异常对象 / hou 对象）
+                                # 不得让响应整体序列化失败——否则客户端无响应
+                                response_bytes = json.dumps(
+                                    response, default=str).encode('utf-8')
                                 response_frame = struct.pack('>I', len(response_bytes)) + response_bytes
                                 try:
-                                    self.client.sendall(response_frame)
+                                    # fix-mcp-help-cap-protocol（3.3 出站）：
+                                    # 非阻塞 socket 上 sendall 遇内核发送
+                                    # 缓冲满直接抛 BlockingIOError（OSError
+                                    # 子类）被误判"客户端断连"。大响应发送
+                                    # 前临时切阻塞 + 写超时，发完恢复非阻塞
+                                    # （单连接串行模型下安全）。
+                                    self.client.setblocking(True)
+                                    self.client.settimeout(_SEND_TIMEOUT_SECONDS)
+                                    try:
+                                        self.client.sendall(response_frame)
+                                    finally:
+                                        try:
+                                            self.client.settimeout(None)
+                                            self.client.setblocking(False)
+                                        except OSError:
+                                            pass
                                     self._last_activity = time.monotonic()
                                 except (BrokenPipeError, ConnectionResetError, OSError) as send_err:
                                     self._cleanup_client()
@@ -1678,10 +1755,13 @@ class HoudiniMCPServer:
 
         thin wrapper to scn.serialize_scene（spec `Scenario: serialize_scene`）。
         不在 MUTATING_COMMANDS 内（只读，AI 用于场景结构对比 / 文档生成）。
+        fix-mcp-help-cap-protocol：响应过 apply_response_cap（大网络 +
+        include_params=True 时节点树可轻易超 16KB）。
         """
-        return scn.serialize_scene(hou, root_path=root_path,
-                                   include_params=include_params,
-                                   max_depth=max_depth)
+        return cmn.apply_response_cap(scn.serialize_scene(
+            hou, root_path=root_path,
+            include_params=include_params,
+            max_depth=max_depth))
 
     def list_node_types(self, category=None, name_filter=None, limit=50, cursor=None):
         """PR 6: 列出 Houdini 节点类型。thin wrapper to disc.list_node_types.
@@ -1736,8 +1816,10 @@ class HoudiniMCPServer:
 
     def get_material_info(self, material_path):
         """PR 7: 查询材质节点详细参数 + texture 引用列表。
-        thin wrapper to mats.get_material_info."""
-        return mats.get_material_info(hou, material_path)
+        thin wrapper to mats.get_material_info.
+        fix-mcp-help-cap-protocol：响应过 apply_response_cap。"""
+        return cmn.apply_response_cap(
+            mats.get_material_info(hou, material_path))
 
     def execute_hscript(self, code):
         """PR 8: 在 Houdini 端执行 HScript 命令字符串。thin wrapper to hsc.execute_hscript.
@@ -1848,11 +1930,15 @@ class HoudiniMCPServer:
         后向兼容：
         - 旧调用 `get_node_info(path=...)` 仍 work（path 关键字回退为 node_path）。
         - 仅传 1 个位置参数（path / node_path）也兼容。
+
+        fix-mcp-help-cap-protocol：响应过 apply_response_cap（include_errors /
+        include_input_details 时非默认参数与连接列表可超 16KB）。
         """
         if node_path is None and path is not None:
             node_path = path
-        return ni.get_node_info(hou, node_path, include_errors, force_cook,
-                                include_input_details, compact)
+        return cmn.apply_response_cap(ni.get_node_info(
+            hou, node_path, include_errors, force_cook,
+            include_input_details, compact))
 
     def execute_code(self, code, policy="normal", allow_dangerous=False,
                      allow_heavy_geometry=False, capture_diff=False, timeout=30):
@@ -1909,11 +1995,14 @@ class HoudiniMCPServer:
                 ),
             }
 
-        # Step 4: undo group name（保持向后兼容：execute_code 不属于 MUTATING_COMMANDS
-        # 的硬编码集合，但 policy==privileged 时仍尝试 undo 包一层以便 agent 撤销）
+        # Step 4: undo group name（fix-mcp-help-cap-protocol：normal 与
+        # privileged 均包裹 undo group，spec 要求 normal 策略的非超时执行
+        # 可由 hou.undos.performUndo() 回滚；read-only 保持现状（写 API
+        # 在 policy 层已被拦截）。execute_code 不在 MUTATING_COMMANDS 硬
+        # 编码集合内（dispatcher 不重复包组），由本 handler 自管。）
         undo_group_name = None
-        if norm_policy == "privileged" and hasattr(hou, "undos"):
-            undo_group_name = "MCP: execute_code (privileged)"
+        if norm_policy in ("normal", "privileged") and hasattr(hou, "undos"):
+            undo_group_name = "MCP: execute_code ({0})".format(norm_policy)
 
         # Step 5: capture diff before
         global _before_scene, _after_scene
@@ -1982,6 +2071,13 @@ class HoudiniMCPServer:
             "stderr": stderr,
             "_audit": audit,
         }
+        if run_result.get("timed_out"):
+            # fix-mcp-help-cap-protocol：超时响应显式标注 daemon 线程可能
+            # 仍在 undo group 外运行（group 已随 with 退出关闭，线程后续
+            # 写入不进组、performUndo 无法回滚它们）
+            result["warning"] = (
+                "execution timed out; worker thread may still be running "
+                "outside the undo group")
         if stdout_truncated:
             result["stdout_truncated"] = True
         if stderr_truncated:
@@ -2209,6 +2305,9 @@ class HoudiniMCPServer:
         Set multiple parameters on a node in one call.
         Values: scalar for single parms, list for tuples (e.g. "t": [0, 1, 0]),
         menu token/label strings for menu parms.
+
+        fix-mcp-help-cap-protocol：响应过 apply_response_cap（applied 列表
+        含 previous/value，批量大参数集时可超 16KB）。
         """
         node = self._resolve_node(path)
         if not isinstance(parameters, dict) or not parameters:
@@ -2222,13 +2321,17 @@ class HoudiniMCPServer:
             except Exception as e:
                 failed.append({"name": name, "error": str(e)})
 
-        return {"node": node.path(), "set": applied, "failed": failed}
+        return cmn.apply_response_cap(
+            {"node": node.path(), "set": applied, "failed": failed})
 
     def get_parameter_schema(self, path, pattern=None, offset=0, limit=50):
         """
         Describe a node's parameters: name, label, type, size, current value,
         defaults, ranges and menu options. Filter with a glob 'pattern'
         (matched against name and label), paginate with offset/limit.
+
+        fix-mcp-help-cap-protocol：响应过 apply_response_cap（limit=200 ×
+        多属性 parm + menu 列表可超 16KB）。
         """
         node = self._resolve_node(path)
         limit = max(1, min(int(limit), 200))
@@ -2274,13 +2377,13 @@ class HoudiniMCPServer:
                     entry["menu_truncated"] = len(menu_items)
             entries.append(entry)
 
-        return {
+        return cmn.apply_response_cap({
             "node": node.path(),
             "node_type": node.type().name(),
             "total": len(parm_tuples),
             "offset": offset,
             "parameters": entries,
-        }
+        })
 
     def set_node_flags(self, path, display=None, render=None, bypass=None, template=None):
         """Set node flags; only the flags passed (non-None) are touched."""
@@ -2336,10 +2439,12 @@ class HoudiniMCPServer:
 
         薄封装到 _error_nodes.find_error_nodes，使用 node.allSubChildren()
         单次扫描（非递归），并返回 errors / warnings 双列表。
+        fix-mcp-help-cap-protocol：响应过 apply_response_cap；模块侧已
+        移除 `nodes` 别名（与 error_nodes 同 list 双份序列化）。
         """
-        return en.find_error_nodes(
+        return cmn.apply_response_cap(en.find_error_nodes(
             hou, root_path=root_path, include_warnings=include_warnings,
-            max_warnings=max_warnings, max_errors=max_errors)
+            max_warnings=max_warnings, max_errors=max_errors))
 
     def get_geo_summary(self, node_path, max_points_for_full=1000000,
                         sample_size=10):
@@ -2547,6 +2652,9 @@ class HoudiniMCPServer:
         Read actual attribute values from geometry, paginated.
         element: 'points' or 'primitives'. attributes: list of names
         (default: position for points, type info for prims).
+
+        fix-mcp-help-cap-protocol：响应过 apply_response_cap（limit=500 ×
+        多属性时原始 JSON 可远超 16KB；spec Scenario: 大响应受控）。
         """
         sop = self._resolve_geometry_node(path)
         geo = sop.geometry()
@@ -2587,14 +2695,14 @@ class HoudiniMCPServer:
                 row[attrib.name()] = self._jsonable(elem.attribValue(attrib))
             rows.append(row)
 
-        return {
+        return cmn.apply_response_cap({
             "node": sop.path(),
             "element": element,
             "total": total,
             "start": start,
             "count": len(rows),
             "data": rows,
-        }
+        })
 
     # -------------------------------------------------------------------------
     # set_material (now completed)
@@ -3525,9 +3633,14 @@ class HoudiniMCPServer:
         自动回退 SideFX 在线。返回 dict 透传 `_source`（`"local"` /
         `"online"` / `""`）与 `_fallback_reason`（回退原因短串）供 AI 判断。
 
+        fix-mcp-help-cap-protocol：入口对 ``timeout`` 做 ``float()`` + clamp
+        ``[1, 60]``（防御字符串渗入，如 ``timeout="10"``）；python_hou 的
+        ``Class.method`` 点号名由 _help 拆分为类页面 + 方法匹配。
+
         HTTP 4xx / 5xx / 网络错误 / timeout / 白屏 均降级为 status=error 字典
         或回退在线，不抛异常。响应整体过 cmn.apply_response_cap 截断大 payload。
         """
+        timeout = _clamp_help_timeout(timeout)
         result = hlp.get_houdini_help(
             help_type, item_name, timeout=timeout)
         return cmn.apply_response_cap(result)
@@ -3551,7 +3664,8 @@ class HoudiniMCPServer:
         `_ai_hint` 合成逻辑不依赖这两个 advisory 字段。
 
         `_ai_hint` 规则（参考 design.md §2）：
-          - status=error                       → F3 fallback 提示
+          - status=error（404）                → "页面/方法不存在" 提示
+          - status=error（URLError/timeout）   → F3 "文档站不可达" 提示
           - status=success + methods=[]        → "API 不存在" / F-C 提示
           - status=success + methods=非空       → "已找到方法: <sig>" 提示
           - 空 / 未知 status                    → "" （防御性）
@@ -3560,6 +3674,7 @@ class HoudiniMCPServer:
         fallback（如 setDisplayFlag）应优先按 hint 推荐的方式调，
         避免直接调不存在的 hou.ObjNode 方法导致 Houdini 卡死。
         """
+        timeout = _clamp_help_timeout(timeout)
         result = hlp.get_houdini_help(
             help_type, item_name, timeout=timeout)
         result["_ai_hint"] = _synthesize_ai_hint(item_name, result)

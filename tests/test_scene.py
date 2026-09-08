@@ -378,6 +378,67 @@ class LoadSceneTests(unittest.TestCase):
 
 
 # ===========================================================================
+# fix-mcp-help-cap-protocol（3.4）：load_scene 的 hou.LoadWarning 处理
+# ===========================================================================
+class _FakeLoadWarning(Exception):
+    """hou.LoadWarning stand-in（真实类由各测试自行挂到 fake hou 上）。"""
+
+
+class LoadSceneWarningTests(unittest.TestCase):
+    """LoadWarning = 场景已实际加载但带警告：MUST NOT 上报 error。"""
+
+    def _make_hou_with_warning(self):
+        hou = _make_hou()
+        hou.LoadWarning = _FakeLoadWarning
+
+        def _load(path, **kwargs):
+            raise _FakeLoadWarning(
+                "Warnings were generated during load.\n"
+                "Some assets could not be found")
+        hou.hipFile.load = _load
+        return hou
+
+    def test_load_warning_returns_success_with_warning(self):
+        hou = self._make_hou_with_warning()
+        result = scn.load_scene(hou, "/tmp/missing_assets.hip")
+        self.assertEqual(result.get("status"), "success")
+        self.assertTrue(result.get("loaded"))
+        self.assertIn("could not be found", result.get("warning", ""))
+
+    def test_load_warning_warning_truncated_to_500(self):
+        hou = self._make_hou_with_warning()
+
+        def _load_long(path, **kwargs):
+            raise _FakeLoadWarning("w" * 5000)
+        hou.hipFile.load = _load_long
+        result = scn.load_scene(hou, "/tmp/x.hip")
+        self.assertEqual(len(result.get("warning", "")), 500)
+
+    def test_load_warning_invalidates_caches(self):
+        hou = self._make_hou_with_warning()
+        called = {"n": 0}
+        original = cmn.invalidate_all_caches
+        cmn.invalidate_all_caches = lambda: called.__setitem__(
+            "n", called["n"] + 1)
+        try:
+            scn.load_scene(hou, "/tmp/x.hip")
+            self.assertEqual(called["n"], 1,
+                             "LoadWarning path must invalidate caches")
+        finally:
+            cmn.invalidate_all_caches = original
+
+    def test_other_exceptions_still_propagate(self):
+        hou = self._make_hou_with_warning()
+
+        def _load_err(path, **kwargs):
+            raise hou.OperationFailed("corrupt hip")
+        hou.OperationFailed = type("OperationFailed", (Exception,), {})
+        hou.hipFile.load = _load_err
+        with self.assertRaises(hou.OperationFailed):
+            scn.load_scene(hou, "/tmp/corrupt.hip")
+
+
+# ===========================================================================
 # Section D: _scene.new_scene
 # ===========================================================================
 class NewSceneTests(unittest.TestCase):

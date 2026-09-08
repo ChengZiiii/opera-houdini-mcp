@@ -43,13 +43,16 @@ def find_error_nodes(hou, root_path="/", include_warnings=True,
                 ...
             ],
             "scan_root": str,             # root.path()
-            # --- 旧契约兼容别名（PR 11 reviewer Critical finding）---
             "error_node_count": int,      # == len(error_nodes)
-            "nodes": [error_node_dict, ...]  # == error_nodes（仅 error）
         }
 
     Raises:
         ValueError: root_path 不存在
+
+    fix-mcp-help-cap-protocol（2.3）：移除旧契约兼容别名 ``nodes``（曾与
+    ``error_nodes`` 引用同一 list，JSON 序列化时同一节点列表出现两份，
+    翻倍响应体）。``error_node_count`` 保留（int 无序列化负担）；
+    旧客户端请改读 ``error_nodes``。
     """
     root = hou.node(root_path)
     if root is None:
@@ -115,7 +118,8 @@ def find_error_nodes(hou, root_path="/", include_warnings=True,
         "_errors_truncated": _errors_truncated,
         "_scan_errors": _scan_errors,
         "scan_root": root.path(),
-        # --- 旧契约兼容别名（PR 11 reviewer Critical finding）---
+        # fix-mcp-help-cap-protocol（2.3）：nodes 别名已移除（与
+        # error_nodes 同 list 双份序列化翻倍响应体）；error_node_count
+        # 保留（int 无序列化负担）。
         "error_node_count": len(error_nodes),
-        "nodes": error_nodes,
     }

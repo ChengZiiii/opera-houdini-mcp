@@ -888,7 +888,8 @@ class EnvOverrideTests(unittest.TestCase):
     def test_defaults_when_env_unset(self):
         mod = _load_help_fresh()
         self.assertEqual(mod.LOCAL_HELP_BASE, "http://127.0.0.1:48626/")
-        self.assertAlmostEqual(mod.LOCAL_HELP_TIMEOUT, 2.5)
+        # fix-mcp-help-cap-protocol：2.5 → 8.0（H21 本地 ~1MB 页面需 6-8s）
+        self.assertAlmostEqual(mod.LOCAL_HELP_TIMEOUT, 8.0)
         self.assertAlmostEqual(mod.LOCAL_HELP_COOLDOWN, 60.0)
         self.assertFalse(mod.LOCAL_HELP_DISABLED)
 
@@ -905,7 +906,8 @@ class EnvOverrideTests(unittest.TestCase):
     def test_timeout_clamped_high(self):
         os.environ["HOUDINI_MCP_LOCAL_HELP_TIMEOUT"] = "999"
         mod = _load_help_fresh()
-        self.assertAlmostEqual(mod.LOCAL_HELP_TIMEOUT, 30.0)  # clamped to hi
+        # fix-mcp-help-cap-protocol：clamp hi 30.0 → 60.0（同步调宽）
+        self.assertAlmostEqual(mod.LOCAL_HELP_TIMEOUT, 60.0)  # clamped to hi
 
     def test_timeout_valid_value(self):
         os.environ["HOUDINI_MCP_LOCAL_HELP_TIMEOUT"] = "5.0"
@@ -915,7 +917,7 @@ class EnvOverrideTests(unittest.TestCase):
     def test_timeout_invalid_falls_back_to_default(self):
         os.environ["HOUDINI_MCP_LOCAL_HELP_TIMEOUT"] = "not-a-number"
         mod = _load_help_fresh()
-        self.assertAlmostEqual(mod.LOCAL_HELP_TIMEOUT, 2.5)
+        self.assertAlmostEqual(mod.LOCAL_HELP_TIMEOUT, 8.0)
 
     def test_cooldown_clamped(self):
         os.environ["HOUDINI_MCP_LOCAL_HELP_COOLDOWN"] = "-5"
@@ -1175,9 +1177,13 @@ class ServerCapExecutionTests(unittest.TestCase):
         capped_payload = {"status": "success", "title": "Grid", "capped": True}
         help_call = mock.Mock(return_value=payload)
         cap = mock.Mock(return_value=capped_payload)
+        # fix-mcp-help-cap-protocol：wrapper 新增 _clamp_help_timeout 全局
+        # 引用（timeout float+clamp），exec namespace 需注入同名函数
+        clamp = mock.Mock(side_effect=lambda t, **kw: float(t))
         namespace = {
             "hlp": types.SimpleNamespace(get_houdini_help=help_call),
             "cmn": types.SimpleNamespace(apply_response_cap=cap),
+            "_clamp_help_timeout": clamp,
         }
         exec(compile(method_source, "<server_get_houdini_help>", "exec"),
              namespace)
@@ -1187,9 +1193,317 @@ class ServerCapExecutionTests(unittest.TestCase):
 
         result = server_type().get_houdini_help("sop", "grid", timeout=4)
 
-        help_call.assert_called_once_with("sop", "grid", timeout=4)
+        clamp.assert_called_once_with(4)
+        help_call.assert_called_once_with("sop", "grid", timeout=4.0)
         cap.assert_called_once_with(payload)
         self.assertEqual(result, capped_payload)
+
+    def test_wrapper_clamps_string_timeout(self):
+        """fix-mcp-help-cap-protocol 1.6：timeout="10"（字符串）不再 TypeError。"""
+        source = _read(SERVER_PY)
+        tree = ast.parse(source)
+        server_class = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "HoudiniMCPServer")
+        method = next(
+            node for node in server_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "get_houdini_help")
+        method_source = ast.get_source_segment(source, method)
+        # 取真实 _clamp_help_timeout（AST-extract 自 server.py 模块级）
+        fn = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_clamp_help_timeout")
+        fn_source = ast.get_source_segment(source, fn)
+        ns_globals = {}
+        exec(compile(fn_source, "<server_clamp>", "exec"), ns_globals)
+        help_call = mock.Mock(return_value={"status": "success"})
+        namespace = {
+            "hlp": types.SimpleNamespace(get_houdini_help=help_call),
+            "cmn": types.SimpleNamespace(apply_response_cap=lambda x: x),
+            "_clamp_help_timeout": ns_globals["_clamp_help_timeout"],
+        }
+        exec(compile(method_source, "<server_get_houdini_help>", "exec"),
+             namespace)
+        server_type = type(
+            "_HelpServer", (),
+            {"get_houdini_help": namespace["get_houdini_help"]})
+
+        server_type().get_houdini_help("sop", "grid", timeout="10")
+        self.assertEqual(help_call.call_args[1]["timeout"], 10.0)
+        # clamp 边界
+        self.assertEqual(ns_globals["_clamp_help_timeout"]("abc"), 10.0)
+        self.assertEqual(ns_globals["_clamp_help_timeout"](None), 10.0)
+        self.assertEqual(ns_globals["_clamp_help_timeout"](0.01), 1.0)
+        self.assertEqual(ns_globals["_clamp_help_timeout"](9999), 60.0)
+        self.assertEqual(
+            ns_globals["_clamp_help_timeout"](float("nan")), 10.0)
+
+
+# ===========================================================================
+# fix-mcp-help-cap-protocol：帮助链路 6 项修复的单测
+# ===========================================================================
+def _class_page_html(class_name, methods):
+    """构造 hou 类页面 HTML（title + N 个 method div）。"""
+    parts = ["<html><body>", "<h1 class='title'>%s</h1>" % class_name]
+    for name in methods:
+        parts.append(
+            "<div class='method'>%s(input_index, item, output_index=0)"
+            " &rarr; hou.Node</div>" % name)
+    parts.append("</body></html>")
+    return "".join(parts)
+
+
+class FixHelpCapClassMethodSplitTests(unittest.TestCase):
+    """1.1 Class.method 拆分（python_hou 专用）。"""
+
+    def setUp(self):
+        self.mod = _load_help_fresh()
+
+    def test_node_setinput_hits_method(self):
+        page = _class_page_html(
+            "Node", ["node", "setInput", "setNextInput", "destroy"])
+        with mock.patch("urllib.request.urlopen") as mu:
+            _patched_urlopen(mu, 200, page)
+            result = self.mod.get_houdini_help(
+                "python_hou", "Node.setInput")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["methods"]), 1)
+        self.assertTrue(result["methods"][0]["text"].startswith("setInput("))
+        self.assertEqual(result["method_query"], "setInput")
+        self.assertEqual(result["item_name"], "Node.setInput")
+        # URL 指向类页面（绝不含点号名）
+        called = mu.call_args_list[0][0][0]
+        url = called.full_url if hasattr(called, "full_url") else called
+        self.assertTrue(url.endswith("/hou/Node"), url)
+
+    def test_missing_method_returns_success_empty_methods(self):
+        page = _class_page_html("Node", ["node", "destroy"])
+        with mock.patch("urllib.request.urlopen") as mu:
+            _patched_urlopen(mu, 200, page)
+            result = self.mod.get_houdini_help(
+                "python_hou", "Node.noSuchMethod")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["methods"], [])
+        self.assertEqual(result["method_query"], "noSuchMethod")
+
+    def test_hou_prefix_stripped(self):
+        page = _class_page_html("Node", ["setInput"])
+        with mock.patch("urllib.request.urlopen") as mu:
+            _patched_urlopen(mu, 200, page)
+            result = self.mod.get_houdini_help(
+                "python_hou", "hou.Node.setInput")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["methods"]), 1)
+
+    def test_class_page_404_falls_back_and_reports_error(self):
+        err_mod = __import__("urllib.error", fromlist=["HTTPError"])
+        http404 = err_mod.HTTPError(
+            url="x", code=404, msg="Not Found", hdrs=None, fp=None)
+        with mock.patch("urllib.request.urlopen") as mu:
+            mu.side_effect = http404
+            result = self.mod.get_houdini_help(
+                "python_hou", "NoSuchClass.method")
+        self.assertEqual(result["status"], "error")
+        # 双原因（本地 404 + 在线 404）
+        self.assertIn("local_http_404", result.get("error", ""))
+
+    def test_non_python_hou_not_split(self):
+        # sop 的 "a.b" 不拆分：URL 直接拼（保持既有语义）
+        with mock.patch("urllib.request.urlopen") as mu:
+            _patched_urlopen(mu, 200, "<html><body></body></html>")
+            self.mod.get_houdini_help("sop", "a.b")
+        called = mu.call_args_list[0][0][0]
+        url = called.full_url if hasattr(called, "full_url") else called
+        self.assertTrue(url.endswith("/sop/a.b"), url)
+
+    def test_multi_dot_not_split(self):
+        # Node.Conn.method（两段以上点）不拆分，走原样查询
+        with mock.patch("urllib.request.urlopen") as mu:
+            _patched_urlopen(mu, 200, "<html><body></body></html>")
+            self.mod.get_houdini_help("python_hou", "Node.Conn.method")
+        called = mu.call_args_list[0][0][0]
+        url = called.full_url if hasattr(called, "full_url") else called
+        self.assertIn("Node.Conn.method", url)
+
+    def test_bare_class_name_not_split(self):
+        with mock.patch("urllib.request.urlopen") as mu:
+            _patched_urlopen(
+                mu, 200, _class_page_html("Geometry", ["iterPoints"]))
+            result = self.mod.get_houdini_help("python_hou", "Geometry")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["methods"]), 1)
+
+
+class FixHelpCapNoCooldownOn404Tests(unittest.TestCase):
+    """1.2 本地 404 不写 cooldown（直接回退在线，健康缓存不受污染）。"""
+
+    def setUp(self):
+        self.mod = _load_help_fresh()
+
+    def test_404_does_not_mark_unhealthy(self):
+        err_mod = __import__("urllib.error", fromlist=["HTTPError"])
+        http404 = err_mod.HTTPError(
+            url="x", code=404, msg="Not Found", hdrs=None, fp=None)
+        online_ok = _make_mock_urlopen(
+            200, "<html><body><h1 class='title'>Grid</h1>"
+                 "<p class='summary'>Creates a grid.</p></body></html>")
+
+        def _side_effect(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else req
+            if "127.0.0.1" in url:
+                raise http404
+            return online_ok
+
+        with mock.patch("urllib.request.urlopen") as mu:
+            mu.side_effect = _side_effect
+            result = self.mod.get_houdini_help("sop", "missing_page")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["_source"], "online")
+        self.assertEqual(result["_fallback_reason"], "local_http_404")
+        # 关键断言：404 后本地仍被视为健康
+        self.assertTrue(self.mod._local_healthy())
+
+    def test_404_then_local_still_probed(self):
+        # 404 之后下一次查询仍先探本地（未被 cooldown 跳过）
+        err_mod = __import__("urllib.error", fromlist=["HTTPError"])
+        http404 = err_mod.HTTPError(
+            url="x", code=404, msg="Not Found", hdrs=None, fp=None)
+        local_ok = _make_mock_urlopen(
+            200, "<html><body><h1 class='title'>Grid</h1>"
+                 "<p class='summary'>Creates a grid.</p></body></html>")
+
+        def _side_effect(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else req
+            if "127.0.0.1" in url:
+                if "missing_page" in url:
+                    raise http404
+                return local_ok
+            raise err_mod.URLError("online down")
+
+        with mock.patch("urllib.request.urlopen") as mu:
+            mu.side_effect = _side_effect
+            self.mod.get_houdini_help("sop", "missing_page")
+            result = self.mod.get_houdini_help("sop", "grid")
+        # 第二次本地命中（证明未进 cooldown）
+        self.assertEqual(result["_source"], "local")
+        self.assertEqual(mu.call_count, 3)  # 404+在线、本地
+
+    def test_500_still_marks_unhealthy(self):
+        # 对照：5xx 仍触发 cooldown（既有语义保持）
+        err_mod = __import__("urllib.error", fromlist=["HTTPError"])
+        http500 = err_mod.HTTPError(
+            url="x", code=500, msg="Server Error", hdrs=None, fp=None)
+        online_ok = _make_mock_urlopen(
+            200, "<html><body><h1 class='title'>Grid</h1>"
+                 "<p class='summary'>Creates a grid.</p></body></html>")
+
+        def _side_effect(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else req
+            if "127.0.0.1" in url:
+                raise http500
+            return online_ok
+
+        with mock.patch("urllib.request.urlopen") as mu:
+            mu.side_effect = _side_effect
+            self.mod.get_houdini_help("sop", "grid")
+        self.assertFalse(self.mod._local_healthy())
+
+
+class FixHelpCapGzipTests(unittest.TestCase):
+    """1.3 gzip：请求头 + Content-Encoding 解压 + wire 字节记录。"""
+
+    def setUp(self):
+        self.mod = _load_help_fresh()
+
+    def _gzip_mock(self, html_text):
+        import gzip as _gz
+        raw = html_text.encode("utf-8")
+        compressed = _gz.compress(raw)
+        resp = mock.Mock()
+        resp.status = 200
+        resp.read.return_value = compressed
+        resp.headers = {"Content-Encoding": "gzip"}
+        resp.__enter__ = lambda self: self
+        resp.__exit__ = lambda self, *args: None
+        return resp, compressed, raw
+
+    def test_gzip_response_decompressed(self):
+        html = ("<html><body><h1 class='title'>Grid</h1>"
+                "<p class='summary'>Creates a grid.</p></body></html>")
+        resp, compressed, raw = self._gzip_mock(html)
+        with mock.patch("urllib.request.urlopen") as mu:
+            mu.return_value = resp
+            result = self.mod.get_houdini_help("sop", "grid")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["title"], "Grid")
+        # _response_size 记 wire（压缩后）字节
+        self.assertEqual(result["_response_size"], len(compressed))
+
+    def test_accept_encoding_header_sent(self):
+        resp, _, _ = self._gzip_mock("<html><body></body></html>")
+        with mock.patch("urllib.request.urlopen") as mu:
+            mu.return_value = resp
+            self.mod.get_houdini_help("sop", "grid")
+        req = mu.call_args[0][0]
+        headers = getattr(req, "headers", {})
+        ae = headers.get("Accept-encoding") or headers.get("Accept-Encoding")
+        self.assertEqual(ae, "gzip")
+
+    def test_non_gzip_passthrough(self):
+        # 无 Content-Encoding（或非 gzip）：按原始字节解析
+        html = ("<html><body><h1 class='title'>Grid</h1></body></html>")
+        resp = mock.Mock()
+        resp.status = 200
+        resp.read.return_value = html.encode("utf-8")
+        resp.headers = {}
+        resp.__enter__ = lambda self: self
+        resp.__exit__ = lambda self, *args: None
+        with mock.patch("urllib.request.urlopen") as mu:
+            mu.return_value = resp
+            result = self.mod.get_houdini_help("sop", "grid")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["title"], "Grid")
+
+
+class FixHelpCapMethodsCapTests(unittest.TestCase):
+    """1.4 python_hou methods 截 50（解析后进响应前）。"""
+
+    def setUp(self):
+        self.mod = _load_help_fresh()
+
+    def test_methods_capped_at_50(self):
+        page = _class_page_html("Geometry", ["m%03d" % i for i in range(60)])
+        with mock.patch("urllib.request.urlopen") as mu:
+            _patched_urlopen(mu, 200, page)
+            result = self.mod.get_houdini_help("python_hou", "Geometry")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["methods"]), 50)
+        self.assertEqual(result.get("methods_truncated"), 60)
+
+    def test_split_match_beyond_cap_50_still_found(self):
+        # 拆分路径在全量 methods 上匹配（目标方法排在 51+ 位也能命中）
+        names = ["m%03d" % i for i in range(55)] + ["setInput"]
+        page = _class_page_html("Node", names)
+        with mock.patch("urllib.request.urlopen") as mu:
+            _patched_urlopen(mu, 200, page)
+            result = self.mod.get_houdini_help("python_hou", "Node.setInput")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["methods"]), 1)
+        self.assertTrue(result["methods"][0]["text"].startswith("setInput("))
+
+    def test_node_help_methods_not_capped_early(self):
+        # 非 python_hou 无 50 截断语义（既有行为）
+        html = ("<html><body><h1 class='title'>Box</h1>"
+                "<p class='summary'>Box node.</p>"
+                + "<div class='parameter'>p%d</div>" * 60
+                + "</body></html>")
+        with mock.patch("urllib.request.urlopen") as mu:
+            _patched_urlopen(mu, 200, html)
+            result = self.mod.get_houdini_help("sop", "box")
+        self.assertEqual(len(result["parameters"]), 60)
 
 
 if __name__ == "__main__":

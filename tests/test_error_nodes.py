@@ -660,20 +660,16 @@ class PR11BridgeBehaviorTests(unittest.TestCase):
 
 
 # ===========================================================================
-# Section H: back-compat aliases (error_node_count / nodes) — PR 11 fix
+# Section H: back-compat aliases — PR 11 fix + fix-mcp-help-cap-protocol 2.3
 # ===========================================================================
 class BackCompatAliasTests(unittest.TestCase):
-    """PR 11 reviewer finding (Critical): the previous contract returned
-    `error_node_count` (int) and `nodes` (list of error-node dicts). Those
-    fields were dropped by PR 11, breaking `tests/test_tools.py:74-86`
-    which still reads them. They must be restored as compat aliases.
-
-    Semantic decision: BOTH `error_node_count` and `nodes` reference error
-    nodes only (consistent with the function name `find_error_nodes` and
-    with the legacy variable naming). This means:
-        error_node_count == len(error_nodes)
-        nodes == error_nodes  (same list object)
-    Warnings are still surfaced via the dedicated `warning_nodes` field.
+    """PR 11 reviewer finding (Critical) 曾要求恢复 ``error_node_count``
+    (int) 与 ``nodes`` (list) 兼容别名。fix-mcp-help-cap-protocol 2.3
+    **有意移除** ``nodes`` 别名：它与 ``error_nodes`` 引用同一 list，
+    JSON 序列化时同一节点列表出现两份，翻倍响应体（spec：
+    "find_error_nodes MUST NOT 双份序列化同一节点列表"）。
+    ``error_node_count`` (int) 保留——无序列化负担。旧客户端改读
+    ``error_nodes``。
     """
 
     def test_error_node_count_present_and_matches_error_nodes(self):
@@ -686,25 +682,23 @@ class BackCompatAliasTests(unittest.TestCase):
         self.assertEqual(result["error_node_count"],
                          len(result["error_nodes"]))
 
-    def test_nodes_field_present_and_is_error_nodes(self):
+    def test_nodes_alias_removed(self):
+        """fix-mcp-help-cap-protocol 2.3：nodes 别名 MUST NOT 出现。"""
         hou, obj, clean, broken, noisy, warny = _make_simple_hou()
         result = en.find_error_nodes(hou, "/obj")
-        self.assertIn("nodes", result,
-                      "missing back-compat field 'nodes'")
-        # `nodes` must be the error_nodes list (same content, same order).
-        paths = [n["path"] for n in result["nodes"]]
+        self.assertNotIn("nodes", result,
+                         "'nodes' alias removed (double serialization)")
+        # error_nodes 本体完整保留
+        paths = [n["path"] for n in result["error_nodes"]]
         self.assertIn("/obj/broken", paths)
         self.assertIn("/obj/noisy", paths)
-        self.assertNotIn("/obj/warny", paths,
-                         "nodes alias must NOT include warning-only nodes")
+        self.assertNotIn("/obj/warny", paths)
         self.assertNotIn("/obj/clean", paths)
-        # Same dicts as error_nodes entry-for-entry.
-        self.assertEqual(result["nodes"], result["error_nodes"])
 
     def test_aliases_hold_when_scene_is_clean(self):
-        """When no nodes have errors, error_node_count must be 0 and
-        `nodes` must be an empty list (so existing assertions like
-        `r["error_node_count"] == 0` keep working)."""
+        """When no nodes have errors, error_node_count must be 0 (so
+        existing assertions like `r["error_node_count"] == 0` keep
+        working); error_nodes is an empty list."""
         clean_only = _FakeNode("clean")
         obj = _FakeNode("obj", sub_children=[clean_only])
         obj._path = "/obj"
@@ -712,7 +706,7 @@ class BackCompatAliasTests(unittest.TestCase):
         hou = _FakeHou(obj)
         result = en.find_error_nodes(hou, "/obj")
         self.assertEqual(result["error_node_count"], 0)
-        self.assertEqual(result["nodes"], [])
+        self.assertEqual(result["error_nodes"], [])
 
 
 # ===========================================================================

@@ -552,6 +552,41 @@ class TakesQueryTests(unittest.TestCase):
         result = self.scene.set_current_take(hou, "missing")
         self.assertEqual(result["error"]["code"], "take_not_found")
 
+    def test_takes_error_messages_are_serializable_strings(self):
+        """fix-mcp-help-cap-protocol 3.1：error envelope 的 message MUST
+        是 str(exc) 字符串而非异常对象（否则 dispatcher json.dumps
+        抛 TypeError，客户端收不到任何响应）。"""
+        import json as _json
+
+        hou = _Hou()
+
+        def _boom():
+            raise RuntimeError("takes exploded")
+        hou.takes.takes = _boom
+        result = self.scene.list_takes(hou)
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error"]["code"], "takes_query_failed")
+        # message 是字符串且内容来自异常
+        self.assertIsInstance(result["error"]["message"], str)
+        self.assertIn("takes exploded", result["error"]["message"])
+        # 整个 envelope 可直接 json.dumps
+        _json.dumps(result)
+
+    def test_current_take_error_message_serializable(self):
+        import json as _json
+
+        hou = _Hou()
+
+        def _boom():
+            raise RuntimeError("currentTake exploded")
+        hou.takes.currentTake = _boom
+        result = self.scene.get_current_take(hou)
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error"]["code"], "current_take_query_failed")
+        self.assertIsInstance(result["error"]["message"], str)
+        self.assertIn("currentTake exploded", result["error"]["message"])
+        _json.dumps(result)
+
 
 class CreateTakeTests(unittest.TestCase):
     @classmethod

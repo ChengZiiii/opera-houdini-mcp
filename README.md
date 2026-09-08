@@ -265,7 +265,7 @@ POSIX 前导 `/`、UNC `\\server\share`、前导 `\`）。绝对路径支持团�
 - **F0 — 判断 hou 版本**：verification 第一步必须先 `hou.version()` 确认 major version，因为 hou API 在跨 major 时会重命名 / 废弃 / 新增
 - **F1 本地 hou help**（优先，无网络依赖，最快）：调 `verify_hou_api(item_name=...)`；若需进一步信息，`hou.node(path).help()`（已存在节点）或 `execute_code` 跑 `help(hou.<Class>.<method>)`
 - **F2 联网 SideFX 文档**（F1 拿不到时）：`verify_hou_api(item_name="<Class>.<method>", help_type="python_hou")` 走 stdlib `urllib.request` 抓 `https://www.sidefx.com/docs/houdini/hom/hou/<name>.html`；不引入新 pip 依赖
-  - **local-help-first（自动）**：`get_houdini_help` / `verify_hou_api` 优先打 Houdini 本地 help server（默认 `http://127.0.0.1:48626/`），本地不可达 / 超时 / 白屏（HTTP 200 但内容无效）时**自动回退在线**。返回 `_source` 字段（`"local"` / `"online"` / `""`）告知实际命中方，`_fallback_reason` 说明回退原因。健康缓存：本地失败后 60s cooldown 内跳过本地直查在线
+  - **local-help-first（自动）**：`get_houdini_help` / `verify_hou_api` 优先打 Houdini 本地 help server（默认 `http://127.0.0.1:48626/`），本地不可达 / 超时 / 白屏（HTTP 200 但内容无效）时**自动回退在线**。返回 `_source` 字段（`"local"` / `"online"` / `""`）告知实际命中方，`_fallback_reason` 说明回退原因。健康缓存：本地失败后 60s cooldown 内跳过本地直查在线（fix-mcp-help-cap-protocol：本地 HTTP 404 **不**进 cooldown——页面不存在是合法答案，直接回退在线；cooldown 仅由 timeout / 5xx / 网络错 / 白屏触发）。`Class.method` 点号名（python_hou）自动拆分为类页面 + 方法精确匹配，不再直接拼 URL 导致双 404
 - **F3 让用户开梯子**（F2 返 `status="error"` 且 `reason` 含网络关键字时）：AI agent 必须在输出里**显式**写出"⚠ SideFX 文档站不可达，请检查网络/梯子，或在 Houdini 内用 `hou.helpServerUrl()` 查本地帮助"
 
 跨工具说明：底层 = `get_houdini_help`；AI-friendly wrapper = `verify_hou_api`。建议优先用 `verify_hou_api` 调 hou API，`get_houdini_help` 用于 SOP/OBJ 节点本身或 vex_function 查询。
@@ -281,7 +281,7 @@ POSIX 前导 `/`、UNC `\\server\share`、前导 `\`）。绝对路径支持团�
 | `HOUDINI_MCP_ALLOW_BYPASS` | 未设 | `privileged` policy 启用开关（**不设则任何 bypass 请求都失败**） | `execute_code` |
 | `HOUDINI_MCP_ENV_DIR` | 见下方约定 | embedded env 目录**绝对路径**覆盖；未设时从 package 目录名自动派生（`<dirname>-env/`，与 package 平级） | `_env_dir()`（3 处 prod + 2 处 test） |
 | `HOUDINI_MCP_LOCAL_HELP_URL` | `http://127.0.0.1:48626/` | 本地 help server base URL | `get_houdini_help` / `verify_hou_api` |
-| `HOUDINI_MCP_LOCAL_HELP_TIMEOUT` | `2.5` | 本地探测短超时（秒，clamp `[0.5, 30.0]`） | `get_houdini_help` / `verify_hou_api` |
+| `HOUDINI_MCP_LOCAL_HELP_TIMEOUT` | `8.0` | 本地探测短超时（秒，clamp `[0.5, 60.0]`；fix-mcp-help-cap-protocol：2.5→8.0，H21 本地 ~1MB 页面实测需 6-8s） | `get_houdini_help` / `verify_hou_api` |
 | `HOUDINI_MCP_LOCAL_HELP_COOLDOWN` | `60` | 本地失败后 cooldown 窗口（秒，clamp `[0.0, 600.0]`） | `get_houdini_help` / `verify_hou_api` |
 | `HOUDINI_MCP_LOCAL_HELP_DISABLE` | 未设 | `1` / `true` / `yes` / `on` 时完全禁用 local-first，退化到"仅在线" | `get_houdini_help` / `verify_hou_api` |
 | `RAPIDAPI_KEY` | 未设 | OPUS 资产库 API key | `_opus.py` |

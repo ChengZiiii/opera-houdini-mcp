@@ -74,7 +74,8 @@ ok("set_wrangle_code: VEX compile error surfaced in validation")
 # -- find_error_nodes must spot the broken wrangle -----------------------------
 r = send("find_error_nodes", {"root_path": CONTAINER})
 assert r["error_node_count"] >= 1, r
-assert any(n["path"] == w["path"] for n in r["nodes"]), r
+# fix-mcp-help-cap-protocol 2.3：nodes 别名移除，读 error_nodes
+assert any(n["path"] == w["path"] for n in r["error_nodes"]), r
 ok("find_error_nodes: broken node located with error messages")
 
 # fix it again, sweep must come back clean

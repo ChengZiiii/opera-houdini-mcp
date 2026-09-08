@@ -26,7 +26,21 @@ requests-html）。
 - 返回 dict 新增两个 advisory 字段：
   - `_source`：`"local"` / `"online"` / `""`（禁用 local-first 时）
   - `_fallback_reason`：回退原因短串（local 成功或仅在线时为 `""`）
+
+fix-mcp-help-cap-protocol 变更：
+- **Class.method 拆分**（python_hou 专用）：`Node.setInput` 这类点号名
+  不再直接拼 URL（历史行为导致本地+在线双 404），改为拉类页面
+  （`hou/<Class>`）后对 `methods` 做精确方法名匹配。
+- **404 不进 cooldown**：页面不存在是合法答案；cooldown 仅由
+  timeout / 5xx / 网络错 / 白屏触发。
+- **`LOCAL_HELP_TIMEOUT` 2.5 → 8.0**（H21 本地 ~1MB 页面实测需 6-8s），
+  clamp 区间放宽到 `[0.5, 60.0]`；请求带 `Accept-Encoding: gzip` 并按
+  `Content-Encoding` 解压（`_response_size` 记 **wire 字节**，gzip 生效
+  时可见明显下降）。
+- **python_hou methods 截 50**：解析完成后 `methods[:50]` 再进响应。
 """
+import gzip
+import re
 from html.parser import HTMLParser
 import os
 import socket
@@ -73,12 +87,15 @@ def _env_bool(name):
 
 # 本地 help server base URL（必须含 scheme，如 http://127.0.0.1:48626/）
 LOCAL_HELP_BASE = os.environ.get("HOUDINI_MCP_LOCAL_HELP_URL") or "http://127.0.0.1:48626/"
-# 本地请求短超时（短于在线 timeout，默认 2.5s，clamp [0.5, 30.0]）
-LOCAL_HELP_TIMEOUT = _env_float("HOUDINI_MCP_LOCAL_HELP_TIMEOUT", 2.5, 0.5, 30.0)
+# 本地请求短超时（fix-mcp-help-cap-protocol：2.5 → 8.0，H21 本地 ~1MB
+# 页面实测需 6-8s；clamp [0.5, 60.0] 同步放宽）
+LOCAL_HELP_TIMEOUT = _env_float("HOUDINI_MCP_LOCAL_HELP_TIMEOUT", 8.0, 0.5, 60.0)
 # 本地不健康 cooldown 窗口（默认 60s，clamp [0.0, 600.0]）
 LOCAL_HELP_COOLDOWN = _env_float("HOUDINI_MCP_LOCAL_HELP_COOLDOWN", 60.0, 0.0, 600.0)
 # 完全禁用 local-first（行为退化到 change 前的"仅在线"，_source=""）
 LOCAL_HELP_DISABLED = _env_bool("HOUDINI_MCP_LOCAL_HELP_DISABLE")
+# python_hou 的 methods 响应上限（spec 既有要求：解析后截前 50 条）
+PYTHON_HOU_METHODS_MAX = 50
 
 
 # ---------------------------------------------------------------------------
@@ -294,12 +311,35 @@ def _fetch_and_parse(url, timeout, help_type, item_name):
     便于调用方覆盖）。HTTP 错 / 网络错 / timeout / HTML 解析失败 → 返回
     `status="error"` dict（含 `status_code` / `error` / `_response_size`
     等既有字段）。
+
+    fix-mcp-help-cap-protocol：
+    - 请求头带 `Accept-Encoding: gzip`；响应 `Content-Encoding: gzip`
+      时手动 `gzip.decompress`（urllib 不自动解压）。
+    - `_response_size` 记 **wire 字节**（解压前的传输字节），gzip 生效
+      时该值明显小于页面原大小，可作为压缩生效的量化指标。
+    - methods **不**在此截断：Class.method 精确匹配需要全量列表；50 条
+      上限（``PYTHON_HOU_METHODS_MAX``）由调用方在进响应前施加。
     """
-    req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    req = urllib.request.Request(url, headers={
+        "User-Agent": _USER_AGENT,
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status_code = getattr(resp, "status", 200)
-            html_bytes = resp.read()
+            wire_bytes = resp.read()
+            encoding = ""
+            try:
+                encoding = resp.headers.get("Content-Encoding") or ""
+            except Exception:
+                encoding = ""
+            html_bytes = wire_bytes
+            if isinstance(encoding, str) and encoding.strip().lower() == "gzip":
+                try:
+                    html_bytes = gzip.decompress(wire_bytes)
+                except OSError:
+                    # 解压失败（伪 gzip 头）：按原始字节继续，交给 parser
+                    pass
             html = html_bytes.decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
         return _error_payload(
@@ -332,10 +372,12 @@ def _fetch_and_parse(url, timeout, help_type, item_name):
             "status": "error",
             "error": "HTML 解析失败: %s: %s" % (type(e).__name__, e),
             "status_code": status_code,
-            "_response_size": len(html_bytes),
+            "_response_size": len(wire_bytes),
             "_source": "",
             "_fallback_reason": "",
         }
+
+    methods = parser.methods
 
     return {
         "help_type": help_type,
@@ -348,8 +390,9 @@ def _fetch_and_parse(url, timeout, help_type, item_name):
         "parameters": parser.parameters,
         "inputs": parser.inputs,
         "outputs": parser.outputs,
-        "methods": parser.methods,
-        "_response_size": len(html_bytes),
+        "methods": methods,
+        # wire 字节（解压前传输量）：gzip 生效时明显小于页面原大小
+        "_response_size": len(wire_bytes),
         "_source": "",
         "_fallback_reason": "",
     }
@@ -391,33 +434,76 @@ def _try_local(url, timeout, help_type, item_name):
 # ---------------------------------------------------------------------------
 # 主入口：local-first + fallback（task 1.7）
 # ---------------------------------------------------------------------------
-def get_houdini_help(help_type, item_name, timeout=_DEFAULT_TIMEOUT):
-    """查询 Houdini 帮助文档：**本地优先** + **在线回退**。
+def _split_class_method(help_type, item_name):
+    """python_hou 专用：把 ``Class.method`` 点号名拆成 (class, method)。
 
-    Args:
-        help_type: HELP_TYPE_URLS 中的键之一（sop/obj/dop/cop2/chop/
-            vop/lop/top/rop/vex_function/python_hou）。
-        item_name: 节点名 / VEX 函数名 / hou 方法名。
-        timeout: 在线 HTTP 请求超时秒数，默认 10。本地用 `LOCAL_HELP_TIMEOUT`
-            （默认 2.5s）。
-
-    Returns:
-        dict：始终包含 help_type / item_name / status / error /
-        status_code / `_source` / `_fallback_reason`；status=success 时
-        另含 title / summary / parameters / inputs / outputs / methods /
-        url / _response_size。任何 4xx/5xx/网络错误/timeout/白屏 都降级为
-        status=error 或回退在线，不抛异常。
-
-    `_source`：`"local"`（本地命中）/ `"online"`（在线命中，可能经 fallback）
-    / `""`（local-first 被禁用，等同 change 前"仅在线"行为）。
-    `_fallback_reason`：回退原因短串（local 成功 / 仅在线时为 `""`）。
+    规则（design §Class.method 拆分）：
+    - 仅 ``help_type=="python_hou"`` 拆分；其他 help_type 返回 None
+    - 先剥 ``hou.`` 前缀（如 ``hou.Node.setInput`` → ``Node.setInput``）
+    - 剥完后**恰好一个点**且两段均非空、无空白 / 斜杠 → 返回二元组；
+      其余（无点 / 多级点 / 裸类名）返回 None
     """
-    if help_type not in HELP_TYPE_URLS:
-        return _error_payload(
-            help_type, item_name, url=None, status_code=None,
-            error_msg="未知 help_type: %s; 有效值: %s" % (
-                help_type, sorted(HELP_TYPE_URLS.keys())))
+    if help_type != "python_hou" or not isinstance(item_name, str):
+        return None
+    name = item_name.strip()
+    if name.startswith("hou."):
+        name = name[len("hou."):]
+    if not name or "." not in name or "/" in name or " " in name:
+        return None
+    parts = name.split(".")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return None
+    return parts[0], parts[1]
 
+
+def _match_methods(methods, method_name):
+    """在类页面 methods 里做精确方法名匹配。
+
+    命中条件：method text 首行 strip 后，首 token（到首个 ``(`` 前）
+    等于 ``method_name``，或以 ``.<method_name>`` 结尾（容忍
+    ``hou.Node.setInput(...)`` 这类带模块前缀的签名行）。返回命中子集
+    （保持原顺序；受 ``PYTHON_HOU_METHODS_MAX`` 上限约束）。
+    """
+    pattern = re.compile(
+        r"^(?:[\w.]+\.)?%s\s*\(" % re.escape(method_name))
+    matched = []
+    for entry in methods:
+        text = (entry.get("text") if isinstance(entry, dict) else str(entry))
+        text = (text or "").strip()
+        if not text:
+            continue
+        first_line = text.splitlines()[0].strip()
+        if pattern.match(first_line):
+            matched.append(entry)
+    return matched[:PYTHON_HOU_METHODS_MAX]
+
+
+def _cap_python_hou_methods(result):
+    """python_hou 的 methods 截前 ``PYTHON_HOU_METHODS_MAX`` 条（spec）。
+
+    非 python_hou / error / 已短于上限的结果原样返回。
+    """
+    if result.get("help_type") != "python_hou":
+        return result
+    methods = result.get("methods")
+    if isinstance(methods, list) and len(methods) > PYTHON_HOU_METHODS_MAX:
+        result["methods"] = methods[:PYTHON_HOU_METHODS_MAX]
+        result["methods_truncated"] = len(methods)
+    return result
+
+
+def _query_page(help_type, item_name, timeout, cap_methods=True):
+    """local-first + fallback 的单页面查询（get_houdini_help 的主体）。
+
+    ``item_name`` 是**页面名**（Class.method 拆分场景下传类名）。
+    ``cap_methods=False`` 时 python_hou 的 methods **不**截 50（供
+    Class.method 精确匹配用全量列表；匹配后由 ``_match_methods`` 施加
+    上限）。返回完整响应 dict（含 `_source` / `_fallback_reason`）。
+
+    fix-mcp-help-cap-protocol：本地 HTTP 404 **不**写 cooldown（页面
+    不存在是合法答案，直接回退在线）；cooldown 仅由 local_timeout /
+    5xx / 网络错 / 白屏触发。
+    """
     online_url = HELP_TYPE_URLS[help_type] + urllib.parse.quote(item_name, safe="")
 
     # ── 分支 1：local-first 被禁用 → 仅在线（_source=""，等同既有行为）
@@ -429,6 +515,8 @@ def get_houdini_help(help_type, item_name, timeout=_DEFAULT_TIMEOUT):
         if result.get("status") == "success":
             result["_source"] = ""
             result["_fallback_reason"] = ""
+            if cap_methods:
+                result = _cap_python_hou_methods(result)
         return result
 
     # ── 分支 2：健康缓存有效 → 先试本地
@@ -441,9 +529,13 @@ def get_houdini_help(help_type, item_name, timeout=_DEFAULT_TIMEOUT):
             _reset_local_health()
             result["_source"] = "local"
             result["_fallback_reason"] = ""
+            if cap_methods:
+                result = _cap_python_hou_methods(result)
             return result
-        # 本地失败：标记不健康 + 记 reason，继续回退在线
-        _mark_local_unhealthy()
+        # 本地失败：404 不标记不健康（页面不存在 ≠ server 挂了），
+        # 其余失败（timeout / 5xx / 网络错 / 白屏）进入 cooldown
+        if reason != "local_http_404":
+            _mark_local_unhealthy()
     else:
         # cooldown 内：跳过本地，直接查在线
         reason = "local_unhealthy_skipped"
@@ -453,10 +545,13 @@ def get_houdini_help(help_type, item_name, timeout=_DEFAULT_TIMEOUT):
         online_url, timeout, help_type, item_name)
     online_result["_source"] = "online"
     online_result["_fallback_reason"] = reason
+    if online_result.get("status") == "success" and cap_methods:
+        online_result = _cap_python_hou_methods(online_result)
     # spec Scenario 1：两边都失败时 `error` 字段需含本地与在线两次失败原因。
-    # 仅当在线也失败（status=="error"）且本地是真实探测失败（非 cooldown
-    # 跳过）时合并进 error；cooldown 跳过（reason=="local_unhealthy_skipped"）
-    # 不是"本地失败"而是"跳过原因"，保持 error 只是在线原因，
+    # 仅当在线也失败（status=="error"）且本地是真实探测结果（非 cooldown
+    # 跳过——跳过不是失败）时合并进 error。404 也合并（design：本地 404 +
+    # 在线 404 → 双原因 error，保持现有格式）。cooldown 跳过
+    # （reason=="local_unhealthy_skipped"）保持 error 只是在线原因，
     # `_fallback_reason` 仍记录它。
     if (online_result.get("status") == "error"
             and reason
@@ -464,3 +559,59 @@ def get_houdini_help(help_type, item_name, timeout=_DEFAULT_TIMEOUT):
         online_result["error"] = "[local: %s] %s" % (
             reason, online_result.get("error", ""))
     return online_result
+
+
+def get_houdini_help(help_type, item_name, timeout=_DEFAULT_TIMEOUT):
+    """查询 Houdini 帮助文档：**本地优先** + **在线回退**。
+
+    Args:
+        help_type: HELP_TYPE_URLS 中的键之一（sop/obj/dop/cop2/chop/
+            vop/lop/top/rop/vex_function/python_hou）。
+        item_name: 节点名 / VEX 函数名 / hou 方法名。
+        timeout: 在线 HTTP 请求超时秒数，默认 10。本地用 `LOCAL_HELP_TIMEOUT`
+            （默认 8.0s）。
+
+    Returns:
+        dict：始终包含 help_type / item_name / status / error /
+        status_code / `_source` / `_fallback_reason`；status=success 时
+        另含 title / summary / parameters / inputs / outputs / methods /
+        url / _response_size。任何 4xx/5xx/网络错误/timeout/白屏 都降级为
+        status=error 或回退在线，不抛异常。
+
+    `_source`：`"local"`（本地命中）/ `"online"`（在线命中，可能经 fallback）
+    / `""`（local-first 被禁用，等同 change 前"仅在线"行为）。
+    `_fallback_reason`：回退原因短串（local 成功 / 仅在线时为 `""`）。
+
+    **Class.method 拆分**（python_hou 专用）：``Node.setInput`` /
+    ``hou.Node.setInput`` 形式的点号名先拆分为类名 + 方法名，拉类页面
+    （`hou/<Class>`，本地优先）后对 `methods` 做精确方法名匹配——
+    **绝不**把点号名直接拼进 URL（历史行为导致本地+在线双 404）。
+    命中 → 返回该方法子集；类存在但方法不存在 → `status=success` +
+    `methods=[]`（`_ai_hint` 按"方法不存在"规则合成）；类页面本身
+    404 → 走既有 error 路径（在线同页 404 时 error 含双原因）。
+    响应附 `method_query` 字段记录所查方法名。
+    """
+    if help_type not in HELP_TYPE_URLS:
+        return _error_payload(
+            help_type, item_name, url=None, status_code=None,
+            error_msg="未知 help_type: %s; 有效值: %s" % (
+                help_type, sorted(HELP_TYPE_URLS.keys())))
+
+    split = _split_class_method(help_type, item_name)
+    if split is not None:
+        class_name, method_name = split
+        # cap_methods=False：精确匹配需要全量 methods（截 50 后目标方法
+        # 可能落在 51+ 位而漏匹配）；命中子集由 _match_methods 截 50
+        result = _query_page(help_type, class_name, timeout,
+                             cap_methods=False)
+        # item_name 覆盖回原始点号名：调用方（_synthesize_ai_hint 的
+        # ObjNode. 前缀规则等）依赖原始名判定
+        result["item_name"] = item_name
+        if result.get("status") == "success":
+            matched = _match_methods(result.get("methods") or [], method_name)
+            result["methods"] = matched
+            result["method_query"] = method_name
+            return result
+        result["method_query"] = method_name
+        return result
+    return _query_page(help_type, item_name, timeout)

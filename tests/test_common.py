@@ -368,6 +368,115 @@ class ApplyResponseCapTests(unittest.TestCase):
 
 
 # ===========================================================================
+# fix-mcp-help-cap-protocol：apply_response_cap 多 list 迭代 + 全空降级
+# ===========================================================================
+class ApplyResponseCapMultiListTests(unittest.TestCase):
+    """2.1 多个大 list 并存时迭代截断；候选耗尽降级 metadata-only。"""
+
+    def _size(self, obj):
+        return len(json.dumps(obj, default=str).encode("utf-8"))
+
+    def test_two_large_lists_iteratively_truncated(self):
+        big = "x" * (20 * 1024)
+        payload = {"nodes": [big] * 5, "edges": [big] * 5}
+        out = cmn.apply_response_cap(payload, 16384)
+        self.assertLessEqual(self._size(out), 16384)
+        self.assertTrue(out.get("_truncated"))
+        # per-field 计数元数据
+        self.assertIn("nodes_original_count", out)
+        self.assertIn("edges_original_count", out)
+        self.assertIn("nodes_preserved_count", out)
+        self.assertIn("edges_preserved_count", out)
+
+    def test_single_oversized_item_semantics_preserved(self):
+        payload = {"items": ["y" * (40 * 1024)]}
+        out = cmn.apply_response_cap(payload, 16384)
+        self.assertLessEqual(self._size(out), 16384)
+        self.assertTrue(out.get("_truncated"))
+        # 截空后 items 键被删除（既有语义）
+        self.assertNotIn("items", out)
+        self.assertEqual(out.get("items_original_count"), 1)
+        self.assertEqual(out.get("items_preserved_count"), 0)
+
+    def test_exhausted_candidates_degrade_to_metadata_only(self):
+        # 无 list、无顶层 str：嵌套巨型字符串无法截断 → response_too_large
+        payload = {"detail": {"blob": "z" * 100000}}
+        out = cmn.apply_response_cap(payload, 16384)
+        self.assertEqual(out.get("status"), "error")
+        self.assertEqual(out.get("error", {}).get("code"),
+                         "response_too_large")
+        self.assertGreater(out.get("_original_size_bytes", 0), 16384)
+        # 绝不返回原数据
+        self.assertNotIn("z" * 100, json.dumps(out))
+
+    def test_multi_list_partial_preservation(self):
+        # 一个大 list + 一个小 list：先截大的，小的应保留
+        big = "b" * (10 * 1024)
+        payload = {
+            "big_list": [big] * 4,
+            "small_list": ["keep%d" % i for i in range(3)],
+        }
+        out = cmn.apply_response_cap(payload, 16384)
+        self.assertLessEqual(self._size(out), 16384)
+        self.assertEqual(out.get("small_list"), ["keep0", "keep1", "keep2"])
+
+    def test_top_level_string_truncation_still_works(self):
+        out = cmn.apply_response_cap(
+            {"image_b64": "A" * (2 * 1024 * 1024)}, 16384)
+        self.assertLessEqual(self._size(out), 16384 + 64)
+        self.assertTrue(out.get("_truncated"))
+
+    def test_never_returns_uncapped_original(self):
+        # 任意构造的复杂超限 payload：结果要么 <= cap 要么降级 envelope
+        payloads = [
+            {"a": ["x" * 9000] * 3, "b": ["y" * 9000] * 3},
+            {"k": "v" * 40000},
+            {"m": [{"deep": ["z" * 8000] * 3}] * 3},
+        ]
+        for payload in payloads:
+            out = cmn.apply_response_cap(payload, 16384)
+            if out.get("status") == "error":
+                self.assertEqual(
+                    out.get("error", {}).get("code"), "response_too_large")
+            else:
+                self.assertLessEqual(self._size(out), 16384)
+                self.assertTrue(out.get("_truncated"))
+
+
+# ===========================================================================
+# fix-mcp-help-cap-protocol：_run_code_thread timed_out grace poll
+# ===========================================================================
+class RunCodeThreadGracePollTests(unittest.TestCase):
+    """3.2 join 到期临界完成的 timed_out 误报修复（grace poll）。"""
+
+    def test_normal_completion_under_timeout(self):
+        r = cmn._run_code_thread("print('hi')", {}, timeout=5)
+        self.assertFalse(r["timed_out"])
+        self.assertIn("hi", r["stdout"])
+
+    def test_real_timeout_reports_true(self):
+        r = cmn._run_code_thread(
+            "import time\ntime.sleep(3)", {}, timeout=0.5)
+        self.assertTrue(r["timed_out"])
+        self.assertGreaterEqual(r["elapsed_ms"], 500)
+
+    def test_critical_completion_not_misreported(self):
+        # 代码耗时略超 join 到期点但落在 grace 窗口内 → timed_out=False
+        # （join(0.5) 到期时 sleep(0.6) 还有 ~0.1s < grace 0.25s）
+        r = cmn._run_code_thread(
+            "import time\ntime.sleep(0.6)\nprint('critical')", {}, timeout=0.5)
+        self.assertFalse(r["timed_out"])
+        self.assertIn("critical", r["stdout"])
+        # elapsed 反映 grace 后的真实时长（> join timeout）
+        self.assertGreaterEqual(r["elapsed_ms"], 600)
+
+    def test_exception_recorded(self):
+        r = cmn._run_code_thread("1/0", {}, timeout=5)
+        self.assertFalse(r["timed_out"])
+        self.assertEqual(r["exception_type"], "ZeroDivisionError")
+
+
+# ===========================================================================
 # Section I: paginate_list
 # ===========================================================================
 class PaginateListTests(unittest.TestCase):
