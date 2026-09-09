@@ -1025,7 +1025,7 @@ class CaptureWorkflowSnapshotToolTests(LessonsToolsBase):
         call_mock.assert_called_once_with(
             "capture_workflow_snapshot",
             {"node_path": None, "include_vex": True, "max_nodes": 50,
-             "probe_mode": "auto", "include_connected": False,
+             "probe_mode": None, "include_connected": False,
              "include_hda_internals": None, "offset": None, "limit": None})
 
     def test_include_hda_internals_passed_through(self):
@@ -1040,7 +1040,7 @@ class CaptureWorkflowSnapshotToolTests(LessonsToolsBase):
         call_mock.assert_called_once_with(
             "capture_workflow_snapshot",
             {"node_path": None, "include_vex": True, "max_nodes": 500,
-             "probe_mode": "auto", "include_connected": False,
+             "probe_mode": None, "include_connected": False,
              "include_hda_internals": True, "offset": None, "limit": None})
 
     def test_layered_probe_params_passed_through(self):

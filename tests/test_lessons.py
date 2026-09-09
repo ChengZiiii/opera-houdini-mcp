@@ -581,39 +581,60 @@ class SaveLessonTests(_BaseDirFixture):
         self.assertEqual(reparsed["verified_versions"], "unknown")
 
     def test_save_failure_preserves_old_file(self):
+        # feat-mcp-round2-hardening §3b：新建 lesson 走独占创建
+        # （O_CREAT|O_EXCL，无 temp+replace），失败注入点相应改为 os.fsync；
+        # 写入中途失败 → 半成品清理 + 既有文件字节不变。
         root = self._root()
         first = self._save()
         path = os.path.join(_lessons.lessons_dir(root), first["id"] + ".md")
         with open(path, "r", encoding="utf-8") as handle:
             before = handle.read()
 
-        real_replace = _lessons.os.replace
+        real_fsync = _lessons.os.fsync
 
-        def boom(src, dst):
-            raise OSError("simulated replace failure")
+        def boom_fsync(fd):
+            raise OSError("simulated fsync failure")
 
-        _lessons.os.replace = boom
+        _lessons.os.fsync = boom_fsync
         try:
             with self.assertRaises(LessonsError) as ctx:
                 self._save(symptom="又一个完全不同的报错乙。")
             self.assertEqual(ctx.exception.code, "ls_write_error")
         finally:
-            _lessons.os.replace = real_replace
+            _lessons.os.fsync = real_fsync
 
         with open(path, "r", encoding="utf-8") as handle:
             self.assertEqual(handle.read(), before)
-        # 无残留临时文件
+        # 无残留临时/半成品文件
         leftovers = [n for n in os.listdir(_lessons.lessons_dir(root))
                      if n != first["id"] + ".md"]
         self.assertEqual(leftovers, [])
 
-    def test_save_failure_reports_error_not_crash(self):
+        # 同指纹累积路径仍走 temp+replace 原子写：os.replace 失败同样
+        # 报结构化错误且旧文件完好
         real_replace = _lessons.os.replace
 
-        def boom(src, dst):
+        def boom_replace(src, dst):
             raise OSError("simulated replace failure")
 
-        _lessons.os.replace = boom
+        _lessons.os.replace = boom_replace
+        try:
+            with self.assertRaises(LessonsError) as ctx:
+                self._save()
+            self.assertEqual(ctx.exception.code, "ls_write_error")
+        finally:
+            _lessons.os.replace = real_replace
+        with open(path, "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_save_failure_reports_error_not_crash(self):
+        # 新建路径（独占创建）写入失败 → 结构化 ls_write_error（含 path）
+        real_fsync = _lessons.os.fsync
+
+        def boom_fsync(fd):
+            raise OSError("simulated fsync failure")
+
+        _lessons.os.fsync = boom_fsync
         try:
             with self.assertRaises(LessonsError) as ctx:
                 self._save()
@@ -622,7 +643,7 @@ class SaveLessonTests(_BaseDirFixture):
             self.assertIsInstance(details, dict)
             self.assertIn("path", details)
         finally:
-            _lessons.os.replace = real_replace
+            _lessons.os.fsync = real_fsync
 
 
 # ---------------------------------------------------------------------------

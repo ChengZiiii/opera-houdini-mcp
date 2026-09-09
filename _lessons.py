@@ -20,6 +20,17 @@ BM25 检索与 bridge 工具注册由后续 agent 基于本模块的公开 API �
   逐文件报错（``{rel_filename: error_message}``），坏文件不拖垮整个 root。
 - 原子写：同目录 temp file + fsync + ``os.replace``；失败保留旧文件并返回
   结构化错误（code ``ls_write_error``），残留 temp 一律清理。
+- 写路径并发防护（feat-mcp-round2-hardening §3）：全部读-改-写路径
+  （``save_lesson`` 新建 / 指纹累积、``save_recipe`` 追加与按 id 原地
+  更新、``record_error_event`` inbox 重写、draft 骨架晋升）都在 per-root
+  双层锁 ``_root_lock`` 内完成——进程内 ``threading.Lock``（per-root，
+  不同 root 互不串行）+ 跨进程锁文件 ``<root>/.locks/<name>.lock``
+  （Windows ``msvcrt.locking`` / POSIX ``fcntl.flock`` best-effort；获取
+  失败有限重试后**降级为仅进程内锁并打日志**，NAS/SMB 上锁语义弱于本地，
+  写入流程不中断）。新 lesson 文件用独占创建（``O_CREAT|O_EXCL``），撞号
+  重算 id（≤5 次），即使锁全失效也绝不覆盖既有文件。锁不可重入：嵌套
+  调用链（record_error_event → 晋升 → 新建 lesson）走 ``*_unlocked``
+  内部变体。
 - fingerprint：``make_fingerprint`` 精确规范化（见其 docstring），
   sha256 hexdigest。同 fingerprint 已存在于 root → 只 ``strength++`` +
   更新 updated_at，**绝不覆盖已有内容**（ADD-only 累积引擎）。
@@ -53,13 +64,27 @@ BM25 检索与 bridge 工具注册由后续 agent 基于本模块的公开 API �
 - 测试钩子：``_base_dir()`` 可被 monkeypatch，所有路径 helper 都从它派生。
 """
 
+import contextlib
 import getpass
 import hashlib
 import json
 import os
 import re
 import tempfile
+import threading
+import time
 from datetime import datetime
+
+# 跨进程锁原语（best-effort import guard）：Windows 主目标 msvcrt.locking，
+# POSIX fcntl.flock；两者都缺失的奇异平台退化为仅进程内锁（不阻塞写入）。
+try:
+    import msvcrt as _msvcrt
+except ImportError:  # POSIX
+    _msvcrt = None
+try:
+    import fcntl as _fcntl
+except ImportError:  # Windows
+    _fcntl = None
 
 try:
     from . import _common as cmn  # noqa: F401  (风格要求：响应 cap 备用)
@@ -94,6 +119,12 @@ PERSONAL_ROOT_NAME = "personal"
 DEFAULT_PRIORITY = 0.5
 PROMOTE_THRESHOLD = 3          # inbox 同一 fingerprint ≥3 次 → 自动生成 draft
 EVENT_MAX_MESSAGE = 4096       # 单条事件消息上限（字符），超过跳过
+
+# --- 写路径并发防护（feat-mcp-round2-hardening §3）---
+LOCKS_DIRNAME = ".locks"            # root 下的跨进程锁目录（<root>/.locks/）
+_CROSS_LOCK_ATTEMPTS = 3            # 跨进程锁获取尝试次数（含首次）
+_CROSS_LOCK_RETRY_DELAY = 0.05      # 每次尝试失败后的退避秒数
+_ID_COLLISION_MAX_RETRIES = 5       # 新 lesson 独占创建撞号后的 id 重算上限
 
 SEVERITIES = ("low", "medium", "high", "critical")
 STATUSES = ("draft", "published")
@@ -241,6 +272,130 @@ def cache_index_dir(root_name):
             "ls_unknown_root", "非法 root 名: {0!r}".format(root_name),
             {"root_name": root_name})
     return os.path.join(_base_dir(), CACHE_DIRNAME, INDEX_DIRNAME, root_name)
+
+
+# ---------------------------------------------------------------------------
+# 1.1b per-root 双层写锁（feat-mcp-round2-hardening §3）
+# ---------------------------------------------------------------------------
+# 进程内锁 registry：规范化（normcase，Windows 大小写不敏感）root path 为
+# 键 → threading.Lock。per-root 粒度：不同 root 各自串行，互不共用锁；
+# registry 自身的增改由独立 guard 锁保护。进程生命周期内锁对象不淘汰
+# （每 root 仅一个 Lock，数量级 = root 数，可忽略）。
+_ROOT_THREAD_LOCKS = {}
+_ROOT_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+def _thread_lock_for(root_path):
+    """取（或首次创建）root_path 对应的进程内 threading.Lock。"""
+    key = os.path.normcase(root_path)
+    with _ROOT_THREAD_LOCKS_GUARD:
+        lock = _ROOT_THREAD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _ROOT_THREAD_LOCKS[key] = lock
+        return lock
+
+
+def _cross_lock_filename(root_path):
+    """跨进程锁文件名：``<basename>-<sha256(path)[:10]>.lock``。
+
+    basename 部分便于人工辨识，hash 部分保证不同 root path（含同名
+    basename）绝不共享锁文件——避免不相关 root 被串行化到同一把锁。
+    """
+    digest = hashlib.sha256(root_path.encode("utf-8")).hexdigest()[:10]
+    base = os.path.basename(root_path.rstrip("/\\")) or "root"
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", base)[:32]
+    return "{0}-{1}.lock".format(safe, digest)
+
+
+def _acquire_cross_process_lock(fd):
+    """对已打开的锁文件 fd 加跨进程锁（非阻塞）。
+
+    Windows：``msvcrt.locking(LK_NBLCK, 1)``（从 offset 0 锁 1 字节）；
+    POSIX：``fcntl.flock(LOCK_EX | LOCK_NB)``。两个模块都缺失时不加锁
+    （仅进程内锁兜底）。失败抛 OSError（调用方有限重试后降级）。
+    """
+    os.lseek(fd, 0, os.SEEK_SET)
+    if _msvcrt is not None:
+        _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
+    elif _fcntl is not None:
+        _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+
+
+def _release_cross_process_lock(fd):
+    """释放并关闭跨进程锁文件（best-effort，失败不抛）。"""
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        if _msvcrt is not None:
+            _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
+        elif _fcntl is not None:
+            _fcntl.flock(fd, _fcntl.LOCK_UN)
+    except OSError:
+        pass  # close() 在两平台都会释放字节区间锁，解锁失败可忽略
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _try_acquire_cross_process_lock(root_path):
+    """尝试获取 root 的跨进程锁文件；失败有限重试后降级（返回 None）。
+
+    锁文件 ``<root>/.locks/<name>.lock``（0 字节，持久保留——删除锁文件
+    反而引入 check-then-unlink 竞态）。``.locks`` 目录无法创建 / 打开 /
+    加锁失败（含被其他进程持有的正常竞争）都按 ``_CROSS_LOCK_ATTEMPTS``
+    次有界重试；仍失败则打日志降级为仅进程内锁并返回 None——**NAS/SMB
+    上锁语义弱于本地，文档化为 best-effort，写入流程不中断**。
+    """
+    lock_path = os.path.join(root_path, LOCKS_DIRNAME,
+                             _cross_lock_filename(root_path))
+    last_error = None
+    for attempt in range(_CROSS_LOCK_ATTEMPTS):
+        fd = None
+        try:
+            os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+            _acquire_cross_process_lock(fd)
+            return fd
+        except OSError as exc:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            last_error = exc
+            if attempt + 1 < _CROSS_LOCK_ATTEMPTS:
+                time.sleep(_CROSS_LOCK_RETRY_DELAY)
+    print("lessons._root_lock: 跨进程锁获取失败（尝试 {0} 次），降级为仅"
+          "进程内锁（best-effort，NAS/SMB 锁语义弱于本地）: {1}: {2}".format(
+              _CROSS_LOCK_ATTEMPTS, lock_path, last_error))
+    return None
+
+
+@contextlib.contextmanager
+def _root_lock(root_path):
+    """per-root 双层写锁上下文：先进程内 Lock，再跨进程锁文件。
+
+    覆盖全部读-改-写路径（save_lesson 新建/累积、save_recipe 追加与按 id
+    原地更新、record_error_event inbox 重写、draft 骨架晋升）。跨进程层
+    获取失败自动降级为仅进程内锁（见 ``_try_acquire_cross_process_lock``），
+    本上下文管理器自身**永不因锁问题抛异常**，写入语义不受影响。
+
+    注意：锁不可重入——嵌套调用方（如 record_error_event → draft 晋升 →
+    新建 lesson）必须改走 ``*_unlocked`` 内部变体，不得二次进入本上下文。
+    进入本上下文会在 root 下创建 ``.locks/`` 目录（跨进程锁文件），因此
+    公共入口应**先**过 writability 门禁再进锁，保证被拒绝的 root 零 fs
+    副作用。
+    """
+    thread_lock = _thread_lock_for(root_path)
+    with thread_lock:
+        fd = _try_acquire_cross_process_lock(root_path)
+        try:
+            yield
+        finally:
+            if fd is not None:
+                _release_cross_process_lock(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +751,51 @@ def _read_text(path):
             {"path": path, "exception": str(exc)})
 
 
+def _create_new_file_exclusive(path, text):
+    """独占创建新文件（``'x'`` 模式，等价 ``O_CREAT|O_EXCL``）。
+
+    id 撞号硬防护（feat-mcp-round2-hardening §3b）：目标已存在时抛
+    ``FileExistsError``（调用方重算 id 有界重试），**即使全部锁失效也绝不
+    覆盖既有文件**。写入中途失败时尽力清理半成品（该 id 可被后续重试
+    复用）并归一 ``LessonsError('ls_write_error')``；无法创建（权限等）
+    同样归一 ls_write_error。与 ``_atomic_write_text`` 的取舍：新文件场景
+    以「零覆盖」优先（半成品最坏只影响单个 draft id，且 load_root_lessons
+    逐文件报错不拖垮 root）；既有文件改写仍走 temp + replace 原子路径。
+    """
+    try:
+        parent = os.path.dirname(path)
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as exc:
+            raise LessonsError(
+                "ls_write_error",
+                "无法创建目录 {0}: {1}".format(parent, exc),
+                {"path": path, "dir": parent, "exception": str(exc)})
+        handle = open(path, "x", encoding="utf-8", newline="\n")
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        raise LessonsError(
+            "ls_write_error",
+            "独占创建 {0} 失败: {1}".format(path, exc),
+            {"path": path, "exception": str(exc)})
+    try:
+        with handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise LessonsError(
+            "ls_write_error",
+            "写入新文件 {0} 失败: {1}".format(path, exc),
+            {"path": path, "exception": str(exc)})
+    return path
+
+
 def _now_iso():
     """当前本地时间 ISO 8601（含 tz offset，如 2026-08-02T15:41:13+08:00）。"""
     return datetime.now().astimezone().isoformat()
@@ -825,11 +1025,25 @@ def save_lesson(root_path, fields):
     累积路径：同 fingerprint 已存在 → 仅 strength++ + updated_at 刷新，
     **绝不覆盖已有内容**，也不新增文件。
 
+    整个读-改-写（load → 指纹比对 / id 分配 → 写）在 per-root 双层锁
+    （``_root_lock``）内完成；新文件用独占创建（``O_CREAT|O_EXCL``），
+    撞号重算 id（≤``_ID_COLLISION_MAX_RETRIES`` 次），即使锁全失效也
+    MUST NOT 覆盖已存在文件。
+
     registry 声明 writable=false 的 root 抛 ``root_not_writable``（零写入）；
     其余失败（字段非法 / 原子写失败 / 自校验失败）抛
     ``LessonsError('ls_write_error')`` 且旧文件完好。成功返回完整 lesson dict。
     """
     root_path = _normalize_root_path(root_path)
+    # 门禁先于锁：被拒绝的 root（writable=false / state!=ok）在锁文件目录
+    # 创建**之前**就返回，保持「零写入、零 fs 副作用」契约。
+    _check_root_writable(root_path)
+    with _root_lock(root_path):
+        return _save_lesson_unlocked(root_path, fields)
+
+
+def _save_lesson_unlocked(root_path, fields):
+    """save_lesson 的锁内实现（调用方必须已持有该 root 的 ``_root_lock``）。"""
     root_name = _root_name_for_path(root_path)
     _check_root_writable(root_path)
 
@@ -861,25 +1075,42 @@ def save_lesson(root_path, fields):
             updated["updated_at"] = new_updated_at
             return updated
 
-    lesson["id"] = _new_lesson_id(
-        [e["id"] for e in existing], datetime.now())
-    lesson["status"] = "draft"
-    lesson["strength"] = 1
-    lesson["created_at"] = _now_iso()
-    lesson["updated_at"] = lesson["created_at"]
+    # 新建路径：独占创建 + 撞号重算（锁外进程/坏文件占用同一 id 时兜底）
+    taken_ids = set(e["id"] for e in existing)
+    retries = 0
+    while True:
+        lesson["id"] = _new_lesson_id(taken_ids, datetime.now())
+        lesson["status"] = "draft"
+        lesson["strength"] = 1
+        lesson["created_at"] = _now_iso()
+        lesson["updated_at"] = lesson["created_at"]
 
-    rendered = _render_lesson_markdown(lesson)
-    try:
-        parse_lesson(rendered)  # 自校验：绝不写无法 round-trip 的文件
-    except LessonsError as exc:
-        raise LessonsError(
-            "ls_write_error",
-            "生成的 lesson 无法自校验: {0}".format(exc.message), exc.details)
+        rendered = _render_lesson_markdown(lesson)
+        try:
+            parse_lesson(rendered)  # 自校验：绝不写无法 round-trip 的文件
+        except LessonsError as exc:
+            raise LessonsError(
+                "ls_write_error",
+                "生成的 lesson 无法自校验: {0}".format(exc.message), exc.details)
 
-    file_path = os.path.join(lessons_dir(root_path),
-                             lesson["id"] + ".md")
-    _atomic_write_text(file_path, rendered)
-    return lesson
+        file_path = os.path.join(lessons_dir(root_path),
+                                 lesson["id"] + ".md")
+        try:
+            _create_new_file_exclusive(file_path, rendered)
+        except FileExistsError:
+            # id 被锁外进程 / 无法解析的既有文件占用 → 序号 +1 重算，
+            # 有界重试；超限明确失败，绝不覆盖。
+            taken_ids.add(lesson["id"])
+            retries += 1
+            if retries > _ID_COLLISION_MAX_RETRIES:
+                raise LessonsError(
+                    "ls_write_error",
+                    "新 lesson id 撞号，重算 {0} 次后仍失败（lessons 目录"
+                    "存在异常占位文件？）".format(_ID_COLLISION_MAX_RETRIES),
+                    {"retries": _ID_COLLISION_MAX_RETRIES,
+                     "last_candidate": lesson["id"]})
+            continue
+        return lesson
 
 
 # ---------------------------------------------------------------------------
@@ -1163,9 +1394,10 @@ def save_recipe(root_path, fields, recipe_id=None):
     写 header 再追加；写前全文过 ``_best_practices.parse_best_practices``
     自校验保证 round-trip；``_atomic_write_text`` 原子写，失败保留旧文件。
     registry 声明 writable=false / state!=ok → ``root_not_writable``（零写入）。
-    成功返回完整 recipe dict（{id, root, category, severity,
-    affected_versions, verified_versions, source, advisory, problem, symptom,
-    fix, action}）。
+    整个读-改-写序列在 per-root 双层锁（``_root_lock``）内完成（并发追加
+    无块丢失 / 无 id 互覆）。成功返回完整 recipe dict（{id, root, category,
+    severity, affected_versions, verified_versions, source, advisory,
+    problem, symptom, fix, action}）。
 
     方法论沉淀协议（advisory，非强制）：
     - 沉淀内容是工作流的**原理 / 设计意图 / 方法论**（为什么这么搭），
@@ -1178,6 +1410,19 @@ def save_recipe(root_path, fields, recipe_id=None):
       重复知识；先 ``search_lessons`` 定位既有 id 再更新。
     """
     root_path = _normalize_root_path(root_path)
+    # 门禁先于锁（与 save_lesson 同因：拒绝的 root 零 fs 副作用）。
+    _check_root_writable(root_path)
+    with _root_lock(root_path):
+        return _save_recipe_unlocked(root_path, fields, recipe_id)
+
+
+def _save_recipe_unlocked(root_path, fields, recipe_id):
+    """save_recipe 的锁内实现（调用方必须已持有该 root 的 ``_root_lock``）。
+
+    读既有 recipes 文本 → 生成/替换块 → 自校验 → 原子重写的整个序列在
+    per-root 锁内串行，多进程/多线程并发追加时块分配（``_next_recipe_id``）
+    与全文重写互不交错。
+    """
     root_name = _root_name_for_path(root_path)
     _check_root_writable(root_path)
 
@@ -1295,6 +1540,10 @@ def record_error_event(root_path, tool, error_code, message, source=None):
     新 fingerprint → 追加一行。count 达到 ``PROMOTE_THRESHOLD``(3) 时自动
     触发 ``promote_inbox_to_drafts`` 生成 draft 骨架。
 
+    inbox 的整个读-改-写（含随后的 draft 晋升）在 per-root 双层锁
+    （``_root_lock``）内完成——晋升走 ``_promote_inbox_to_drafts_unlocked``
+    **不得**二次加锁（``_root_lock`` 不可重入）。
+
     事件过大（> EVENT_MAX_MESSAGE）或任何写失败 → 跳过并 print，返回
     False；成功返回 True。**永不抛异常**，绝不打断任何命令响应。
     """
@@ -1303,49 +1552,53 @@ def record_error_event(root_path, tool, error_code, message, source=None):
             print("record_error_event: 消息过大或非法，事件已跳过 "
                   "(tool={0}, error_code={1})".format(tool, error_code))
             return False
+        root_path = _normalize_root_path(root_path)
         fingerprint = make_fingerprint(message)
         now = _now_iso()
-        raw_records, bad_lines = _read_inbox(root_path)
-        # 逐记录防御：count 非法（如 "abc"）的记录整体视为坏行——原文保留
-        # （verbatim）、不参与累加；单条坏记录绝不影响其他记录与后续事件。
-        records = []
-        for raw, record in raw_records:
-            if _record_count(record) is None:
-                bad_lines.append(raw)
-                continue
-            records.append(record)
-        found = False
-        for record in records:
-            if record.get("fingerprint") == fingerprint:
-                record["count"] = _record_count(record) + 1
-                record["updated_at"] = now
-                found = True
-        if not found:
-            records.append({
-                "fingerprint": fingerprint,
-                "tool": tool,
-                "error_code": error_code,
-                "message": message,
-                "created_at": now,
-                "source": source if source else "bridge",
-                "count": 1,
-                "updated_at": now,
-            })
-        payload = "".join(bad_lines)
-        for record in records:
-            payload += json.dumps(record, ensure_ascii=False) + "\n"
-        _atomic_write_text(inbox_path(root_path), payload)
+        with _root_lock(root_path):
+            raw_records, bad_lines = _read_inbox(root_path)
+            # 逐记录防御：count 非法（如 "abc"）的记录整体视为坏行——原文
+            # 保留（verbatim）、不参与累加；单条坏记录绝不影响其他记录与
+            # 后续事件。
+            records = []
+            for raw, record in raw_records:
+                if _record_count(record) is None:
+                    bad_lines.append(raw)
+                    continue
+                records.append(record)
+            found = False
+            for record in records:
+                if record.get("fingerprint") == fingerprint:
+                    record["count"] = _record_count(record) + 1
+                    record["updated_at"] = now
+                    found = True
+            if not found:
+                records.append({
+                    "fingerprint": fingerprint,
+                    "tool": tool,
+                    "error_code": error_code,
+                    "message": message,
+                    "created_at": now,
+                    "source": source if source else "bridge",
+                    "count": 1,
+                    "updated_at": now,
+                })
+            payload = "".join(bad_lines)
+            for record in records:
+                payload += json.dumps(record, ensure_ascii=False) + "\n"
+            _atomic_write_text(inbox_path(root_path), payload)
 
-        # ≥3 次自动生成 draft 骨架（失败不阻断事件记录）
-        for record in records:
-            if record.get("fingerprint") == fingerprint and \
-                    _record_count(record) >= PROMOTE_THRESHOLD:
-                try:
-                    promote_inbox_to_drafts(root_path)
-                except LessonsError as exc:
-                    print("record_error_event: draft 骨架生成失败（已跳过）: "
-                          "{0}".format(exc.message))
-                break
+            # ≥3 次自动生成 draft 骨架（失败不阻断事件记录）；锁已持有，
+            # 走 unlocked 变体避免重入死锁。
+            for record in records:
+                if record.get("fingerprint") == fingerprint and \
+                        _record_count(record) >= PROMOTE_THRESHOLD:
+                    try:
+                        _promote_inbox_to_drafts_unlocked(root_path)
+                    except LessonsError as exc:
+                        print("record_error_event: draft 骨架生成失败（已跳过）: "
+                              "{0}".format(exc.message))
+                    break
         return True
     except Exception as exc:  # noqa: BLE001 —— inbox 路径必须永不抛
         print("record_error_event: 写入失败已跳过: {0}".format(exc))
@@ -1371,6 +1624,20 @@ def promote_inbox_to_drafts(root_path):
     已存在同 fingerprint lesson 的指纹跳过（幂等）。生成 draft 骨架：
     symptom=消息原文，problem/fix 为空，category=unclassified，
     severity=medium，source=inbox-auto。返回本次创建的 lesson id 列表。
+
+    读 inbox + 读 lessons + 逐指纹建 lesson 的整个序列在 per-root 双层锁
+    （``_root_lock``）内完成。
+    """
+    root_path = _normalize_root_path(root_path)
+    with _root_lock(root_path):
+        return _promote_inbox_to_drafts_unlocked(root_path)
+
+
+def _promote_inbox_to_drafts_unlocked(root_path):
+    """promote_inbox_to_drafts 的锁内实现（调用方必须已持有 ``_root_lock``）。
+
+    内部新建 lesson 走 ``_save_lesson_unlocked``——锁不可重入，禁止经由
+    公共 ``save_lesson`` 二次加锁（record_error_event 持锁调用本函数）。
     """
     raw_records, _bad = _read_inbox(root_path)
     existing, _errors = load_root_lessons(root_path)
@@ -1393,7 +1660,7 @@ def promote_inbox_to_drafts(root_path):
             if r.get("fingerprint") == fingerprint:
                 message = r.get("message") or ""
                 break
-        lesson = save_lesson(root_path, {
+        lesson = _save_lesson_unlocked(root_path, {
             "title": _draft_title(message),
             "category": "unclassified",
             "severity": "medium",

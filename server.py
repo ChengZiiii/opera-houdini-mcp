@@ -4166,7 +4166,7 @@ class HoudiniMCPServer:
     # READ_ONLY_COMMANDS）。响应整体过 apply_response_cap。
     def handle_capture_workflow_snapshot(self, node_path=None,
                                          include_vex=True, max_nodes=50,
-                                         probe_mode="auto",
+                                         probe_mode=None,
                                          include_connected=False,
                                          include_hda_internals=None,
                                          offset=None, limit=None):
@@ -4176,8 +4176,8 @@ class HoudiniMCPServer:
         错误 ``no_selection``，不静默回退）；给定 → ``hou.node``（不可
         解析 → ``invalid_node_path``）。多个选中节点全部作为 BFS seeds。
 
-        分层探测（``probe_mode``，默认 ``auto``）：按目标节点状态逐层决定
-        探测深度——
+        分层探测（``probe_mode``，缺省 ``None`` → 映射为 ``auto``）：按目标
+        节点状态逐层决定探测深度——
         - **锁定官方节点 + 有 EditableNodes 声明**（如 rbdbulletsolver1
           的 ``dopnet/forces`` 子网络，``definition().hasSection
           ("EditableNodes")`` 且 ``isEditable()=false``）→ **只展开
@@ -4190,12 +4190,13 @@ class HoudiniMCPServer:
           rbdconfigure 等）→ 不展开，仅记录节点与非默认参数。
         - **锁定用户数字资产**（如 csr_voronoi_advanced1）→ 默认只记
           节点名；调用方可传 ``probe_mode="expand_all"`` 显式要求展开。
-        ``probe_mode`` 取值：``auto``（默认）/ ``expand_all``（全部整棵
+        ``probe_mode`` 取值：``auto``（缺省映射）/ ``expand_all``（全部整棵
         展开）/ ``editable_only``（只探 EditableNodes 子树）/ ``none``
         （完全不展开）。**不能用 isEditable() 判定"children 不可读"**：
         isEditable() 只用于**正向解锁判定**（True → 需渗透）；锁定态
         不代表 children 不可读。旧参数 ``include_hda_internals`` 兼容
-        映射：True → ``auto``，False → ``none``（显式 probe_mode 优先）。
+        映射（**仅在 probe_mode 未显式传入时生效**）：True → ``auto``，
+        False → ``none``；显式 probe_mode 优先，不被其覆盖。
 
         闭包与预算：默认**只沿 children 方向展开**（受分层探测约束），
         不沿连线扩展；``include_connected=True`` 时把沿 inputs/outputs
@@ -4287,18 +4288,24 @@ class HoudiniMCPServer:
             root_label = node_path
 
         # --- probe_mode 规范化 + include_hda_internals 兼容映射 ---
-        # 旧参数 include_hda_internals：True → "auto"（分层探测），False →
-        # "none"（不展开内部）；显式 probe_mode 优先。
+        # probe_mode=None（缺省，含 bridge 未显式传参）→ "auto"；旧参数
+        # include_hda_internals **仅在 probe_mode 未显式给出时**参与映射
+        # （True → "auto"，False → "none"）；显式 probe_mode 一律优先，
+        # MUST NOT 被本参数覆盖（conform 主 spec 既有 SHALL——此前
+        # include_hda_internals 无条件覆盖导致显式 expand_all 失效）。
+        if probe_mode is None:
+            if include_hda_internals is True:
+                probe_mode = "auto"
+            elif include_hda_internals is False:
+                probe_mode = "none"
+            else:
+                probe_mode = "auto"
         if probe_mode not in _SNAPSHOT_PROBE_MODES:
             return cmn.apply_response_cap(_workflow_error(
                 "invalid_probe_mode",
                 "probe_mode 必须是 auto/expand_all/editable_only/none",
                 {"value": probe_mode,
                  "valid": list(_SNAPSHOT_PROBE_MODES)}))
-        if include_hda_internals is True:
-            probe_mode = "auto"
-        elif include_hda_internals is False:
-            probe_mode = "none"
 
         # --- max_nodes 硬上限（int 化，<1 视为 1）---
         # 命名 budget：避免与分页参数 limit 同名（否则 BFS 赋值会覆盖

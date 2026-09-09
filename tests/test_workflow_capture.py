@@ -1071,6 +1071,50 @@ class CaptureWorkflowSnapshotTests(unittest.TestCase):
         self.assertEqual(result["error"]["code"], "invalid_probe_mode")
         self.assertIn("auto", result["error"]["message"])
 
+    def test_explicit_probe_mode_wins_over_include_hda_internals(self):
+        # feat-mcp-round2-hardening §3c conform 修复：显式 probe_mode MUST
+        # NOT 被 include_hda_internals 无条件覆盖（旧行为：expand_all +
+        # include_hda_internals=False → 被强改为 none，锁定资产无法展开）。
+        net = _FakeNode("net")
+        definition = _FakeDefinition("C:/otls/mytool.hda")
+        inner = _FakeNode("inner_wrangle", type_name="attribwrangle",
+                          parent=net,
+                          parm_values={"snippet": "@P.y += 1;"})
+        locked_hda = _FakeNode("HDA1", type_name="mysop", parent=net,
+                               definition=definition, children=[inner],
+                               is_editable=False)
+        inner._parent = locked_hda
+        self._select([locked_hda])
+        result = self._handler().handle_capture_workflow_snapshot(
+            probe_mode="expand_all", include_hda_internals=False)
+        self.assertEqual(result["status"], "success")
+        by_path = {n["path"] for n in result["nodes"]}
+        self.assertEqual(by_path,
+                         {"/net/HDA1", "/net/HDA1/inner_wrangle"})
+        # 对偶：显式 none + include_hda_internals=True → none 仍优先
+        result_none = self._handler().handle_capture_workflow_snapshot(
+            probe_mode="none", include_hda_internals=True)
+        self.assertEqual(result_none["node_count"], 1)
+        self.assertEqual({n["path"] for n in result_none["nodes"]},
+                         {"/net/HDA1"})
+
+    def test_default_probe_mode_maps_to_auto(self):
+        # 两个参数都不传（bridge 缺省 None）→ auto：解锁用户资产默认渗透
+        net = _FakeNode("net")
+        definition = _FakeDefinition("C:/otls/mytool.hda")
+        inner = _FakeNode("inner_wrangle", type_name="attribwrangle",
+                          parent=net,
+                          parm_values={"snippet": "@P.y += 1;"})
+        unlocked_hda = _FakeNode("HDA1", type_name="mysop", parent=net,
+                                 definition=definition, children=[inner],
+                                 is_editable=True)
+        inner._parent = unlocked_hda
+        self._select([unlocked_hda])
+        result = self._handler().handle_capture_workflow_snapshot()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual({n["path"] for n in result["nodes"]},
+                         {"/net/HDA1", "/net/HDA1/inner_wrangle"})
+
     def test_plain_network_container_expanded(self):
         # 非 HDA 普通容器（subnet，definition None）+ children 非空 →
         # 展开（其 children 是用户工作流内容）

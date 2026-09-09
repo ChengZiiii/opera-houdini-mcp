@@ -1316,7 +1316,7 @@ def knowledge_stats(ctx: Context, scope=None):
 
 @mcp.tool()
 def capture_workflow_snapshot(ctx, node_path=None, include_vex: bool = True,
-                              max_nodes: int = 50, probe_mode="auto",
+                              max_nodes: int = 50, probe_mode=None,
                               include_connected: bool = False,
                               include_hda_internals: bool = None,
                               offset: int = None, limit: int = None):
@@ -1334,7 +1334,8 @@ def capture_workflow_snapshot(ctx, node_path=None, include_vex: bool = True,
       结构化错误，不静默回退）；指定时捕获以该节点为根的闭包子网络。
     - include_vex: 可选，默认 True；包含 Attribute Wrangle 的 VEX snippet。
     - max_nodes: 可选，默认 50；闭包节点硬上限，超限截断并标记 truncated。
-    - probe_mode: 可选，默认 auto；分层探测深度：
+    - probe_mode: 可选，缺省 None（未指定，服务端映射为 auto）；分层探测
+      深度：
       - ``auto``：按节点状态逐层判定——锁定官方 + 有 EditableNodes 声明
         （如 rbdbulletsolver1 的 dopnet/forces）→ **只探 editable 子树**；
         解锁实例（isEditable()=true，含解锁官方 HDA 嵌入式定义，如
@@ -1348,8 +1349,10 @@ def capture_workflow_snapshot(ctx, node_path=None, include_vex: bool = True,
     - include_connected: 可选，默认 False；True 时沿 inputs/outputs 连线
       扩展（用剩余预算，强制子树优先；默认只沿 children 方向展开，避免
       无关子树耗尽预算）。
-    - include_hda_internals: 兼容旧参数；True → probe_mode="auto"，
-      False → probe_mode="none"（显式 probe_mode 优先）。
+    - include_hda_internals: 兼容旧参数；**仅在 probe_mode 未显式传入时
+      生效**：True → probe_mode=auto，False → probe_mode=none；显式
+      probe_mode 一律优先，MUST NOT 被本参数覆盖（如
+      probe_mode="expand_all" + include_hda_internals=False → expand_all）。
     - offset/limit: 可选；完整快照超阈值（512KB）返回精简摘要时，传
       offset/limit 分页续读全量详情节点（page.total / next_offset）。
 
