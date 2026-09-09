@@ -10,8 +10,11 @@ API surface 的 SimpleNamespace），使 __init__.py 可被 import，单测
 ERROR；只有 `pytest tests/` 批量跑时，pytest 内部的 sys.path / 收集
 逻辑容忍部分失败但仍能执行其他测试。本 conftest 一劳永逸解决。
 """
+import os
 import sys
 import types
+
+import pytest
 
 
 def _stub_hou():
@@ -87,3 +90,37 @@ def _stub_numpy():
 
 _stub_hou()
 _stub_numpy()
+
+
+# ---------------------------------------------------------------------------
+# fix-mcp-test-suite-repair：泄漏防护（autouse）
+# ---------------------------------------------------------------------------
+# 用户生产 MCP 常驻 127.0.0.1:9876。任何测试若经桥的默认 _houdini_port 发
+# 命令（如 load_scene），会打到真机 Houdini（曾导致弹保存对话框）。本
+# fixture 在每个测试开始前把已加载 bridge 模块的 _houdini_port 改指死端口
+# （连接立即被拒），使全量套件默认零真机访问。
+#
+# - 死端口可用 HOUDINI_MCP_TEST_PORT 覆盖；
+# - 显式 opt-in HOUDINI_MCP_TEST_ALLOW_LIVE=1 时完全放行（真机 e2e /
+#   手动 smoke 用）；
+# - 测试中途懒加载的桥（如 test_lessons_tools 的缓存加载）由各自文件的
+#   加载守卫兜底（见 test_lessons_tools._apply_leak_guard）。
+_DEAD_PORT = 1
+
+
+@pytest.fixture(autouse=True)
+def _isolate_from_live_houdini(monkeypatch):
+    """默认隔离：禁止套件触达用户生产 MCP（默认 127.0.0.1:9876）。"""
+    if os.environ.get("HOUDINI_MCP_TEST_ALLOW_LIVE") == "1":
+        yield
+        return
+    dead_port = int(os.environ.get("HOUDINI_MCP_TEST_PORT", str(_DEAD_PORT)))
+    for name, module in list(sys.modules.items()):
+        if module is None:
+            continue
+        port = getattr(module, "_houdini_port", None)
+        # 以 int 型 _houdini_port 属性识别 bridge 模块（唯一连接向量：
+        # get_houdini_connection 是 _houdini_port 的唯一消费方）
+        if isinstance(port, int) and port != dead_port:
+            monkeypatch.setattr(module, "_houdini_port", dead_port)
+    yield

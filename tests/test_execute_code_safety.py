@@ -485,11 +485,37 @@ class BridgeGetLastSceneDiffTests(unittest.TestCase):
         fastmcp_mod = types.ModuleType("mcp.server.fastmcp")
 
         class _FakeFastMCP(object):
+            # fix-mcp-test-suite-repair：注册面与真 FastMCP 对齐
+            # （tool/resource/prompt），6ff79b6 引入 @mcp.resource 后旧 stub
+            # 缺 resource 导致 BridgeGetLastSceneDiffTests setUpClass 即炸。
             def __init__(self, *args, **kwargs):
                 self.lifespan = None
+                self._tools = []
+                self._resources = []
+                self._prompts = []
+                self._tool_manager = types.SimpleNamespace(
+                    list_tools=lambda: [
+                        types.SimpleNamespace(name=fn.__name__)
+                        for (_, _, fn) in self._tools],
+                    # 桥 import 末尾 _install_capture_hook() 会包装
+                    # call_tool（幂等），stub 必须提供
+                    call_tool=lambda name, arguments=None: None)
 
             def tool(self, *args, **kwargs):
                 def deco(fn):
+                    self._tools.append((args, kwargs, fn))
+                    return fn
+                return deco
+
+            def resource(self, *args, **kwargs):
+                def deco(fn):
+                    self._resources.append((args, kwargs, fn))
+                    return fn
+                return deco
+
+            def prompt(self, *args, **kwargs):
+                def deco(fn):
+                    self._prompts.append((args, kwargs, fn))
                     return fn
                 return deco
 

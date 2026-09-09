@@ -20,3 +20,10 @@ opus = [
     "langchain>=0.1.0",
     "langchain-classic>=1.0.0",
 ]
+
+# fix-mcp-test-suite-repair：pytest 纳入 dev group —— 此前为临时 pip 安装、
+# 不在 lock 内，`uv sync` 会把它从 .venv 卸掉导致套件不可运行。
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]

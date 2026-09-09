@@ -6,6 +6,53 @@
 所有脚本纯 stdlib，无 pytest / hou 依赖，可在任意 Python 3.7+ 跑（`ast.parse`
 静态校验也跑得过）。
 
+## 单元测试套件（pytest，.venv）
+
+`test_*.py` 是 pytest 单元测试（不需要真机 Houdini）；下文与同目录的
+`*_e2e.py` / `h21_live_*.py` / `phase*_e2e.py` 是直连 socket 的 live 脚本，
+不会被 pytest 收集。
+
+### 环境准备与全量运行
+
+```powershell
+cd external/houdinimcp
+uv sync          # 按 pyproject + uv.lock 安装（含 [dependency-groups] dev 的 pytest）
+.venv\Scripts\python.exe -m pytest tests -q
+```
+
+- **套件依赖 = pyproject/uv.lock**。venv 报 dotenv ImportError（如
+  `cannot import name 'dotenv_values'`，mcp→pydantic_settings 依赖链）时，
+  跑 `uv sync` 对齐 lock 即可修复（fix-mcp-test-suite-repair 实测结论）。
+- pytest 自 fix-mcp-test-suite-repair 起声明在 `[dependency-groups] dev`；
+  此前它是临时 pip 安装、不在 lock 内，`uv sync` 会把它从 .venv 卸掉导致
+  套件不可运行——遇到就再 `uv sync`（现在会自动装回）。
+
+### 泄漏防护（重要）
+
+用户生产 MCP 常驻 `127.0.0.1:9876`。pytest 单测默认**零真机访问**：
+
+- `conftest.py` 的 autouse fixture（`_isolate_from_live_houdini`）在每个
+  测试前把已加载 bridge 模块的 `_houdini_port` 改指死端口（连接立即被拒）；
+  死端口可用 `HOUDINI_MCP_TEST_PORT` 覆盖。
+- 测试中途懒加载桥的文件（`test_lessons_tools.py`）在加载完成瞬间就地加固：
+  端口改死 + `_ensure_headless_daemon` 换成立即抛 ConnectionError 的 stub
+  （防止连接失败时真实拉起 headless hython）。
+- 真机 e2e / 手动 smoke **显式 opt-in**：
+  `$env:HOUDINI_MCP_TEST_ALLOW_LIVE="1"` 后再跑，防护完全放行。
+
+### test_tools.py 手跑用法
+
+`test_tools.py` 是 standalone 集成脚本（import 期即执行完整集成场景），
+无端口参数时（含 pytest 收集）模块级 skip，不影响全量收集：
+
+```powershell
+# 先在 hython 里跑 tests/headless_host.py（见其 docstring）起 host，然后：
+.venv\Scripts\python.exe tests\test_tools.py <port>
+# 或经环境变量注入端口：
+$env:HOUDINI_MCP_TEST_PORT = "19878"
+.venv\Scripts\python.exe tests\test_tools.py
+```
+
 ## 文件清单
 
 | 文件 | 角色 | 状态 |

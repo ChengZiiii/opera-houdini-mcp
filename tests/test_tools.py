@@ -2,6 +2,10 @@
 
 Run tests/headless_host.py in hython first (see its docstring), then:
     uv run python tests/test_tools.py [port]
+
+fix-mcp-test-suite-repair：本文件是 standalone 脚本，import 期即执行完整
+集成场景。带端口手跑用法不变；无参（含 pytest 收集）时模块级 skip，
+保证 `pytest tests` 收集安全。端口也可经 HOUDINI_MCP_TEST_PORT 注入。
 """
 import os
 import sys
@@ -10,7 +14,20 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import sys
 import houdini_mcp_server as bridge
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 19878
+try:
+    PORT = int(sys.argv[1])
+except (IndexError, ValueError):
+    PORT = int(os.environ.get("HOUDINI_MCP_TEST_PORT", "0"))
+
+if PORT == 0:
+    # 无端口即 standalone 场景未指定目标：pytest 收集安全跳过（模块级），
+    # 手跑用法：python tests/test_tools.py <port>
+    import pytest
+    pytest.skip(
+        "standalone script; run with a port argument "
+        "(e.g. python tests/test_tools.py 9876)",
+        allow_module_level=True)
+
 CONTAINER = "/obj/MCP_TIER1_TEST"
 conn = bridge.HoudiniConnection(host="127.0.0.1", port=PORT)
 

@@ -20,10 +20,12 @@ Tests cover (>= 30):
         - renderer selection propagates per view
         - no geometry -> _warning dict
     - apply_response_cap + _add_response_metadata integration
-    - bridge style probe (3 new @mcp.tool() with no type annotations +
-      Chinese docstrings); send_command cmd names match.
+    - bridge 注册面契约（slim-mcp-toolset 注销后）：3 个 base64 工具名 MUST
+      NOT 出现在桥 tools/list 注册表；桥内函数体保留为普通函数（无
+      @mcp.tool 装饰器）
     - server.py: _render_b64 import, 3 new handlers in dict, 3 thin wrapper
-      methods exist, wrappers call cmn.apply_response_cap once.
+      methods exist, wrappers call cmn.apply_response_cap once 且 envelope
+      为 dict。
 
 Run with:
     python -m unittest tests.test_render_b64 -v
@@ -1117,14 +1119,29 @@ class ServerHandlerCapMockTests(unittest.TestCase):
     def test_render_viewport_base64_calls_cap_once(self):
         cls, cap, _ = _build_pr14_handler_class(rb64_stub=self._rb64_stub)
         inst = cls()
-        inst.render_viewport_base64()
+        result = inst.render_viewport_base64()
         self.assertEqual(len(cap.calls), 1)
+        # server 端对应命令的 envelope 为 dict（style 断言翻转后的替代契约）
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["image_base64"], "ABCD")
 
     def test_render_quad_views_base64_calls_cap_once(self):
         cls, cap, _ = _build_pr14_handler_class(rb64_stub=self._rb64_stub)
         inst = cls()
-        inst.render_quad_views_base64()
+        result = inst.render_quad_views_base64()
         self.assertEqual(len(cap.calls), 1)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["top"]["image_base64"], "A")
+
+    def test_render_specific_camera_base64_envelope_is_dict(self):
+        cls, cap, rb64 = _build_pr14_handler_class(rb64_stub=self._rb64_stub)
+        inst = cls()
+        rb64.render_specific_camera_base64 = lambda *a, **kw: {
+            "image_base64": "C", "format": "PNG", "renderer": "opengl"}
+        result = inst.render_specific_camera_base64("/obj/cam1")
+        self.assertEqual(len(cap.calls), 1)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["image_base64"], "C")
 
 
 # ===========================================================================
@@ -1204,119 +1221,166 @@ class ForkRenderPolicyRedirectInterruptTests(unittest.TestCase):
 
 
 # ===========================================================================
-# Section H: bridge style probe (PR 14 tools)
+# Section H: bridge 注册面契约（slim-mcp-toolset 注销后的新契约）
 # ===========================================================================
 HMA_PY = os.path.join(ROOT, "houdini_mcp_server.py")
-PR14_SECTION_HEADER = "# PR 14 Render Base64 Tools"
+BASE64_TOOLS = ("render_viewport_base64",
+                "render_quad_views_base64",
+                "render_specific_camera_base64")
 
 
-def _has_cjk(s):
-    if not s:
-        return False
-    return any("\u4e00" <= ch <= "\u9fff" for ch in s)
+def _load_module(name, path):
+    """importlib 文件级加载（同 test_headless_launch._load 模式）。"""
+    spec = _ilu.spec_from_file_location(name, path)
+    module = _ilu.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
-def _signature_has_annotations(fn):
-    args = fn.args
-    for arg in (args.posonlyargs + args.args + args.kwonlyargs):
-        if arg.annotation is not None:
-            return True
-    if args.vararg and args.vararg.annotation is not None:
-        return True
-    if args.kwarg and args.kwarg.annotation is not None:
-        return True
-    return fn.returns is not None
+def _load_bridge_with_stub_registry():
+    """经既有 stub 加载路径（test_headless_launch._load_bridge 模式）加载桥
+    模块，返回 (bridge_module, fastmcp_instance)。
+
+    stub FastMCP 与真 FastMCP 注册面对齐：tool/resource/prompt 记录 +
+    ``_tool_manager.list_tools()`` / ``call_tool``（桥 import 末尾
+    _install_capture_hook 会包装 call_tool，stub 必须提供）。
+
+    与 test_headless_launch 不同，加载完成后恢复 sys.modules 的
+    mcp*/requests*/dotenv* 条目——本文件在套件中段执行，不能把 stub
+    mcp 留给后续文件（test_lessons_tools 之后真实 mcp 已在 sys.modules）。
+    """
+    _STUB_KEYS = ("mcp", "requests", "dotenv")
+
+    def _is_stub_key(key):
+        return (key in _STUB_KEYS
+                or any(key.startswith(k + ".") for k in _STUB_KEYS))
+
+    saved = {k: v for k, v in sys.modules.items() if _is_stub_key(k)}
+    try:
+        package = types.ModuleType("houdinimcp")
+        package.__path__ = [ROOT]
+        sys.modules["houdinimcp"] = package
+
+        mcp = types.ModuleType("mcp")
+        mcp_server = types.ModuleType("mcp.server")
+        fastmcp = types.ModuleType("mcp.server.fastmcp")
+
+        class _FastMCP(object):
+            def __init__(self, *args, **kwargs):
+                self.lifespan = None
+                self._tools = []
+                self._resources = []
+                self._prompts = []
+                self._tool_manager = types.SimpleNamespace(
+                    list_tools=lambda: [
+                        types.SimpleNamespace(name=fn.__name__)
+                        for (_, _, fn) in self._tools],
+                    call_tool=lambda name, arguments=None: None)
+
+            def tool(self, *args, **kwargs):
+                def deco(function):
+                    self._tools.append((args, kwargs, function))
+                    return function
+                return deco
+
+            def resource(self, *args, **kwargs):
+                def deco(function):
+                    self._resources.append((args, kwargs, function))
+                    return function
+                return deco
+
+            def prompt(self, *args, **kwargs):
+                def deco(function):
+                    self._prompts.append((args, kwargs, function))
+                    return function
+                return deco
+
+            def run(self):
+                return None
+
+        fastmcp.FastMCP = _FastMCP
+        fastmcp.Context = object
+        mcp_server.fastmcp = fastmcp
+        mcp.server = mcp_server
+        sys.modules["mcp"] = mcp
+        sys.modules["mcp.server"] = mcp_server
+        sys.modules["mcp.server.fastmcp"] = fastmcp
+
+        requests = types.ModuleType("requests")
+        requests.exceptions = types.SimpleNamespace(
+            RequestException=Exception, HTTPError=Exception)
+        sys.modules["requests"] = requests
+        dotenv = types.ModuleType("dotenv")
+        dotenv.load_dotenv = lambda **kwargs: None
+        sys.modules["dotenv"] = dotenv
+
+        _reset_render_policy()
+        bridge = _load_module("houdini_mcp_server_renderb64_test_module",
+                              os.path.join(ROOT, "houdini_mcp_server.py"))
+    finally:
+        # 丢弃本次安装的 stub，恢复加载前的 sys.modules 条目
+        for key in list(sys.modules):
+            if key in saved:
+                continue
+            if _is_stub_key(key):
+                del sys.modules[key]
+        sys.modules.update(saved)
+    return bridge, bridge.mcp
 
 
-def _find_pr14_function_nodes():
-    """Find PR 14 @mcp.tool() functions in houdini_mcp_server.py."""
-    with open(HMA_PY, "r", encoding="utf-8") as f:
-        src = f.read()
-    tree = ast.parse(src)
-    lines = src.splitlines()
-    header_line = None
-    for i, line in enumerate(lines, start=1):
-        if PR14_SECTION_HEADER in line:
-            header_line = i
-            break
-    if header_line is None:
-        raise AssertionError(
-            "PR 14 section marker not found in houdini_mcp_server.py")
-    # Stop at next section header
-    stop_line = len(lines) + 1
-    section_header_re = re.compile(r"^#\s*PR\s+\d+\s+\S.*\bTools\b")
-    for i in range(header_line + 1, len(lines) + 1):
-        line = lines[i - 1]
-        if section_header_re.match(line) and PR14_SECTION_HEADER not in line:
-            stop_line = i
-            break
-    fns = []
-    for node in tree.body:
-        if not isinstance(node, ast.FunctionDef):
-            continue
-        if node.lineno <= header_line:
-            continue
-        if node.lineno >= stop_line:
-            continue
-        for dec in node.decorator_list:
-            if isinstance(dec, ast.Call):
-                func = dec.func
-                if isinstance(func, ast.Attribute) and func.attr == "tool":
-                    fns.append(node)
-                    break
-    return fns
+class Base64ToolsUnregisteredTests(unittest.TestCase):
+    """slim-mcp-toolset（363a95a）注销 9 个低频工具后的 base64 渲染契约。
 
+    新契约：3 个 base64 工具名 MUST NOT 出现在桥 tools/list 注册表；
+    桥内函数体保留为普通函数（无活动 @mcp.tool 装饰器，恢复 = 取消注释）；
+    server.py 端 3 个 handler / 注册表键保留（见 ServerHandlersTests）。
+    """
 
-import re  # imported here to avoid top-level namespace pollution
+    @classmethod
+    def setUpClass(cls):
+        cls.bridge, cls.mcp = _load_bridge_with_stub_registry()
 
+    def test_base64_tools_absent_from_registry(self):
+        """3 个 base64 名不在 tools/list 注册表（注销而非删除逻辑）。"""
+        registered = {t.name for t in self.mcp._tool_manager.list_tools()}
+        for name in BASE64_TOOLS:
+            self.assertNotIn(
+                name, registered,
+                "{0} 已注销，不得出现在 tools/list".format(name))
+        # 注册表非空：stub 记录生效，且注销不影响其余工具
+        self.assertGreater(len(registered), 100)
 
-class PR14BridgeStyleTests(unittest.TestCase):
-    """3 new @mcp.tool() must have no type annotations and Chinese
-    docstrings."""
+    def test_base64_functions_still_defined_without_tool_decorator(self):
+        """桥内 3 个函数保留为模块级普通函数，且无活动 @mcp.tool 装饰器。"""
+        with open(HMA_PY, "r", encoding="utf-8") as f:
+            src = f.read()
+        tree = ast.parse(src)
+        for name in BASE64_TOOLS:
+            fn_nodes = [n for n in tree.body
+                        if isinstance(n, ast.FunctionDef) and n.name == name]
+            self.assertEqual(
+                len(fn_nodes), 1,
+                "{0} 必须保留在桥模块中（仅注销注册，不删逻辑）".format(name))
+            active_tool_decorators = [
+                d for d in fn_nodes[0].decorator_list
+                if isinstance(d, ast.Call)
+                and isinstance(d.func, ast.Attribute)
+                and d.func.attr == "tool"]
+            self.assertEqual(
+                active_tool_decorators, [],
+                "{0} 不得有活动 @mcp.tool 装饰器".format(name))
+        # slim-mcp-toolset 注销注释锚点保留（恢复注册的可指认路径）
+        self.assertIn(
+            "slim-mcp-toolset", src,
+            "注销注释锚点丢失，恢复注册的注释路径不可指认")
 
-    def setUp(self):
-        self.fns = _find_pr14_function_nodes()
-        self.assertEqual(
-            len(self.fns), 3,
-            "Expected 3 PR 14 @mcp.tool() functions, found {0}: {1}".format(
-                len(self.fns), [f.name for f in self.fns]))
-
-    def test_three_expected_names(self):
-        names = sorted(f.name for f in self.fns)
-        self.assertEqual(names, sorted([
-            "render_quad_views_base64",
-            "render_specific_camera_base64",
-            "render_viewport_base64",
-        ]))
-
-    def test_render_viewport_base64_no_annotations(self):
-        fn = next(f for f in self.fns if f.name == "render_viewport_base64")
-        self.assertFalse(_signature_has_annotations(fn))
-
-    def test_render_quad_views_base64_no_annotations(self):
-        fn = next(f for f in self.fns if f.name == "render_quad_views_base64")
-        self.assertFalse(_signature_has_annotations(fn))
-
-    def test_render_specific_camera_base64_no_annotations(self):
-        fn = next(f for f in self.fns
-                  if f.name == "render_specific_camera_base64")
-        self.assertFalse(_signature_has_annotations(fn))
-
-    def test_render_viewport_base64_chinese_docstring(self):
-        fn = next(f for f in self.fns if f.name == "render_viewport_base64")
-        doc = ast.get_docstring(fn) or ""
-        self.assertTrue(_has_cjk(doc), repr(doc))
-
-    def test_render_quad_views_base64_chinese_docstring(self):
-        fn = next(f for f in self.fns if f.name == "render_quad_views_base64")
-        doc = ast.get_docstring(fn) or ""
-        self.assertTrue(_has_cjk(doc), repr(doc))
-
-    def test_render_specific_camera_base64_chinese_docstring(self):
-        fn = next(f for f in self.fns
-                  if f.name == "render_specific_camera_base64")
-        doc = ast.get_docstring(fn) or ""
-        self.assertTrue(_has_cjk(doc), repr(doc))
+    def test_registered_tools_still_expose_expected_core_surface(self):
+        """注销 9 个低频工具后，核心工具仍在注册表（抽查）。"""
+        registered = {t.name for t in self.mcp._tool_manager.list_tools()}
+        for name in ("ping_houdini", "get_scene_info", "search_lessons",
+                     "capture_pane_screenshot"):
+            self.assertIn(name, registered)
 
 
 # ===========================================================================
@@ -1345,20 +1409,17 @@ class _FakeMCP(object):
 
 
 def _exec_pr14_bridge_tool(tool_name):
+    """AST 隔离执行桥内 PR 14 工具函数体，返回 (fn, recorder, fake_mcp)。
+
+    slim-mcp-toolset：装饰器已注销，AST 执行只验证函数体内部逻辑
+    （cmd 名 + params 透传），按函数名定位、不断言 @mcp.tool 装饰器存在。
+    """
     with open(HMA_PY, "r", encoding="utf-8") as f:
         src = f.read()
     tree = ast.parse(src)
-    fn_node = None
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == tool_name:
-            for dec in node.decorator_list:
-                if isinstance(dec, ast.Call):
-                    func = dec.func
-                    if isinstance(func, ast.Attribute) and func.attr == "tool":
-                        fn_node = node
-                        break
-            if fn_node is not None:
-                break
+    fn_node = next((node for node in tree.body
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == tool_name), None)
     if fn_node is None:
         raise AssertionError(
             "PR 14 bridge tool {0} not found".format(tool_name))

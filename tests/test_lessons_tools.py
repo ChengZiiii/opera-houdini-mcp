@@ -145,6 +145,32 @@ def _purge_stub_mcp():
                 del sys.modules[key]
 
 
+def _apply_leak_guard(module):
+    """fix-mcp-test-suite-repair：隔离用户生产 MCP（默认 127.0.0.1:9876）。
+
+    桥 import 时默认 ``_houdini_port = 9876``；本文件的 capture hook 测试
+    会直接调 ``load_scene``（经 ``_houdini_call`` → ``get_houdini_connection``），
+    端口不隔离就会连到真机 Houdini（弹保存对话框的根因）。conftest 的
+    autouse fixture 只覆盖已加载模块；本文件是**测试中途懒加载**桥，必须
+    在加载完成瞬间就地加固：
+
+    - ``_houdini_port`` → 死端口（``HOUDINI_MCP_TEST_PORT`` 可覆盖）；
+    - ``_ensure_headless_daemon`` → 立即抛 ConnectionError 的 stub（端口
+      连接失败时禁止真实拉起 headless hython）；
+    - 显式 opt-in ``HOUDINI_MCP_TEST_ALLOW_LIVE=1`` 不做隔离（真机手跑用）。
+    """
+    if os.environ.get("HOUDINI_MCP_TEST_ALLOW_LIVE") == "1":
+        return
+    module._houdini_port = int(os.environ.get("HOUDINI_MCP_TEST_PORT", "1"))
+
+    def _no_headless_daemon(*args, **kwargs):
+        raise ConnectionError(
+            "headless daemon disabled in unit tests (leak guard)")
+
+    module._ensure_headless_daemon = _no_headless_daemon
+    module._houdini_connection = None
+
+
 def _load_bridge():
     """以独立 module name 加载 bridge；flat import 复用测试进程内的真实
     _lessons / _lessons_search 模块对象（monkeypatch _base_dir 因此可见）。"""
@@ -156,6 +182,7 @@ def _load_bridge():
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
+    _apply_leak_guard(module)
     return module
 
 

@@ -46,11 +46,39 @@ def _load_bridge():
     fastmcp = types.ModuleType("mcp.server.fastmcp")
 
     class _FastMCP(object):
+        # fix-mcp-test-suite-repair：注册面与真 FastMCP 对齐（tool/resource/
+        # prompt 记录 + _tool_manager.list_tools），6ff79b6 引入 @mcp.resource
+        # 后旧 stub 缺 resource 导致桥模块 import 即炸（headless 10F 根因）。
         def __init__(self, *args, **kwargs):
             self.lifespan = None
+            self._tools = []
+            self._resources = []
+            self._prompts = []
+            self._tool_manager = types.SimpleNamespace(
+                list_tools=lambda: [
+                    types.SimpleNamespace(name=fn.__name__)
+                    for (_, _, fn) in self._tools],
+                # 桥 import 末尾 _install_capture_hook() 会包装 call_tool
+                #（幂等，靠 _lessons_capture_installed 标记），stub 必须提供
+                call_tool=lambda name, arguments=None: None)
 
         def tool(self, *args, **kwargs):
-            return lambda function: function
+            def deco(function):
+                self._tools.append((args, kwargs, function))
+                return function
+            return deco
+
+        def resource(self, *args, **kwargs):
+            def deco(function):
+                self._resources.append((args, kwargs, function))
+                return function
+            return deco
+
+        def prompt(self, *args, **kwargs):
+            def deco(function):
+                self._prompts.append((args, kwargs, function))
+                return function
+            return deco
 
         def run(self):
             return None
