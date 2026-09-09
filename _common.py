@@ -26,8 +26,8 @@ import json
 import os
 import re
 import sys
-import threading
 import time
+import traceback
 from contextlib import redirect_stderr, redirect_stdout
 
 __all__ = [
@@ -59,8 +59,8 @@ __all__ = [
     "invalidate_all_caches",
     "register_cache",
     "_cache_registry",
-    "_run_code_thread",
-] 
+    "_run_code_sync",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -757,9 +757,6 @@ class ExecutionTimeoutError(Exception):
 # ---------------------------------------------------------------------------
 _VALID_POLICIES = ("read-only", "normal", "privileged")
 _BYPASS_TRUTHY = {"1", "true", "yes", "on"}
-# fix-mcp-help-cap-protocol：_run_code_thread 的 timed_out grace poll
-# 窗口（秒）。join 到期后线程在此窗口内退出 → 判正常完成（不误报超时）
-_GRACE_POLL_SECONDS = 0.25
 
 
 def validate_policy(policy):
@@ -911,12 +908,22 @@ def check_execute_code_policy(code, policy, allow_dangerous,
 def _build_audit(policy, bypass_used, dangerous_hits, heavy_hits,
                   mutation_hits, elapsed_ms, undo_group,
                   exception_type=None, exception_message=None,
-                  timed_out=False):
-    """结构化 audit 块；空 hits 字段省略而非 None。"""
+                  timed_out=False, execution_mode=None,
+                  timeout_ignored=None):
+    """结构化 audit 块；空 hits 字段省略而非 None。
+
+    feat-mcp-round2-hardening §1（主线程同步执行）契约：
+    - ``timed_out`` 恒存在且为 bool（主线程模型下恒 False；保留字段以
+      兼容既有消费方，不再"False 时省略"）
+    - ``execution_mode`` / ``timeout_ignored`` 由调用方显式传入时记录
+      （execute_code 主线程路径传 "main_thread" / True）
+    - ``undo_group`` 为 None（read-only 不包组）时省略，保持既有行为
+    """
     audit = {
         "policy": policy,
         "bypass_used": bool(bypass_used),
         "elapsed_ms": int(elapsed_ms) if elapsed_ms is not None else 0,
+        "timed_out": bool(timed_out),
     }
     if dangerous_hits:
         audit["dangerous_hits"] = list(dangerous_hits)
@@ -930,8 +937,10 @@ def _build_audit(policy, bypass_used, dangerous_hits, heavy_hits,
         audit["exception_type"] = exception_type
     if exception_message:
         audit["exception_message"] = exception_message
-    if timed_out:
-        audit["timed_out"] = True
+    if execution_mode is not None:
+        audit["execution_mode"] = execution_mode
+    if timeout_ignored is not None:
+        audit["timeout_ignored"] = bool(timeout_ignored)
     return audit
 
 
@@ -1045,77 +1054,49 @@ def invalidate_all_caches():
     return None
 
 
-def _run_code_thread(code, namespace, timeout=30):
-    """在 daemon 线程里 exec(code, namespace)；超时只标记不阻塞。
+def _run_code_sync(code, namespace):
+    """在**调用线程**（Houdini 主线程）同步 exec(code, namespace)。
+
+    feat-mcp-round2-hardening §1：取代旧 ``_run_code_thread`` worker 线程
+    模型。理由（design.md §1）：
+    1. HOM undo 与主线程绑定 —— worker 线程的场景变更不进 undo 栈，
+       performUndo() / Ctrl+Z 无法回滚；
+    2. worker 的 redirect_stdout/stderr 是进程级替换，超时存活期会劫持
+       全进程输出；
+    3. SWIG/C++ 调用持 GIL，主线程照样阻塞，伪并发没有价值。
+
+    主线程同步语义：代码完整执行至自然结束，无超时中断（也不存在
+    timed_out / grace poll 概念——字段由 handler 层恒填 False）。死循环
+    脚本 = 主线程卡死 = MCP 服务不可用直至 Houdini 重启，该代价由
+    dangerous-pattern 静态扫描 + verify-before-execute 工作流缓解，并
+    在 bridge 工具描述中明示。
 
     返回 dict 字段：
-    - stdout / stderr: 重定向捕获的输出
-    - elapsed_ms: 实际等待时间（毫秒）
-    - timed_out: bool
-    - exception_type / exception_message: 异常时填入
-    注：超时情况下线程为 daemon，主进程退出时会被回收；不会自动 undo。
-
-    fix-mcp-help-cap-protocol（timed_out 误报修复）：
-    ``thread.join(timeout)`` 到期返回后立刻 ``is_alive()`` 存在收尾竞态
-    ——代码已完整执行（exec 返回、stdout 已写完、finally 已跑）但线程
-    尚未退出 run 方法时，``is_alive()`` 仍为 True，导致 audit 误报
-    ``timed_out=true, elapsed≈timeout``（实机复现：stdout 完整 + 节点
-    已清理仍报 30006ms 超时）。修法：join 到期后再做一次短 grace poll
-    （``_GRACE_POLL_SECONDS``，默认 0.25s），grace 内线程真退出则改判
-    正常完成并刷新 elapsed_ms；grace 后仍存活才定性 timed_out=True
-    （真超时路径不受影响）。
-
-    Caveat — StringIO 写入的线程安全：
-    超时返回时子线程（daemon）可能仍在执行，被 exec 中的 print/traceback
-    会持续写入 stdout_capture / stderr_capture（io.StringIO）。io.StringIO
-    非 thread-safe（write/getvalue 没有锁），但 CPython GIL 下基本不会
-    段错误或丢字符；不过理论上仍存在交错写入的风险。调用方若关心一致性，
-    建议在 read stdout/stderr 前做短轮询 `thread.join(0.01)`，让子线程
-    在自然执行间隙结束，再读取 StringIO。本函数不主动 join 第二次，以
-    避免引入新线程同步复杂度（fix brief 推荐 docstring-only 修复）。
+    - stdout / stderr: redirect 捕获的输出（同步执行，无跨线程劫持窗口）
+    - elapsed_ms: 实际执行耗时（毫秒）
+    - exception_type / exception_message: 异常时填入，否则为 None
     """
     stdout_capture = io.StringIO()
     stderr_capture = io.StringIO()
-    container = {}
-
-    def _target():
-        try:
-            with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
-                exec(code, namespace)
-            container["exc"] = None
-        except Exception as e:
-            container["exc"] = e
-            try:
-                traceback_mod = __import__("traceback")
-                traceback_mod.print_exc(file=stderr_capture)
-            except Exception:
-                pass
-
-    thread = threading.Thread(target=_target, daemon=True)
+    exception_type = None
+    exception_message = None
     start = time.time()
-    thread.start()
-    thread.join(timeout=timeout)
-    timed_out = thread.is_alive()
-    if timed_out:
-        # grace poll：join 到期瞬间线程可能正在收尾（exec 已完成、
-        # stdout 完整、finally 已跑），直接定性会误报 timed_out。
-        # 短等一段后仍存活才是真超时（如 sleep 35 > timeout 30）。
-        thread.join(_GRACE_POLL_SECONDS)
-        if not thread.is_alive():
-            timed_out = False
+    try:
+        with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
+            exec(code, namespace)
+    except Exception as e:
+        exception_type = type(e).__name__
+        exception_message = str(e)
+        try:
+            traceback.print_exc(file=stderr_capture)
+        except Exception:
+            pass
     elapsed_ms = int((time.time() - start) * 1000)
 
-    result = {
+    return {
         "stdout": stdout_capture.getvalue(),
         "stderr": stderr_capture.getvalue(),
         "elapsed_ms": elapsed_ms,
-        "timed_out": timed_out,
+        "exception_type": exception_type,
+        "exception_message": exception_message,
     }
-    exc = container.get("exc")
-    if exc is not None:
-        result["exception_type"] = type(exc).__name__
-        result["exception_message"] = str(exc)
-    else:
-        result["exception_type"] = None
-        result["exception_message"] = None
-    return result

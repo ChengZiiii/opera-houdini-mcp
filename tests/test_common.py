@@ -444,36 +444,35 @@ class ApplyResponseCapMultiListTests(unittest.TestCase):
 
 
 # ===========================================================================
-# fix-mcp-help-cap-protocol：_run_code_thread timed_out grace poll
+# feat-mcp-round2-hardening §1：_run_code_sync 主线程同步执行
 # ===========================================================================
-class RunCodeThreadGracePollTests(unittest.TestCase):
-    """3.2 join 到期临界完成的 timed_out 误报修复（grace poll）。"""
+class RunCodeSyncTests(unittest.TestCase):
+    """_run_code_sync 取代 _run_code_thread + grace poll：无 timeout、无
+    daemon 线程，代码在调用线程同步执行至自然结束。"""
 
-    def test_normal_completion_under_timeout(self):
-        r = cmn._run_code_thread("print('hi')", {}, timeout=5)
-        self.assertFalse(r["timed_out"])
+    def test_normal_completion_captures_stdout(self):
+        r = cmn._run_code_sync("print('hi')", {})
         self.assertIn("hi", r["stdout"])
+        self.assertIsNone(r["exception_type"])
+        # 同步模型：无 timed_out 字段（handler 层恒填 False）
+        self.assertNotIn("timed_out", r)
 
-    def test_real_timeout_reports_true(self):
-        r = cmn._run_code_thread(
-            "import time\ntime.sleep(3)", {}, timeout=0.5)
-        self.assertTrue(r["timed_out"])
-        self.assertGreaterEqual(r["elapsed_ms"], 500)
-
-    def test_critical_completion_not_misreported(self):
-        # 代码耗时略超 join 到期点但落在 grace 窗口内 → timed_out=False
-        # （join(0.5) 到期时 sleep(0.6) 还有 ~0.1s < grace 0.25s）
-        r = cmn._run_code_thread(
-            "import time\ntime.sleep(0.6)\nprint('critical')", {}, timeout=0.5)
-        self.assertFalse(r["timed_out"])
-        self.assertIn("critical", r["stdout"])
-        # elapsed 反映 grace 后的真实时长（> join timeout）
-        self.assertGreaterEqual(r["elapsed_ms"], 600)
+    def test_sleep_runs_to_completion(self):
+        # 无超时中断：sleep 必然完整执行，elapsed 反映真实耗时
+        r = cmn._run_code_sync("import time\ntime.sleep(0.6)", {})
+        self.assertIsNone(r["exception_type"])
+        self.assertGreaterEqual(r["elapsed_ms"], 550)
 
     def test_exception_recorded(self):
-        r = cmn._run_code_thread("1/0", {}, timeout=5)
-        self.assertFalse(r["timed_out"])
+        r = cmn._run_code_sync("1/0", {})
         self.assertEqual(r["exception_type"], "ZeroDivisionError")
+        self.assertIn("ZeroDivisionError", r["stderr"])
+
+    def test_runs_in_calling_thread(self):
+        r = cmn._run_code_sync(
+            "import threading\n"
+            "print(threading.current_thread() is threading.main_thread())", {})
+        self.assertIn("True", r["stdout"])
 
 
 # ===========================================================================

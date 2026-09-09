@@ -1570,6 +1570,18 @@ def execute_houdini_code(ctx: Context, code: str,
     and are undoable as a single step. Use this only for operations no
     dedicated tool covers.
 
+    执行模型（feat-mcp-round2-hardening §1，主线程同步执行）：
+    - 代码在 Houdini **主线程同步执行**：调用期间整个 MCP 服务阻塞至代码
+      自然结束。死循环 / 卡死脚本 = 服务不可用直至 Houdini 重启——执行前
+      务必先用 verify_hou_api / get_houdini_help 核实将调用的 hou API，
+      避免已知会 hang 的调用（如 H21 OBJ setInput 30s+ hang）。
+    - **undo 真实生效**：normal / privileged 策略下场景变更包在
+      hou.undos.group 内，可经 performUndo() / Ctrl+Z 回滚；read-only 不包组
+      （写 API 在 policy 层被拦截）。
+    - 无超时中断机制：不存在"超时后代码仍在跑"的窗口；响应 audit 恒
+      timed_out=false，附 execution_mode="main_thread" 与
+      timeout_ignored=true。
+
     Args:
         code: Python source to exec inside Houdini.
         policy: "read-only" / "normal" / "privileged" (PR 4 safety policy).

@@ -3,7 +3,11 @@
 Covers:
 - _common.validate_policy / _bypass_config_enabled / check_execute_code_policy / _build_audit
 - _common.serialize_scene_state placeholder (mock hou)
-- _common._run_code_thread 正常 / 异常 / 超时 三种情况
+- _common._run_code_sync 主线程同步执行：正常 / 异常 / 完整执行（无超时中断）
+- server.HoudiniMCPServer.execute_code handler 主线程契约（feat-mcp-round2-hardening
+  §1）：audit 字段（timed_out 恒 false / execution_mode / timeout_ignored /
+  undo_group）、undo 包组与 performUndo 回滚（mock undo 栈）、timeout 参数
+  保留不生效、read-only 拦截、dangerous fail-closed、capture_diff
 - bridge get_last_scene_diff round-trip (mock get_houdini_connection)
 
 Stdlib unittest, no hython required. hou is mocked via a tiny stub class.
@@ -327,6 +331,10 @@ class BuildAuditTests(unittest.TestCase):
         self.assertEqual(audit["policy"], "normal")
         self.assertFalse(audit["bypass_used"])
         self.assertEqual(audit["elapsed_ms"], 12)
+        # feat-mcp-round2-hardening §1：timed_out 恒存在（False 时不再省略，
+        # 保留字段以兼容既有消费方）
+        self.assertIn("timed_out", audit)
+        self.assertFalse(audit["timed_out"])
         # empty hits fields should be omitted, not None
         self.assertNotIn("dangerous_hits", audit)
         self.assertNotIn("heavy_hits", audit)
@@ -387,6 +395,34 @@ class BuildAuditTests(unittest.TestCase):
         )
         self.assertNotIn("undo_group", audit)
 
+    def test_execution_mode_and_timeout_ignored_recorded(self):
+        # feat-mcp-round2-hardening §1：主线程路径恒记录 execution_mode /
+        # timeout_ignored；未传时省略（保持 _build_audit 通用性）
+        audit = cmn._build_audit(
+            policy="normal",
+            bypass_used=False,
+            dangerous_hits=[],
+            heavy_hits=[],
+            mutation_hits=[],
+            elapsed_ms=7,
+            undo_group=None,
+            execution_mode="main_thread",
+            timeout_ignored=True,
+        )
+        self.assertEqual(audit["execution_mode"], "main_thread")
+        self.assertTrue(audit["timeout_ignored"])
+        minimal = cmn._build_audit(
+            policy="normal",
+            bypass_used=False,
+            dangerous_hits=[],
+            heavy_hits=[],
+            mutation_hits=[],
+            elapsed_ms=1,
+            undo_group=None,
+        )
+        self.assertNotIn("execution_mode", minimal)
+        self.assertNotIn("timeout_ignored", minimal)
+
 
 # ===========================================================================
 # Section E: serialize_scene_state placeholder
@@ -416,57 +452,332 @@ class SerializeSceneStateTests(unittest.TestCase):
 
 
 # ===========================================================================
-# Section F: _run_code_thread — 正常 / 异常 / 超时 / 安全拒绝
+# Section F: _run_code_sync — 主线程同步执行（feat-mcp-round2-hardening §1）
 # ===========================================================================
-class RunCodeThreadTests(unittest.TestCase):
+class RunCodeSyncTests(unittest.TestCase):
+    """_run_code_sync 取代 _run_code_thread：无 timeout / 无 daemon 线程 /
+    无 timed_out 概念，代码在调用线程同步执行至自然结束。"""
+
     def test_normal_code_captures_stdout(self):
         ns = {"hou": _FakeHou(), "x": 0}
-        result = cmn._run_code_thread(
-            "x = 1 + 2\nprint('hello', x)", ns, timeout=5
-        )
+        result = cmn._run_code_sync("x = 1 + 2\nprint('hello', x)", ns)
         self.assertIn("stdout", result)
         self.assertIn("hello 3", result["stdout"])
-        self.assertFalse(result.get("timed_out", False))
         self.assertIsNone(result.get("exception_type"))
         self.assertGreaterEqual(result.get("elapsed_ms", 0), 0)
+        # 同步模型：无 timed_out 字段（handler 层恒填 False）
+        self.assertNotIn("timed_out", result)
 
     def test_exception_recorded(self):
         ns = {"hou": _FakeHou()}
-        result = cmn._run_code_thread(
-            "raise ValueError('boom')", ns, timeout=5
-        )
+        result = cmn._run_code_sync("raise ValueError('boom')", ns)
         self.assertIsNotNone(result.get("exception_type"))
         self.assertEqual(result["exception_type"], "ValueError")
         self.assertIn("boom", result.get("exception_message", ""))
+        # traceback 已同步捕获进 stderr
+        self.assertIn("ValueError", result.get("stderr", ""))
 
-    def test_timeout_marks_timed_out(self):
+    def test_sleep_runs_to_completion(self):
+        # 主线程模型：无超时中断——sleep 代码必然完整执行，stdout 完整，
+        # elapsed 反映真实耗时（旧 worker 模型 join(timeout) 会提前返回）
         ns = {"hou": _FakeHou()}
         start = time.time()
-        result = cmn._run_code_thread(
-            "import time; time.sleep(5)", ns, timeout=1
-        )
-        elapsed_real = time.time() - start
-        # Must return within ~ timeout + small slack, not wait full sleep
-        self.assertLess(elapsed_real, 4.0)
-        self.assertTrue(result.get("timed_out", False))
-        self.assertGreaterEqual(result.get("elapsed_ms", 0), 900)
+        result = cmn._run_code_sync(
+            "import time; time.sleep(0.6); print('done')", ns)
+        wall = time.time() - start
+        self.assertIn("done", result.get("stdout", ""))
+        self.assertGreaterEqual(result.get("elapsed_ms", 0), 550)
+        self.assertGreaterEqual(wall, 0.55)
 
-    def test_timeout_does_not_block_forever(self):
+    def test_runs_in_calling_thread(self):
+        # 核心语义：代码在调用线程（= main thread）执行，不再经 worker
         ns = {"hou": _FakeHou()}
-        result = cmn._run_code_thread(
-            "import time; time.sleep(10)", ns, timeout=0.5
-        )
-        # daemon thread may still be alive; we must not block on it
-        self.assertTrue(result.get("timed_out", False))
+        result = cmn._run_code_sync(
+            "import threading\n"
+            "print(threading.current_thread() is threading.main_thread())",
+            ns)
+        self.assertIn("True", result.get("stdout", ""))
 
     def test_exception_in_redirected_stdout_still_recorded(self):
         ns = {"hou": _FakeHou()}
-        result = cmn._run_code_thread(
-            "print('before'); raise RuntimeError('nope')", ns, timeout=5
-        )
+        result = cmn._run_code_sync(
+            "print('before'); raise RuntimeError('nope')", ns)
         self.assertEqual(result["exception_type"], "RuntimeError")
         # stdout before raise should still be captured
         self.assertIn("before", result.get("stdout", ""))
+
+
+# ===========================================================================
+# Section H: server.execute_code handler — 主线程契约（feat-mcp-round2 §1）
+# ===========================================================================
+def _load_server_module():
+    """加载真实 server.py（模式同 tests/test_batch_undo.py）。
+
+    只有 ``_common`` / ``_render_policy`` 从真实文件加载，其余兄弟模块打
+    stub（execute_code 路径只依赖 _common 与顶层 import 成功）。
+    """
+    package_name = "execute_code_test_houdinimcp"
+    module_name = package_name + ".server"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+
+    package = types.ModuleType(package_name)
+    package.__path__ = [ROOT]
+    sys.modules[package_name] = package
+
+    for name in (
+            "_scene", "_error_nodes", "_discovery", "_materials",
+            "_hscript", "_graph_edit", "_node_info", "_geo_summary",
+            "_pane_capture", "_capture_paths", "_render_b64", "_help",
+            "HoudiniMCPRender"):
+        sys.modules[package_name + "." + name] = types.ModuleType(
+            package_name + "." + name)
+
+    for name in ("_common", "_render_policy"):
+        full_name = package_name + "." + name
+        path = os.path.join(ROOT, name + ".py")
+        spec = _ilu.spec_from_file_location(full_name, path)
+        module = _ilu.module_from_spec(spec)
+        sys.modules[full_name] = module
+        spec.loader.exec_module(module)
+
+    full_name = package_name + ".server"
+    spec = _ilu.spec_from_file_location(full_name, os.path.join(ROOT, "server.py"))
+    module = _ilu.module_from_spec(spec)
+    sys.modules[full_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class _FakeUndoGroup(object):
+    def __init__(self, owner, label):
+        self.owner = owner
+        self.label = label
+
+    def __enter__(self):
+        self.owner.events.append(("enter", self.label))
+        self.owner._open_creations = []
+        return self
+
+    def __exit__(self, exc_type, exc_value, tb):
+        self.owner.events.append(("exit", self.label))
+        self.owner.closed_creations.append(self.owner._open_creations)
+        self.owner._open_creations = None
+        return False
+
+
+class _FakeUndos(object):
+    """mock hou.undos：模拟 HOM 语义——只有包在 group 内的场景变更可被
+    performUndo 回滚；group 外的创建不进 undo 栈。"""
+
+    def __init__(self):
+        self.events = []
+        self.closed_creations = []
+        self._open_creations = None
+
+    def group(self, label):
+        self.events.append(("create", label))
+        return _FakeUndoGroup(self, label)
+
+    def record_creation(self, node):
+        # 不在 undo group 内的创建不进栈（worker 线程时代的失真即源于此）
+        if self._open_creations is not None:
+            self._open_creations.append(node)
+
+    def performUndo(self):
+        if not self.closed_creations:
+            raise RuntimeError("no undo to perform")
+        for node in self.closed_creations.pop():
+            node.destroy()
+
+
+class _FakeHouNode(object):
+    def __init__(self, path, undos=None):
+        self._path = path
+        self._children = []
+        self._destroyed = False
+        self._undos = undos
+
+    def path(self):
+        return self._path
+
+    def isDestroyed(self):
+        return self._destroyed
+
+    def destroy(self):
+        self._destroyed = True
+
+    def children(self):
+        return [c for c in self._children if not c._destroyed]
+
+    def type(self):
+        t = types.SimpleNamespace()
+        t.name = lambda: "geo"
+        t.category = lambda: types.SimpleNamespace(name=lambda: "Object")
+        return t
+
+    def createNode(self, node_type, node_name=None):
+        name = node_name or "{0}{1}".format(node_type, len(self._children) + 1)
+        child = _FakeHouNode(self._path + "/" + name, undos=self._undos)
+        self._children.append(child)
+        if self._undos is not None:
+            self._undos.record_creation(child)
+        return child
+
+
+class _FakeHandlerHou(object):
+    """execute_code handler 用 mock hou：node() + undos，可做 undo 回滚断言。"""
+
+    def __init__(self):
+        self.undos = _FakeUndos()
+        self._obj = _FakeHouNode("/obj", undos=self.undos)
+        self._root = _FakeHouNode("/", undos=self.undos)
+        self._root._children.append(self._obj)
+
+    def node(self, path):
+        if path == "/":
+            return self._root
+        if path == "/obj":
+            return self._obj
+        return None
+
+
+class ExecuteCodeHandlerMainThreadTests(unittest.TestCase):
+    """server.HoudiniMCPServer.execute_code 主线程契约单测（mock hou）。
+
+    核心验收（spec "normal 策略可撤销" scenario 的 mock 版）：normal 策略
+    建节点 → performUndo() → 节点被回滚。真实 hou 版由
+    tests/h21_live_execute_code_main_thread.py 在 hython 独立端口上验证。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server_mod = _load_server_module()
+
+    def setUp(self):
+        self.hou = _FakeHandlerHou()
+        self.server_mod.hou.node = self.hou.node
+        self.server_mod.hou.undos = self.hou.undos
+
+    def tearDown(self):
+        # conftest 的 hou stub 是全局共享的：恢复原样避免跨测试泄漏
+        self.server_mod.hou.node = lambda p: None
+        try:
+            delattr(self.server_mod.hou, "undos")
+        except AttributeError:
+            pass
+
+    def _run(self, code, **kwargs):
+        inst = self.server_mod.HoudiniMCPServer.__new__(
+            self.server_mod.HoudiniMCPServer)
+        return self.server_mod.HoudiniMCPServer.execute_code(inst, code, **kwargs)
+
+    def _find_node(self, name):
+        for child in self.hou._obj.children():
+            if child.path() == "/obj/" + name:
+                return child
+        return None
+
+    def test_normal_creates_node_with_undo_group_recorded(self):
+        result = self._run("hou.node('/obj').createNode('geo', 'UNDO_E2E')")
+        self.assertTrue(result.get("executed"), result)
+        self.assertFalse(result.get("blocked", False))
+        audit = result["_audit"]
+        self.assertEqual(audit["undo_group"], "MCP: execute_code (normal)")
+        self.assertEqual(audit["execution_mode"], "main_thread")
+        self.assertTrue(audit["timeout_ignored"])
+        self.assertFalse(audit["timed_out"])
+        # undo group 确实开合（包住主线程执行）
+        self.assertIn(("create", "MCP: execute_code (normal)"),
+                      self.hou.undos.events)
+        self.assertIn(("enter", "MCP: execute_code (normal)"),
+                      self.hou.undos.events)
+        self.assertIn(("exit", "MCP: execute_code (normal)"),
+                      self.hou.undos.events)
+        self.assertIsNotNone(self._find_node("UNDO_E2E"))
+
+    def test_normal_create_then_perform_undo_rolls_back(self):
+        # 核心验收：normal 建节点 → performUndo → 节点消失
+        result = self._run("hou.node('/obj').createNode('geo', 'UNDO_E2E')")
+        self.assertTrue(result.get("executed"), result)
+        self.assertIsNotNone(self._find_node("UNDO_E2E"))
+        self.hou.undos.performUndo()
+        self.assertIsNone(self._find_node("UNDO_E2E"))
+
+    def test_execution_happens_in_main_thread(self):
+        result = self._run(
+            "import threading\n"
+            "print(threading.current_thread() is threading.main_thread())")
+        self.assertTrue(result.get("executed"), result)
+        self.assertIn("True", result.get("stdout", ""))
+
+    def test_timeout_param_accepted_but_ignored(self):
+        # spec "timeout 参数忽略" scenario 的单测版：sleep(1.5) > timeout=1
+        # → 旧 worker 模型会在 ~1s 提前返回 timed_out=true 且 stdout 残缺；
+        #   新主线程模型必须完整执行至自然结束（区分度高）
+        start = time.time()
+        result = self._run(
+            "import time; time.sleep(1.5); print('done')",
+            policy="normal", timeout=1)
+        wall = time.time() - start
+        self.assertTrue(result.get("executed"), result)
+        self.assertIn("done", result.get("stdout", ""))
+        audit = result["_audit"]
+        self.assertFalse(audit["timed_out"])
+        self.assertTrue(audit["timeout_ignored"])
+        self.assertEqual(audit["execution_mode"], "main_thread")
+        self.assertGreaterEqual(audit["elapsed_ms"], 1500)
+        self.assertGreaterEqual(wall, 1.5)
+
+    def test_read_only_blocks_mutation_and_never_wraps_undo_group(self):
+        result = self._run("hou.node('/obj').createNode('geo', 'NOPE')",
+                           policy="read-only")
+        self.assertFalse(result.get("executed", False))
+        self.assertTrue(result.get("blocked"))
+        self.assertIn("mutation", result["reason"])
+        audit = result["_audit"]
+        self.assertNotIn("undo_group", audit)
+        self.assertEqual(audit["execution_mode"], "main_thread")
+        self.assertTrue(audit["timeout_ignored"])
+        # 未执行 → 无 undo group 开合
+        self.assertEqual(self.hou.undos.events, [])
+        self.assertIsNone(self._find_node("NOPE"))
+
+    def test_read_only_safe_code_executes_without_undo_group(self):
+        result = self._run("print('read-only ok')", policy="read-only")
+        self.assertTrue(result.get("executed"), result)
+        audit = result["_audit"]
+        self.assertNotIn("undo_group", audit)
+        self.assertFalse(audit["timed_out"])
+        self.assertEqual(self.hou.undos.events, [])
+
+    def test_normal_dangerous_fail_closed(self):
+        result = self._run("import subprocess\nsubprocess.run(['ls'])")
+        self.assertFalse(result.get("executed", False))
+        self.assertTrue(result.get("blocked"))
+        self.assertIn("dangerous", result["reason"])
+        self.assertEqual(self.hou.undos.events, [])
+
+    def test_capture_diff_still_reports_scene_changes(self):
+        result = self._run(
+            "hou.node('/obj').createNode('geo', 'DIFF_NODE')",
+            capture_diff=True)
+        self.assertTrue(result.get("executed"), result)
+        inst = self.server_mod.HoudiniMCPServer.__new__(
+            self.server_mod.HoudiniMCPServer)
+        diff = self.server_mod.HoudiniMCPServer.get_last_scene_diff(inst)
+        self.assertTrue(diff.get("available"))
+        self.assertTrue(diff.get("changed"))
+        after_paths = [n["path"] for n in diff.get("after", {}).get("nodes", [])]
+        self.assertIn("/obj/DIFF_NODE", after_paths)
+
+    def test_invalid_policy_audit_carries_main_thread_fields(self):
+        result = self._run("print('x')", policy="super")
+        self.assertTrue(result.get("blocked"))
+        audit = result["_audit"]
+        self.assertFalse(audit["timed_out"])
+        self.assertEqual(audit["execution_mode"], "main_thread")
+        self.assertTrue(audit["timeout_ignored"])
 
 
 # ===========================================================================

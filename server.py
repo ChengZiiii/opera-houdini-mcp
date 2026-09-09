@@ -1944,11 +1944,23 @@ class HoudiniMCPServer:
                      allow_heavy_geometry=False, capture_diff=False, timeout=30):
         """Execute arbitrary Python code within Houdini with PR 4 safety layer.
 
+        执行模型（feat-mcp-round2-hardening §1 修订）：代码在 **Houdini
+        主线程同步执行**（QTimer dispatch 内，与其他 MUTATING 命令同路径），
+        不再经 worker 线程。代价与语义：
+        - **timeout 参数保留但不生效**：主线程执行期间本服务阻塞至代码
+          自然结束，无法从中断——死循环/卡死脚本 = MCP 服务不可用直至
+          Houdini 重启。audit 恒 ``timed_out=false`` 并附
+          ``execution_mode="main_thread"``、``timeout_ignored=true``。
+        - **undo 真实生效**：normal/privileged 包裹
+          ``hou.undos.group("MCP: execute_code (<policy>)")``，场景变更可
+          经 ``performUndo()`` / Ctrl+Z 回滚；read-only 不包组（写 API 在
+          policy 层已被拦截）。
+
         新签名（向后兼容：仅传 code 时等价于 policy=normal / 全 bypass 关闭 /
-        不 capture diff / timeout=30s）。流程：
+        不 capture diff / timeout=30 被忽略）。流程：
         1) 规范化 policy 2) 读 bypass config 3) policy 决策（hit 即返 blocked）
-        4) capture_diff 时先 serialize 5) _run_code_thread 执行 6) capture_diff
-        时再 serialize 7) _build_audit 组装审计块。
+        4) capture_diff 时先 serialize 5) _run_code_sync 主线程同步执行
+        6) capture_diff 时再 serialize 7) _build_audit 组装审计块。
         """
         # Step 1+2: validate policy & bypass config
         try:
@@ -1968,6 +1980,8 @@ class HoudiniMCPServer:
                     undo_group=None,
                     exception_type="ValueError",
                     exception_message=str(e),
+                    execution_mode="main_thread",
+                    timeout_ignored=True,
                 ),
             }
         bypass_enabled = cmn._bypass_config_enabled()
@@ -1978,7 +1992,7 @@ class HoudiniMCPServer:
             bypass_enabled,
         )
         if not decision["allowed"]:
-            # 不进入 thread，返 blocked dict
+            # 主线程执行前拦截，返 blocked dict
             return {
                 "executed": False,
                 "blocked": True,
@@ -1992,6 +2006,8 @@ class HoudiniMCPServer:
                     mutation_hits=decision["hits"]["mutation"],
                     elapsed_ms=0,
                     undo_group=None,
+                    execution_mode="main_thread",
+                    timeout_ignored=True,
                 ),
             }
 
@@ -1999,7 +2015,9 @@ class HoudiniMCPServer:
         # privileged 均包裹 undo group，spec 要求 normal 策略的非超时执行
         # 可由 hou.undos.performUndo() 回滚；read-only 保持现状（写 API
         # 在 policy 层已被拦截）。execute_code 不在 MUTATING_COMMANDS 硬
-        # 编码集合内（dispatcher 不重复包组），由本 handler 自管。）
+        # 编码集合内（dispatcher 不重复包组），由本 handler 自管。
+        # feat-mcp-round2-hardening §1：undo group 只有包住**主线程**执行
+        # 才有效（HOM undo 与主线程绑定）——这正是去 worker 线程化的主因。）
         undo_group_name = None
         if norm_policy in ("normal", "privileged") and hasattr(hou, "undos"):
             undo_group_name = "MCP: execute_code ({0})".format(norm_policy)
@@ -2015,14 +2033,16 @@ class HoudiniMCPServer:
         else:
             _before_scene = None
 
-        # Step 6: namespace + thread-exec
+        # Step 6: namespace + 主线程同步执行（feat-mcp-round2-hardening §1：
+        # 代码在 QTimer dispatch 线程内直接 exec——场景变更进 undo 栈、
+        # stdout/stderr 同步捕获无劫持窗口、timeout 参数不再生效。）
         namespace = {"hou": hou}
         # 把 undo 包成 context manager（如果可用）
         if undo_group_name and hasattr(hou, "undos") and hasattr(hou.undos, "group"):
             with hou.undos.group(undo_group_name):
-                run_result = cmn._run_code_thread(code, namespace, timeout=timeout)
+                run_result = cmn._run_code_sync(code, namespace)
         else:
-            run_result = cmn._run_code_thread(code, namespace, timeout=timeout)
+            run_result = cmn._run_code_sync(code, namespace)
 
         # Step 7: capture diff after
         if capture_diff:
@@ -2042,16 +2062,11 @@ class HoudiniMCPServer:
             run_result.get("stderr", ""), max_size
         )
 
-        # 异常时仍要打 traceback 到 host stderr（沿用 PR 3 之前行为）
-        if run_result.get("exception_type") and not run_result.get("timed_out"):
-            try:
-                print("--- Houdini MCP: execute_code Error ---", file=sys.stderr)
-                traceback.print_exc(file=sys.stderr)
-                print("--- End Error ---", file=sys.stderr)
-            except Exception:
-                pass
-
-        # Step 9: 组装 audit + 返回
+        # Step 9: 组装 audit + 返回（feat-mcp-round2-hardening §1 契约：
+        # timed_out 恒 False（保留字段以兼容既有消费方）；
+        # execution_mode="main_thread" + timeout_ignored=True 恒记录；
+        # undo_group 记录是否包组。异常 traceback 已由 _run_code_sync 同步
+        # 捕获进 stderr，不再向 host stderr 重复打印。）
         audit = cmn._build_audit(
             policy=norm_policy,
             bypass_used=(norm_policy == "privileged" and bypass_enabled),
@@ -2062,7 +2077,9 @@ class HoudiniMCPServer:
             undo_group=undo_group_name,
             exception_type=run_result.get("exception_type"),
             exception_message=run_result.get("exception_message"),
-            timed_out=run_result.get("timed_out", False),
+            timed_out=False,
+            execution_mode="main_thread",
+            timeout_ignored=True,
         )
 
         result = {
@@ -2071,13 +2088,6 @@ class HoudiniMCPServer:
             "stderr": stderr,
             "_audit": audit,
         }
-        if run_result.get("timed_out"):
-            # fix-mcp-help-cap-protocol：超时响应显式标注 daemon 线程可能
-            # 仍在 undo group 外运行（group 已随 with 退出关闭，线程后续
-            # 写入不进组、performUndo 无法回滚它们）
-            result["warning"] = (
-                "execution timed out; worker thread may still be running "
-                "outside the undo group")
         if stdout_truncated:
             result["stdout_truncated"] = True
         if stderr_truncated:
