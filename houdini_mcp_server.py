@@ -3848,17 +3848,24 @@ def list_materials(ctx, parent_path="/mat"):
 
 
 @mcp.tool()
-def list_material_types(ctx, category="Vop"):
-    """枚举材质 category 下的 node types（add-scene-context-selection-materials，READ_ONLY）。
+def list_material_types(ctx, category="Vop", limit: int = 100,
+                        cursor: int = 0):
+    """枚举材质 category 下的 node types（add-scene-context-selection-materials，READ_ONLY，分页信封）。
 
     ``category`` 仅接受 ``Vop`` / ``Shop``；使用对应 category 的
     ``nodeTypes()``，稳定排序返回 ``name / node_type / category /
     description``，``node_type`` 走 ``nameWithCategory()`` 完整
     类别名。未知 / 不支持 category 返 ``unsupported_category``。
+    分页（feat-mcp-round2-hardening §4b）：``limit`` clamp [1,500]、
+    多取 1 判 ``has_more``（lookahead 项不返回）、越界 ``cursor``
+    返回空页且 ``cursor=None``；信封含 ``total``，全量翻页拼接的
+    type 数 == total（不再被 response cap 截到前 ~150 项）。
     响应过 server 端 ``apply_response_cap``。
     """
     return _houdini_call("list_material_types", {
         "category": category,
+        "limit": limit,
+        "cursor": cursor,
     })
 
 

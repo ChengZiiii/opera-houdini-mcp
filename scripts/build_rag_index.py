@@ -1,31 +1,67 @@
 #!/usr/bin/env python
-"""build_rag_index.py — 递归扫描 Houdini help HTML 构建 RAG JSON 索引。
+"""build_rag_index.py — 扫描 Houdini help 源（zip wiki 文本 + HTML）构建 RAG JSON 索引。
 
 独立脚本（可由系统 Python 或 hython 直接运行），**不复用、不修改、不
 替换** ``_help.py`` 的 ``SideFXDocParser`` 与 local-help-first 查询路径
-（task 2.2 / R8）。本脚本自带仅用于批量索引的 stdlib ``HTMLParser``
-子类，提取 ``<title>`` 与可见正文，跳过 ``script/style/noscript``。
+（task 2.2 / R8）。本脚本自带仅用于批量索引的解析器：stdlib
+``HTMLParser`` 子类（散装 HTML 目录）+ wiki 文本解析器（zip 帮助包）。
 
-设计要点（tasks 2.1-2.6）：
+## 源实况（2026-09-10 实机侦察，feat-mcp-round2-hardening §4a）
+
+H21 的 ``$HFS/houdini/help`` 下没有散装 HTML——文档以 **zip 打包的 wiki
+文本**发布（nodes.zip 4768 条 / vex.zip 1163 / hom.zip 939 /
+expressions.zip 475 / commands.zip 439，条目为 ``sop/adaptiveprune.txt``
+风格：``#type/#context`` 元数据 + ``= 标题 =`` + ``\"\"\"摘要\"\"\"`` +
+正文 + ``@parameters`` 段）。本脚本默认扫这 5 个核心 zip（``--zips`` 可
+参数化）；散装 HTML 目录扫描模式**保留**（超集，同一目录两者可混扫）。
+
+wiki 文本解析规则（``parse_wiki_text``）：
+- ``#key: value`` 元数据行：剥出正文；``#context`` / ``#internal`` /
+  ``#tags`` 的值回灌为可检索 token（如 ``sop attribwrangle``——节点
+  internal 名是精确检索键，标题 "Attribute Wrangle" 分词后不含它）
+- ``= 标题 =``：提取 title；``== 段名 ==``：剥等号保留段名文本
+- ``\"\"\"摘要\"\"\"``：保留为正文（去引号标记）
+- ``@section`` 标记行：一律剥除；``@parameters`` 起的缩进参数块整段
+  跳过（至下一个 ``@`` 标记或 EOF）——参数块占 nodes.zip 大头且非检索
+  目标，跳过后索引体积可控
+- ``:include ...:`` 指令行：剥除（内容不在本文件内）
+- ``[text|target]`` 链接 markup → ``text``
+- 其余正文保留；最终 ``_collapse_ws`` 折叠空白（与 HTML 模式一致）
+
+doc path（索引内稳定 POSIX 标识）：zip 条目用 ``<zip 名>/<entry 相对
+路径>``（如 ``nodes.zip/sop/attribwrangle.txt``）；HTML 用源目录相对
+路径。全量按 path 排序后分配 doc id（确定性）。
+
+## 设计要点（tasks 2.1-2.6 + round2 §4a）
 - 仅 stdlib（R4）。可由系统 Python / hython 独立运行。
-- 扫描源优先级：``HOUDINI_MCP_RAG_SOURCE`` > ``$HFS/houdini/help``。
-- 递归 ``**/*.html``，保留稳定 POSIX 相对路径作为文档 identity。
-- 构建 documents/postings/avgdl/document_count，全文内嵌 JSON。
-- 原子发布（task 2.5）：同目录写唯一临时文件，flush + ``os.fsync()`` 后
-  ``os.replace()``；写入/替换失败保留旧索引并 best-effort 清临时文件。
+- 源优先级：``--source`` > ``HOUDINI_MCP_RAG_SOURCE`` >
+  ``$HFS/houdini/help``。
+- 输出优先级：``--output`` > ``HOUDINI_MCP_RAG_INDEX_DIR`` >
+  ``~/.opera-houdini-mcp/rag/``（**不得**默认写入 git submodule 目录）。
+- 构建 documents/postings/avgdl/document_count，全文内嵌 JSON；
+  ``json.dump`` 流式写句柄（不一次性物化整串）；postings 逐 term
+  ``popitem`` 转换释放中间 dict（峰值 ≈ 单份结构）。
+- 原子发布（task 2.5）：同目录写唯一临时文件，flush + ``os.fsync()``
+  后 ``os.replace()``；写入/替换失败保留旧索引并 best-effort 清临时
+  文件。0 doc 时拒绝发布（保护既有索引）。
 - 源目录缺失时 graceful 退出并给出配置提示（task 2.6）。
 
 运行示例：
     python external/houdinimcp/scripts/build_rag_index.py
-    set HOUDINI_MCP_RAG_SOURCE=C:/HFS/houdini/help && python build_rag_index.py
+    python build_rag_index.py --source "C:/Program Files/Side Effects \\
+        Software/Houdini 21.0.596/houdini/help"
+    python build_rag_index.py --zips nodes,vex --output D:/rag
     hython external/houdinimcp/scripts/build_rag_index.py
 """
+import argparse
 import datetime
 import io
 import json
 import os
+import re
 import sys
 import tempfile
+import zipfile
 from html.parser import HTMLParser
 
 # 让脚本既能从 scripts/ 单独运行，也能 -m 加载：把 fork 根目录
@@ -47,9 +83,15 @@ SKIP_TAGS = frozenset(("script", "style", "noscript"))
 TITLE_TAG = "title"
 INDEX_FILENAME = _rag.INDEX_FILENAME
 
+# 默认核心 zip 子集（H21 帮助包；--zips 可覆盖/扩展）
+DEFAULT_ZIP_NAMES = ("nodes", "vex", "hom", "expressions", "commands")
+
+# 默认输出目录（round2 §4a：不再默认写 fork 模块目录）
+DEFAULT_OUTPUT_DIRNAME = os.path.join(".opera-houdini-mcp", "rag")
+
 
 # ---------------------------------------------------------------------------
-# 独立 HTML 正文解析器（task 2.2）
+# 独立 HTML 正文解析器（task 2.2；散装 HTML 目录模式，保留为超集）
 # ---------------------------------------------------------------------------
 class HTMLBodyParser(HTMLParser):
     """提取 ``<title>`` 与可见正文；忽略 ``script/style/noscript``。
@@ -122,7 +164,80 @@ def parse_html(text):
 
 
 # ---------------------------------------------------------------------------
-# 递归扫描 + 索引构建（tasks 2.3 / 2.4）
+# wiki 文本解析器（round2 §4a：zip 帮助包条目格式）
+# ---------------------------------------------------------------------------
+# ``#key: value`` 元数据行（#type/#context/#internal/#icon/#tags/#since）
+_WIKI_META_LINE_RE = re.compile(r"^#([A-Za-z_][\w-]*):\s*(.*)$")
+# ``= 标题 =``：首字符 = 后必须跟空白（排除 ``== 段名 ==``）
+_WIKI_TITLE_RE = re.compile(r"^=\s+(.*?)\s*=+\s*$")
+# ``== 段名 ==``（及更深层级）：剥等号保留段名文本
+_WIKI_SECTION_RE = re.compile(r"^==+\s*(.*?)\s*=+\s*$")
+# ``@section`` 标记行（@parameters / @related / @examples / @inputs ...）
+_WIKI_MARKER_RE = re.compile(r"^@([A-Za-z_]\w*)\s*$")
+# ``:include xxx:`` 指令行（内容不在本文件内，纯噪声 token）
+_WIKI_INCLUDE_RE = re.compile(r"^:include\b")
+# ``[text|target]`` wiki 链接 → text
+_WIKI_LINK_RE = re.compile(r"\[([^\]|]+)\|[^\]]*\]")
+# 回灌为可检索 token 的元数据键（internal 名是精确检索键）
+_WIKI_META_KEYWORD_KEYS = frozenset(("context", "internal", "tags"))
+# 触发"跳过整段"的标记（参数块：体积大头且非检索目标）
+_WIKI_SKIP_SECTION_MARKERS = frozenset(("parameters",))
+
+
+def parse_wiki_text(text):
+    """解析 Houdini help zip 的 wiki 文本条目，返回 ``(title, body)``。
+
+    规则见模块 docstring；title 缺失时返回 ``""``（由调用方回退 entry
+    stem）。任何异常输入都宽容处理（非字符串返回空），不抛。
+    """
+    if not isinstance(text, str):
+        return "", ""
+    title = ""
+    meta_keywords = []
+    body_parts = []
+    in_skip_section = False
+    for raw in text.split("\n"):
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        meta = _WIKI_META_LINE_RE.match(stripped)
+        if meta is not None:
+            if meta.group(1).lower() in _WIKI_META_KEYWORD_KEYS:
+                value = meta.group(2).strip()
+                if value:
+                    meta_keywords.append(value)
+            continue
+        marker = _WIKI_MARKER_RE.match(stripped)
+        if marker is not None:
+            # 标记行本身一律剥除；parameters 起的段整段跳过
+            in_skip_section = (marker.group(1).lower()
+                               in _WIKI_SKIP_SECTION_MARKERS)
+            continue
+        if in_skip_section:
+            continue
+        if stripped.startswith('"""'):
+            body_parts.append(stripped.replace('"""', " "))
+            continue
+        if _WIKI_INCLUDE_RE.match(stripped):
+            continue
+        if not title:
+            title_match = _WIKI_TITLE_RE.match(stripped)
+            if title_match is not None:
+                title = title_match.group(1).strip()
+                continue
+        section = _WIKI_SECTION_RE.match(stripped)
+        if section is not None:
+            body_parts.append(section.group(1).strip())
+            continue
+        body_parts.append(stripped)
+    if meta_keywords:
+        body_parts.append(" ".join(meta_keywords))
+    body = _collapse_ws(_WIKI_LINK_RE.sub(r"\1", " ".join(body_parts)))
+    return title, body
+
+
+# ---------------------------------------------------------------------------
+# 递归扫描 + zip 感知扫描 + 索引构建（tasks 2.3 / 2.4 + round2 §4a）
 # ---------------------------------------------------------------------------
 def find_html_files(source_root):
     """递归扫描 ``source_root`` 下 ``**/*.html``。
@@ -144,14 +259,115 @@ def find_html_files(source_root):
     return results
 
 
-def build_index(source_root):
-    """扫描 HTML 并构造符合 ``houdinimcp.rag-index`` v1 schema 的 dict。"""
-    files = find_html_files(source_root)
+def find_zip_txt_entries(source_root, zip_names=None):
+    """扫描 ``source_root`` 下指定 zip 帮助包的 ``.txt`` 条目。
+
+    返回 ``[(doc_path, zip_abs_path, entry_name), ...]``，按 doc_path
+    稳定排序。``doc_path`` 为 ``<zip 文件名>/<entry 相对路径>`` 的稳定
+    POSIX 标识（如 ``nodes.zip/sop/attribwrangle.txt``）。zip 缺失 /
+    损坏时跳过该 zip（不抛）。
+    """
+    if zip_names is None:
+        zip_names = DEFAULT_ZIP_NAMES
+    results = []
+    source_root = os.path.abspath(source_root)
+    for zname in zip_names:
+        base = str(zname).strip()
+        if not base:
+            continue
+        if not base.lower().endswith(".zip"):
+            base = base + ".zip"
+        zip_path = os.path.join(source_root, base)
+        if not os.path.isfile(zip_path):
+            continue
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                names = [n for n in zf.namelist()
+                         if n.lower().endswith(".txt") and not n.endswith("/")]
+        except (OSError, zipfile.BadZipFile, RuntimeError):
+            continue
+        prefix = os.path.basename(base)
+        for entry in sorted(names):
+            entry_norm = entry.replace("\\", "/")
+            results.append(("%s/%s" % (prefix, entry_norm),
+                            zip_path, entry_norm))
+    results.sort(key=lambda triple: triple[0])
+    return results
+
+
+def _index_one_text(doc_id, doc_path, title, body, documents, postings):
+    """把单个已解析文档写入 documents/postings，返回其 token 长度。"""
+    combined = (title + "\n" + body) if title else body
+    tokens = _rag.tokenize(combined)
+    length = len(tokens)
+    doc_tf = {}
+    for tok in tokens:
+        doc_tf[tok] = doc_tf.get(tok, 0) + 1
+    for term, tf in doc_tf.items():
+        postings.setdefault(term, {})[doc_id] = tf
+    documents.append({
+        "id": doc_id,
+        "path": doc_path,
+        "title": title,
+        "length": length,
+        "content": body,
+    })
+    return length
+
+
+def build_index(source_root, zip_names=None):
+    """扫描源（zip wiki 文本 + 散装 HTML 超集）并构造符合
+    ``houdinimcp.rag-index`` v1 schema 的 dict。
+
+    doc id 按合并后 path 排序分配（确定性）；zip 逐包打开一次流式处理
+    entry（不重复解压索引结构）；postings 逐 term popitem 转换释放中间
+    dict，``json.dump`` 由 publish 阶段流式写盘。
+    """
+    zip_entries = find_zip_txt_entries(source_root, zip_names)
+    html_files = find_html_files(source_root)
+
     documents = []
     postings = {}  # term -> {doc_id: tf}
     total_length = 0
+    doc_id = 0
+    zip_doc_count = 0
+    html_doc_count = 0
 
-    for doc_id, (posix_rel, abs_path) in enumerate(files):
+    # zip 条目（已按 doc_path 排序 → 同 zip 连续，仅在切换时重开 ZipFile）
+    current_zip = None
+    zf = None
+    try:
+        for doc_path, zip_abs, entry in zip_entries:
+            if zip_abs != current_zip:
+                if zf is not None:
+                    zf.close()
+                try:
+                    zf = zipfile.ZipFile(zip_abs)
+                except (OSError, zipfile.BadZipFile, RuntimeError):
+                    zf = None
+                current_zip = zip_abs
+            if zf is None:
+                continue
+            try:
+                text = zf.read(entry).decode("utf-8", "replace")
+            except (OSError, KeyError, RuntimeError):
+                continue
+            title, body = parse_wiki_text(text)
+            if not title:
+                # title 回退：entry stem（如 sop/attribwrangle.txt →
+                # attribwrangle）——internal 名是检索键
+                stem = entry.rsplit("/", 1)[-1]
+                title = stem[:-4] if stem.lower().endswith(".txt") else stem
+            total_length += _index_one_text(
+                doc_id, doc_path, title, body, documents, postings)
+            doc_id += 1
+            zip_doc_count += 1
+    finally:
+        if zf is not None:
+            zf.close()
+
+    # 散装 HTML（超集保留）
+    for posix_rel, abs_path in html_files:
         try:
             with io.open(abs_path, "r", encoding="utf-8",
                          errors="replace") as handle:
@@ -159,31 +375,19 @@ def build_index(source_root):
         except OSError:
             continue
         title, body = parse_html(html_text)
-        combined = (title + "\n" + body) if title else body
-        tokens = _rag.tokenize(combined)
-        length = len(tokens)
-
-        doc_tf = {}
-        for tok in tokens:
-            doc_tf[tok] = doc_tf.get(tok, 0) + 1
-        for term, tf in doc_tf.items():
-            postings.setdefault(term, {})[doc_id] = tf
-
-        documents.append({
-            "id": doc_id,
-            "path": posix_rel,
-            "title": title,
-            "length": length,
-            "content": body,
-        })
-        total_length += length
+        total_length += _index_one_text(
+            doc_id, posix_rel, title, body, documents, postings)
+        doc_id += 1
+        html_doc_count += 1
 
     document_count = len(documents)
     avgdl = (total_length / document_count) if document_count > 0 else 0.0
 
+    # postings 转换：popitem 逐 term 释放，避免双份中间结构
     postings_out = {}
-    for term, doc_map in postings.items():
-        plist = [[doc_id, tf] for doc_id, tf in doc_map.items()]
+    while postings:
+        term, doc_map = postings.popitem()
+        plist = [[did, tf] for did, tf in doc_map.items()]
         plist.sort(key=lambda pair: pair[0])
         postings_out[term] = plist
 
@@ -192,8 +396,11 @@ def build_index(source_root):
         "schema": _rag.SCHEMA_NAME,
         "version": _rag.SCHEMA_VERSION,
         "built_at": built_at,
-        "source": "build_rag_index.py from {0}".format(
-            os.path.abspath(source_root)),
+        "source": "build_rag_index.py from {0} (zips={1}, zip_docs={2}, "
+                  "html_docs={3})".format(
+                      os.path.abspath(source_root),
+                      ",".join(zip_names) if zip_names else "",
+                      zip_doc_count, html_doc_count),
         "document_count": document_count,
         "avgdl": avgdl,
         "documents": documents,
@@ -203,30 +410,41 @@ def build_index(source_root):
 
 
 # ---------------------------------------------------------------------------
-# 源/输出目录解析（tasks 2.3 / 2.6）
+# 源/输出目录解析（tasks 2.3 / 2.6 + round2 §4a）
 # ---------------------------------------------------------------------------
-def resolve_source():
-    """扫描源优先级：``HOUDINI_MCP_RAG_SOURCE`` > ``$HFS/houdini/help``。
+def resolve_source(explicit=None):
+    """扫描源优先级：``--source`` > ``HOUDINI_MCP_RAG_SOURCE`` >
+    ``$HFS/houdini/help``。
 
     返回存在的目录绝对路径，或 ``None``（缺失）。
     """
+    candidates = []
+    if explicit:
+        candidates.append(explicit)
     env_src = os.environ.get("HOUDINI_MCP_RAG_SOURCE")
-    if env_src and os.path.isdir(env_src):
-        return os.path.abspath(env_src)
+    if env_src:
+        candidates.append(env_src)
     hfs = os.environ.get("HFS")
     if hfs:
-        candidate = os.path.join(hfs, "houdini", "help")
-        if os.path.isdir(candidate):
+        candidates.append(os.path.join(hfs, "houdini", "help"))
+    for candidate in candidates:
+        if candidate and os.path.isdir(candidate):
             return os.path.abspath(candidate)
     return None
 
 
-def resolve_index_dir():
-    """输出目录：``HOUDINI_MCP_RAG_INDEX_DIR`` > ``_rag`` 模块目录。"""
+def resolve_index_dir(explicit=None):
+    """输出目录：``--output`` > ``HOUDINI_MCP_RAG_INDEX_DIR`` >
+    ``~/.opera-houdini-mcp/rag/``。
+
+    round2 §4a：默认不再写 fork 模块目录（git submodule 内）。
+    """
+    if explicit:
+        return explicit
     env_dir = os.environ.get("HOUDINI_MCP_RAG_INDEX_DIR")
     if env_dir:
         return env_dir
-    return _PARENT
+    return os.path.join(os.path.expanduser("~"), DEFAULT_OUTPUT_DIRNAME)
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +455,8 @@ def publish_index(index, index_dir):
 
     在目标同目录写唯一临时文件，flush + ``os.fsync()`` 后
     ``os.replace(temp, final)`` 原子替换。写入或 replace 失败时保留旧
-    索引，并 best-effort 删除临时文件。
+    索引，并 best-effort 删除临时文件。``json.dump`` 流式写句柄，不在
+    内存一次性物化整串。
     """
     if not os.path.isdir(index_dir):
         os.makedirs(index_dir, exist_ok=True)
@@ -264,21 +483,50 @@ def publish_index(index, index_dir):
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI（round2 §4a：--source / --output / --zips）
 # ---------------------------------------------------------------------------
+def _parse_zips(value):
+    if value is None:
+        return list(DEFAULT_ZIP_NAMES)
+    names = [part.strip() for part in str(value).split(",") if part.strip()]
+    return names if names else list(DEFAULT_ZIP_NAMES)
+
+
 def main(argv=None):
-    argv = argv if argv is not None else sys.argv[1:]
-    source = resolve_source()
+    parser = argparse.ArgumentParser(
+        description="Build the houdinimcp RAG index (zip wiki text + HTML).")
+    parser.add_argument(
+        "--source", default=None,
+        help="help source dir (default: HOUDINI_MCP_RAG_SOURCE > "
+             "$HFS/houdini/help)")
+    parser.add_argument(
+        "--output", default=None,
+        help="output dir (default: HOUDINI_MCP_RAG_INDEX_DIR > "
+             "~/.opera-houdini-mcp/rag/)")
+    parser.add_argument(
+        "--zips", default=None,
+        help="comma-separated zip basenames under the source dir "
+             "(default: %s)" % ",".join(DEFAULT_ZIP_NAMES))
+    args = parser.parse_args(argv)
+
+    zip_names = _parse_zips(args.zips)
+    source = resolve_source(args.source)
     if source is None:
         sys.stderr.write(
-            "build_rag_index: no HTML source found.\n"
-            "Set HOUDINI_MCP_RAG_SOURCE=<dir>, or run inside hython "
-            "(HFS set),\nor point HOUDINI_MCP_RAG_INDEX_DIR at the "
-            "output location.\n")
+            "build_rag_index: no help source found.\n"
+            "Pass --source <dir>, or set HOUDINI_MCP_RAG_SOURCE, or run "
+            "inside hython (HFS set).\n")
         return 2
-    index_dir = resolve_index_dir()
-    sys.stderr.write("build_rag_index: scanning {0}\n".format(source))
-    index = build_index(source)
+    index_dir = resolve_index_dir(args.output)
+    sys.stderr.write("build_rag_index: scanning {0} (zips: {1})\n".format(
+        source, ",".join(zip_names)))
+    index = build_index(source, zip_names)
+    if index["document_count"] <= 0:
+        # 0 doc 多为源配置错误：拒绝发布，保护既有索引
+        sys.stderr.write(
+            "build_rag_index: 0 documents indexed (no matching zips or "
+            "html under source); refusing to publish.\n")
+        return 4
     try:
         final_path = publish_index(index, index_dir)
     except OSError as exc:

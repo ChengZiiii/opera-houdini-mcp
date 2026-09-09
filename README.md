@@ -40,7 +40,7 @@
 - **零新增 pip 依赖** — `get_houdini_help` 用 stdlib `html.parser` 替代 `beautifulsoup4`，维持 `mcp[cli]==1.12.2 + requests + python-dotenv` 三件套
 - **结构化 audit** — 每次 `execute_code` 响应附 `_audit` 块（policy / dangerous_hits / heavy_hits / mutation_hits / bypass_used / elapsed_ms / undo_group）
 - **local-help-first** — `get_houdini_help` / `verify_hou_api` 优先打 Houdini 本地 help server（`127.0.0.1:48626`），失败自动回退在线 SideFX
-- **自进化知识库** — 4 个 bridge-local 知识工具（`search_lessons` / `save_lesson` / `read_lesson` / `knowledge_stats`）+ 自动错误捕获 hook（零上下文成本）；多 root（个人库自动发现 + 团队库注册表声明，默认只读）；**无嵌入模型**（BM25 + 指纹 + 统计，全 stdlib）
+- **自进化知识库** — 6 个 bridge-local 知识工具（`search_lessons` / `save_lesson` / `read_lesson` / `knowledge_stats` / `capture_workflow_snapshot` / `save_recipe`）+ 自动错误捕获 hook（零上下文成本）；多 root（个人库自动发现 + 团队库注册表声明，默认只读）；**无嵌入模型**（BM25 + 指纹 + 统计，全 stdlib）
 
 ---
 
@@ -170,14 +170,15 @@ git submodule sync
 | 安全代码 | `execute_code` | 三档 policy + bypass 双开关 + 结构化 audit |
 | 安全代码 | `get_last_scene_diff` | 仅 mutation 模式提供前后场景快照 |
 | 截图 | `capture_pane_screenshot` / `render_node_network` / `list_visible_panes` / `capture_multiple_panes` | pane 截图，响应走 `apply_response_cap` |
-| 渲染 | `render_viewport_base64` / `render_quad_views_base64` | base64 版，karma cpu/xpu 双 renderer |
+| 渲染 | `render_single_view` / `render_quad_views` / `render_specific_camera` | 路径版渲染（落盘 `image_path`）；`render_viewport_base64` / `render_quad_views_base64` / `render_specific_camera_base64` 已注销注册（slim-mcp-toolset；恢复 = 取消对应 `@mcp.tool()` 注释）；缺 OGL 3.3 环境经 render policy redirect 到视口截图 |
+| 渲染 policy | `start_render` / `monitor_render` | ROP 同步渲染（四层防御 + consent token）+ husk/mantra OS 进程 best-effort 监控（bridge-only） |
 | 文档 | `get_houdini_help` | **本地 help server 优先** + 在线 SideFX 回退（stdlib `urllib` + `html.parser`）；返 `_source` / `_fallback_reason` |
 | 文档 | `verify_hou_api` | python_hou 默认 + `_ai_hint` 合成，AI-friendly wrapper over `get_houdini_help` |
 | 诊断 | `check_connection` / `ping_houdini` | 不持久化连接的 ping |
 | 缓存 | `manage_cache` | stats / invalidate / warmup |
 | 知识库 | `get_best_practices` | fork 人工审查 advisory recipes（bridge-local，不建立 Houdini 连接） |
 | 知识库 | `search_docs` / `get_doc` / `parse_hip_offline` | BM25 离线文档检索 / 全文 / 离线 .hip 解析 |
-| 知识库 | `search_lessons` / `save_lesson` / `read_lesson` / `knowledge_stats` | 自进化知识沉淀：跨 root BM25 融合检索 / 沉淀 / 全文 / 统计 |
+| 知识库 | `search_lessons` / `save_lesson` / `read_lesson` / `knowledge_stats` / `capture_workflow_snapshot` / `save_recipe` | 自进化知识沉淀：跨 root BM25 融合检索 / 沉淀 / 全文 / 统计 + 工作流快照 / recipe 写入 |
 
 ---
 
@@ -279,11 +280,13 @@ POSIX 前导 `/`、UNC `\\server\share`、前导 `\`）。绝对路径支持团�
 | 环境变量 | 默认 | 作用 | 适用工具 |
 |----------|------|------|----------|
 | `HOUDINI_MCP_ALLOW_BYPASS` | 未设 | `privileged` policy 启用开关（**不设则任何 bypass 请求都失败**） | `execute_code` |
+| `HOUDINI_MCP_ALLOW_NEW_SCENE` | 未设 | `new_scene` 放行开关（服务端/Houdini 进程内读取；未设或非 truthy 时**默认禁用**，防 AI 自主清空用户场景；`1/true/yes/on` 显式放行） | `new_scene` |
 | `HOUDINI_MCP_ENV_DIR` | 见下方约定 | embedded env 目录**绝对路径**覆盖；未设时从 package 目录名自动派生（`<dirname>-env/`，与 package 平级） | `_env_dir()`（3 处 prod + 2 处 test） |
 | `HOUDINI_MCP_LOCAL_HELP_URL` | `http://127.0.0.1:48626/` | 本地 help server base URL | `get_houdini_help` / `verify_hou_api` |
 | `HOUDINI_MCP_LOCAL_HELP_TIMEOUT` | `8.0` | 本地探测短超时（秒，clamp `[0.5, 60.0]`；fix-mcp-help-cap-protocol：2.5→8.0，H21 本地 ~1MB 页面实测需 6-8s） | `get_houdini_help` / `verify_hou_api` |
 | `HOUDINI_MCP_LOCAL_HELP_COOLDOWN` | `60` | 本地失败后 cooldown 窗口（秒，clamp `[0.0, 600.0]`） | `get_houdini_help` / `verify_hou_api` |
 | `HOUDINI_MCP_LOCAL_HELP_DISABLE` | 未设 | `1` / `true` / `yes` / `on` 时完全禁用 local-first，退化到"仅在线" | `get_houdini_help` / `verify_hou_api` |
+| `HOUDINI_MCP_RAG_INDEX_DIR` | `~/.opera-houdini-mcp/rag/` | RAG 索引目录覆盖；未设时解析序 home 目录（存在即用）→ 旧 fork 模块目录（兼容）。索引由 `scripts/build_rag_index.py` 生成（对 `$HFS/houdini/help` zip 帮助包实跑，命令见 `tests/README.md`） | `search_docs` / `get_doc` |
 | `RAPIDAPI_KEY` | 未设 | OPUS 资产库 API key | `_opus.py` |
 | `RAPIDAPI_HOST` | `opus5.p.rapidapi.com` | OPUS API host | `_opus.py` |
 | `RAPIDAPI_HOST_URL` | `https://opus5.p.rapidapi.com/` | OPUS API base URL | `_opus.py` |

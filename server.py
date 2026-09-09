@@ -4130,16 +4130,21 @@ class HoudiniMCPServer:
         return cmn.apply_response_cap(
             mats.list_materials(hou, parent_path=parent_path))
 
-    def handle_list_material_types(self, category="Vop"):
+    def handle_list_material_types(self, category="Vop", limit=100,
+                                   cursor=0):
         """add-scene-context-selection-materials：枚举材质 category 下
-        node types。
+        node types（分页信封，feat-mcp-round2-hardening §4b）。
 
         走 ``_materials.list_material_types``；``node_type`` 走
         ``nameWithCategory()`` 完整名；未知 / 不支持 category 返
-        ``unsupported_category``。响应过 ``apply_response_cap``。
+        ``unsupported_category``。``limit`` clamp [1,500]、多取 1 判
+        ``has_more``（lookahead 项不返回）、越界 ``cursor`` 空页 +
+        ``cursor=None``；信封含 ``total``，全量翻页总和 == total。
+        响应过 ``apply_response_cap``。
         """
         return cmn.apply_response_cap(
-            mats.list_material_types(hou, category=category))
+            mats.list_material_types(hou, category=category, limit=limit,
+                                     cursor=cursor))
 
     def handle_create_material_network(self, parent_path, name="mat"):
         """add-scene-context-selection-materials：parent 下创建 matnet。

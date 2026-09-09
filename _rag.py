@@ -15,8 +15,9 @@ local-help-first + 在线回退；本模块面向「跨文档主题检索」，�
   ``score/search`` 按 score 降序、同分按 doc_id 升序稳定排序（task 1.3）。
 - 版本化 JSON schema ``houdinimcp.rag-index`` version 1（task 1.4）：
   逐字段校验类型、非负计数、唯一文档 id/path、posting 引用必须存在。
-- ``_index_path()``：默认 ``index.v1.json``，支持
-  ``HOUDINI_MCP_RAG_INDEX_DIR`` 覆盖（task 1.5）。
+- ``_index_path()``：默认 ``index.v1.json``，解析序 ``HOUDINI_MCP_RAG_INDEX_DIR``
+  env → ``~/.opera-houdini-mcp/rag/``（存在即用）→ 旧 fork 模块目录（兼容；
+  feat-mcp-round2-hardening §4a，生成命令见 ``scripts/build_rag_index.py``）。
 - path + mtime_ns + size cache（task 1.6）：缺失/损坏/不兼容返回结构化
   status；**坏的新文件绝不得替换进程内最后一次已校验缓存**；同 path
   有已校验缓存时降级为 stale success（响应附 ``_index_warning``）。
@@ -488,7 +489,14 @@ def _index_path(path=None):
     - 显式 ``path`` 直接 abspath。
     - ``HOUDINI_MCP_RAG_INDEX_DIR`` 环境变量覆盖目录，文件名固定
       ``index.v1.json``。
-    - 默认：``_rag.py`` 模块同目录。
+    - 默认位置 1：``~/.opera-houdini-mcp/rag/index.v1.json``（存在即
+      使用；feat-mcp-round2-hardening §4a，生成命令见
+      ``scripts/build_rag_index.py``）。
+    - 默认位置 2（legacy 兼容）：``_rag.py`` 模块同目录。
+
+    解析序（env → ``~/.opera-houdini-mcp/rag/`` → 旧 fork 内路径）：
+    新 home 目录**存在索引文件时优先**；不存在时回退旧模块目录，保证
+    老安装（索引放在 fork 目录旁）不被静默切换。
     """
     if path is not None:
         if not isinstance(path, str):
@@ -498,7 +506,12 @@ def _index_path(path=None):
     env_dir = os.environ.get("HOUDINI_MCP_RAG_INDEX_DIR")
     if env_dir:
         return os.path.abspath(os.path.join(env_dir, INDEX_FILENAME))
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), INDEX_FILENAME)
+    home_rag = os.path.join(os.path.expanduser("~"),
+                            ".opera-houdini-mcp", "rag", INDEX_FILENAME)
+    if os.path.isfile(home_rag):
+        return home_rag
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        INDEX_FILENAME)
 
 
 def _lookup_last_good(path):

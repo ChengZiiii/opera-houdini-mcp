@@ -224,7 +224,7 @@ def main():
               and D.isSelected())  # D still selected from test 9
         _check(ok, "set_selection invalid path 0 partial change", failures)
 
-        # === 11. list_material_types Vop + stable sort ===
+        # === 11. list_material_types Vop + stable sort + 分页 ===
         total += 1
         r = mats.list_material_types(hou, "Vop")
         ok = (r.get("status") == "success"
@@ -235,6 +235,34 @@ def main():
         names = [t["name"] for t in r["types"]]
         ok = ok and names == sorted(names)
         _check(ok, "list_material_types Vop + nameWithCategory + sort",
+               failures)
+
+        # === 11b. list_material_types 分页：全量翻页总和 == total ===
+        # feat-mcp-round2-hardening §4b（H21 实测 Vop 1321 项）
+        total += 1
+        collected = 0
+        cursor = 0
+        pages = 0
+        r_total = r.get("total")
+        while True:
+            rp = mats.list_material_types(hou, "Vop", limit=100,
+                                          cursor=cursor)
+            if rp.get("status") != "success":
+                ok = False
+                break
+            collected += rp["count"]
+            pages += 1
+            if not rp["has_more"]:
+                ok = (rp["cursor"] is None
+                      and collected == rp["total"]
+                      and r_total == rp["total"])
+                break
+            cursor = rp["cursor"]
+            if pages > 100:
+                ok = False
+                break
+        _check(ok, "list_material_types pagination sum == total "
+               "(collected=%s, total=%s)" % (collected, r_total),
                failures)
 
         # === 12. list_material_types unsupported category ===

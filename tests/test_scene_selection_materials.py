@@ -827,6 +827,22 @@ class ListMaterialsTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Section G: list_material_types
 # ---------------------------------------------------------------------------
+def _make_hou_with_n_vop_types(count):
+    """Fake hou with ``count`` Vop node types named type0000..typeNNNN."""
+    cat = _FakeCategory("Vop")
+    node_types = {}
+    for i in range(count):
+        name = "type%04d" % i
+        node_types["Vop/%s" % name] = _FakeNodeType(name, "Vop")
+    cat.nodeTypes = lambda: node_types
+
+    class _Hou(object):
+        def nodeTypeCategories(self):
+            return {"Vop": cat}
+
+    return _Hou()
+
+
 class ListMaterialTypesTests(unittest.TestCase):
     def test_vop_category(self):
         hou = _FakeHouMatTop({})
@@ -874,6 +890,138 @@ class ListMaterialTypesTests(unittest.TestCase):
         r = _materials.list_material_types(hou, "Vop")
         names = [e["name"] for e in r["types"]]
         self.assertEqual(names, sorted(names))
+
+
+# ---------------------------------------------------------------------------
+# Section G2: list_material_types 分页边界（feat-mcp-round2-hardening §4b）
+# ---------------------------------------------------------------------------
+class ListMaterialTypesPaginationTests(unittest.TestCase):
+    """分页信封契约：clamp [1,500]、多取 1 判 has_more（lookahead 不
+    返回）、越界 cursor 空页 + cursor=None、全量翻页总和 == total。
+    """
+
+    def test_envelope_fields_present(self):
+        hou = _make_hou_with_n_vop_types(3)
+        r = _materials.list_material_types(hou, "Vop")
+        self.assertEqual(r["status"], "success")
+        for key in ("types", "count", "total", "has_more", "cursor",
+                    "category"):
+            self.assertIn(key, r)
+        self.assertEqual(r["total"], 3)
+        self.assertEqual(r["count"], 3)
+        self.assertFalse(r["has_more"])
+        self.assertIsNone(r["cursor"])
+
+    def test_exact_full_page_no_has_more(self):
+        # 恰好取满：3 项 limit=3 → count=3, has_more=False, cursor=None
+        hou = _make_hou_with_n_vop_types(3)
+        r = _materials.list_material_types(hou, "Vop", limit=3, cursor=0)
+        self.assertEqual(r["count"], 3)
+        self.assertEqual(r["total"], 3)
+        self.assertFalse(r["has_more"])
+        self.assertIsNone(r["cursor"])
+
+    def test_over_by_one_has_more_and_cursor(self):
+        # 超 1：5 项 limit=2 → 首页 2 项 + has_more + cursor=2；
+        # lookahead 第 3 项不返回
+        hou = _make_hou_with_n_vop_types(5)
+        r = _materials.list_material_types(hou, "Vop", limit=2, cursor=0)
+        self.assertEqual(r["count"], 2)
+        self.assertTrue(r["has_more"])
+        self.assertEqual(r["cursor"], 2)
+        self.assertEqual([t["name"] for t in r["types"]],
+                         ["type0000", "type0001"])
+
+        # 第二页：cursor=2 → 2 项 + has_more + cursor=4
+        r2 = _materials.list_material_types(hou, "Vop", limit=2,
+                                            cursor=r["cursor"])
+        self.assertEqual(r2["count"], 2)
+        self.assertTrue(r2["has_more"])
+        self.assertEqual(r2["cursor"], 4)
+        self.assertEqual([t["name"] for t in r2["types"]],
+                         ["type0002", "type0003"])
+
+        # 末页：cursor=4 → 1 项 + has_more=False + cursor=None
+        r3 = _materials.list_material_types(hou, "Vop", limit=2,
+                                            cursor=r2["cursor"])
+        self.assertEqual(r3["count"], 1)
+        self.assertFalse(r3["has_more"])
+        self.assertIsNone(r3["cursor"])
+        self.assertEqual([t["name"] for t in r3["types"]],
+                         ["type0004"])
+
+    def test_out_of_bounds_cursor_empty_page(self):
+        # 越界 cursor：空页 + count=0 + has_more=False + cursor=None
+        hou = _make_hou_with_n_vop_types(3)
+        r = _materials.list_material_types(hou, "Vop", limit=100,
+                                           cursor=99)
+        self.assertEqual(r["status"], "success")
+        self.assertEqual(r["types"], [])
+        self.assertEqual(r["count"], 0)
+        self.assertEqual(r["total"], 3)
+        self.assertFalse(r["has_more"])
+        self.assertIsNone(r["cursor"])
+
+    def test_limit_clamp_low(self):
+        # limit<=0 / 非整数 → clamp 到 1
+        hou = _make_hou_with_n_vop_types(3)
+        for bad in (0, -5, "ten", None):
+            r = _materials.list_material_types(hou, "Vop", limit=bad)
+            self.assertEqual(r["status"], "success",
+                             "limit=%r should not error" % (bad,))
+            self.assertEqual(r["count"], 1)
+            self.assertTrue(r["has_more"])
+            self.assertEqual(r["cursor"], 1)
+
+    def test_limit_clamp_high(self):
+        # limit > 500 → clamp 到 500：501 项时首页 500 + has_more
+        hou = _make_hou_with_n_vop_types(501)
+        r = _materials.list_material_types(hou, "Vop", limit=10000)
+        self.assertEqual(r["count"], 500)
+        self.assertEqual(r["total"], 501)
+        self.assertTrue(r["has_more"])
+        self.assertEqual(r["cursor"], 500)
+        # 恰好 500 项时 limit=10000 → 无 has_more
+        hou2 = _make_hou_with_n_vop_types(500)
+        r2 = _materials.list_material_types(hou2, "Vop", limit=10000)
+        self.assertEqual(r2["count"], 500)
+        self.assertFalse(r2["has_more"])
+        self.assertIsNone(r2["cursor"])
+
+    def test_negative_cursor_clamped_to_zero(self):
+        hou = _make_hou_with_n_vop_types(3)
+        r = _materials.list_material_types(hou, "Vop", limit=2,
+                                           cursor=-5)
+        self.assertEqual(r["count"], 2)
+        self.assertEqual(r["cursor"], 2)
+
+    def test_full_pagination_sum_equals_total_1321(self):
+        # H21 实测 Vop 1321 项全量翻页：拼接总和 == total，无丢失 /
+        # 重复（feat-mcp-round2-hardening 核心验收）
+        total_expected = 1321
+        hou = _make_hou_with_n_vop_types(total_expected)
+        collected = []
+        cursor = 0
+        pages = 0
+        while True:
+            r = _materials.list_material_types(hou, "Vop", limit=100,
+                                               cursor=cursor)
+            self.assertEqual(r["status"], "success")
+            self.assertEqual(r["total"], total_expected)
+            collected.extend(t["name"] for t in r["types"])
+            pages += 1
+            if not r["has_more"]:
+                self.assertIsNone(r["cursor"])
+                break
+            self.assertEqual(r["cursor"], pages * 100)
+            cursor = r["cursor"]
+            self.assertLess(pages, 100, "pagination did not terminate")
+        self.assertEqual(len(collected), total_expected)
+        # 无重复、无丢失、稳定排序
+        self.assertEqual(len(set(collected)), total_expected)
+        self.assertEqual(collected, sorted(collected))
+        # 1321 / 100 → 14 页（末页 21 项）
+        self.assertEqual(pages, 14)
 
 
 # ---------------------------------------------------------------------------

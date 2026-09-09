@@ -582,12 +582,25 @@ def get_material_info(hou, material_path):
 # ---------------------------------------------------------------------------
 # add-scene-context-selection-materials: 净新增 3 个材质工具
 # ---------------------------------------------------------------------------
-def list_material_types(hou, category="Vop"):
-    """枚举指定 category 下可作为材质节点的全部 type。
+# feat-mcp-round2-hardening §4b：分页边界（对齐 _discovery._paginate_envelope）
+_PAGE_MAX_LIMIT = 500
+_PAGE_DEFAULT_LIMIT = 100
+
+
+def list_material_types(hou, category="Vop", limit=_PAGE_DEFAULT_LIMIT,
+                        cursor=0):
+    """枚举指定 category 下可作为材质节点的全部 type（分页信封）。
 
     使用 ``hou.nodeTypeCategories()`` + ``category.nodeTypes()``，稳定
-    排序返回 ``{name, node_type, category, description}``。``node_type``
-    使用 ``nameWithCategory()`` 完整类别名。
+    排序返回 ``{types:[{name,node_type,category,description}], count,
+    total, has_more, cursor, category}``。``node_type`` 使用
+    ``nameWithCategory()`` 完整类别名。
+
+    分页契约（feat-mcp-round2-hardening）：
+    - ``limit`` clamp 到 ``[1, 500]``（非整数按 1 处理）
+    - 多取 1 项判断 ``has_more``（lookahead 项本身不返回）
+    - ``cursor`` 越界返回空页且 ``cursor=None``
+    - 全量翻页拼接的 type 数等于 ``total``（H21 实测 Vop 1321 项）
 
     未知 / 不支持 category → ``unsupported_category`` 错误。
     """
@@ -645,11 +658,49 @@ def list_material_types(hou, category="Vop"):
             "category": category_name,
             "description": description,
         })
-    return _success({
-        "types": out,
-        "count": len(out),
+    return _paginate_types(out, category_name, limit, cursor)
+
+
+def _paginate_types(items, category_name, limit, cursor):
+    """分页信封（多取 1 判 has_more；越界 cursor 空页 + cursor=None）。
+
+    与 ``_discovery._paginate_envelope`` 同语义：``limit<=0`` clamp 到 1、
+    上限 500；``cursor`` 负数 / 非整数 clamp 到 0。
+    """
+    try:
+        limit_int = int(limit)
+    except (TypeError, ValueError):
+        limit_int = 1
+    if limit_int <= 0:
+        limit_int = 1
+    if limit_int > _PAGE_MAX_LIMIT:
+        limit_int = _PAGE_MAX_LIMIT
+    try:
+        start = int(cursor)
+    except (TypeError, ValueError):
+        start = 0
+    if start < 0:
+        start = 0
+
+    total = len(items)
+    env = _success({
+        "types": [],
+        "count": 0,
+        "total": total,
+        "has_more": False,
+        "cursor": None,
         "category": category_name,
     })
+    if start >= total:
+        return env
+    page_plus = items[start:start + limit_int + 1]
+    has_more = len(page_plus) > limit_int
+    page = page_plus[:limit_int]
+    env["types"] = page
+    env["count"] = len(page)
+    env["has_more"] = has_more
+    env["cursor"] = (start + limit_int) if has_more else None
+    return env
 
 
 def list_materials(hou, parent_path="/mat"):

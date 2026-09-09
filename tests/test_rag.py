@@ -15,11 +15,13 @@ snippet、cap 与 get_doc 边界测试。
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 import textwrap
 import types
 import unittest
+import zipfile
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -794,6 +796,373 @@ class BridgeEnvelopeTests(unittest.TestCase):
         self.assertEqual(env["status"], "success")
         self.assertIn("_index_warning", env)
         self.assertTrue(env["_index_warning"])
+
+
+# ---------------------------------------------------------------------------
+# feat-mcp-round2-hardening §4a：wiki 文本解析器（zip 帮助包条目格式）
+# ---------------------------------------------------------------------------
+_SAMPLE_WIKI = """#type:     node
+#context:  sop
+#internal: attribwrangle
+#icon:     SOP/attribwrangle
+#tags:     attrs, vex, tech
+#since:    12.5
+
+= Attribute Wrangle =
+
+\"\"\"Runs a VEX snippet to modify attribute values.\"\"\"
+
+== Overview ==
+
+This node corresponds to the [Attribute VOP SOP|Node:sop/attribvop],
+but uses a textual VEX snippet.
+
+:include wrangle_syntax:
+
+@parameters
+
+== General ==
+
+Group:
+    #id: group
+
+    The group of elements to operate on.
+
+@related
+
+- [Vex:point]
+"""
+
+
+class WikiParserTests(unittest.TestCase):
+
+    def test_metadata_title_summary_extracted(self):
+        title, body = build_mod.parse_wiki_text(_SAMPLE_WIKI)
+        self.assertEqual(title, "Attribute Wrangle")
+        # 摘要保留（去引号标记）
+        self.assertIn("Runs a VEX snippet", body)
+        # 正文段名剥等号保留文本
+        self.assertIn("Overview", body)
+        self.assertNotIn("== Overview ==", body)
+
+    def test_metadata_lines_stripped_but_keywords_kept(self):
+        _title, body = build_mod.parse_wiki_text(_SAMPLE_WIKI)
+        # #key: 行本身不出现在正文
+        self.assertNotIn("#type:", body)
+        self.assertNotIn("#icon:", body)
+        self.assertNotIn("#since:", body)
+        # context / internal / tags 值回灌为可检索 token
+        self.assertIn("sop", body.split())
+        self.assertIn("attribwrangle", body.split())
+        # tags 值（逗号分隔）逐词可检索
+        self.assertIn("attrs,", body)
+        self.assertIn("vex,", body)
+
+    def test_parameters_section_skipped(self):
+        _title, body = build_mod.parse_wiki_text(_SAMPLE_WIKI)
+        # @parameters 起的参数块整段跳过（含后续非缩进参数名行）
+        self.assertNotIn("Group:", body)
+        self.assertNotIn("The group of elements", body)
+        self.assertNotIn("#id: group", body)
+
+    def test_section_after_parameters_resumes(self):
+        # @related 出现在 @parameters 之后：标记剥除、内容保留
+        _title, body = build_mod.parse_wiki_text(_SAMPLE_WIKI)
+        self.assertNotIn("@related", body)
+        self.assertNotIn("@parameters", body)
+        self.assertIn("Vex:point", body)
+
+    def test_include_directive_stripped(self):
+        _title, body = build_mod.parse_wiki_text(_SAMPLE_WIKI)
+        self.assertNotIn(":include", body)
+
+    def test_link_markup_reduced_to_text(self):
+        _title, body = build_mod.parse_wiki_text(_SAMPLE_WIKI)
+        self.assertIn("Attribute VOP SOP", body)
+        self.assertNotIn("|Node:sop/attribvop", body)
+
+    def test_no_title_returns_empty(self):
+        text = "Just some body text.\n"
+        title, body = build_mod.parse_wiki_text(text)
+        self.assertEqual(title, "")
+        self.assertIn("Just some body text", body)
+
+    def test_subsection_heading_not_title(self):
+        # == Section == 不得被当作 = 标题 =
+        text = "== Overview ==\nbody only\n"
+        title, body = build_mod.parse_wiki_text(text)
+        self.assertEqual(title, "")
+        self.assertIn("Overview", body)
+
+    def test_non_string_returns_empty(self):
+        self.assertEqual(build_mod.parse_wiki_text(None), ("", ""))
+        self.assertEqual(build_mod.parse_wiki_text(123), ("", ""))
+
+    def test_whitespace_collapsed_single_line(self):
+        _title, body = build_mod.parse_wiki_text(_SAMPLE_WIKI)
+        self.assertNotIn("\n", body)
+        self.assertNotIn("\t", body)
+
+    def test_marker_only_line_is_marker(self):
+        # @word 整行（无其他内容）才视为标记；"@param x" 是普通文本行，
+        # 不重置 parameters skip 段
+        text = "= T =\n@parameters\nbody A\n@param inline text\nbody B\n"
+        title, body = build_mod.parse_wiki_text(text)
+        self.assertEqual(title, "T")
+        # @parameters 起整段跳过（后续非标记行仍在 skip 段内）
+        self.assertEqual(body, "")
+
+    def test_marker_resumes_after_parameters(self):
+        # 下一个 @ 标记重置 skip：@related 的内容保留
+        text = "= T =\n@parameters\nparm stuff\n@related\nrelated item\n"
+        _title, body = build_mod.parse_wiki_text(text)
+        self.assertNotIn("parm stuff", body)
+        self.assertNotIn("@related", body)
+        self.assertIn("related item", body)
+
+    def test_multiline_summary(self):
+        text = "= T =\n\"\"\"First line\nsecond line\"\"\"\nafter\n"
+        _title, body = build_mod.parse_wiki_text(text)
+        self.assertIn("First line", body)
+        self.assertIn("second line", body)
+        self.assertIn("after", body)
+
+
+# ---------------------------------------------------------------------------
+# feat-mcp-round2-hardening §4a：zip 源扫描 + 混合构建
+# ---------------------------------------------------------------------------
+def _make_help_fixture(tmpdir):
+    """构造混合源 fixture：nodes.zip（2 wiki 条目）+ 散装 HTML 1 个。"""
+    zip_path = os.path.join(tmpdir, "nodes.zip")
+    wiki_a = ("#type: node\n#context: sop\n#internal: attribwrangle\n"
+              "\n= Attribute Wrangle =\n\n"
+              "\"\"\"Runs a VEX snippet.\"\"\"\n\n"
+              "Modifies attribute values with vex code.\n")
+    wiki_b = ("#type: node\n#context: sop\n#internal: box\n"
+              "\n= Box =\n\n\"\"\"Creates a box.\"\"\"\n\n"
+              "Box geometry primitives.\n")
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("sop/attribwrangle.txt", wiki_a)
+        zf.writestr("sop/box.txt", wiki_b)
+        zf.writestr("dop/something.h", "binary-ish junk")  # 非 .txt 跳过
+    _write(tmpdir, "loose.html",
+           "<html><head><title>Loose</title></head>"
+           "<body><p>loose html doc</p></body></html>")
+    return tmpdir
+
+
+class ZipSourceBuildTests(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        _make_help_fixture(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_find_zip_txt_entries_paths(self):
+        entries = build_mod.find_zip_txt_entries(self.tmp.name, ["nodes"])
+        paths = [e[0] for e in entries]
+        self.assertEqual(paths, ["nodes.zip/sop/attribwrangle.txt",
+                                 "nodes.zip/sop/box.txt"])
+
+    def test_find_zip_txt_entries_missing_zip_skipped(self):
+        entries = build_mod.find_zip_txt_entries(self.tmp.name,
+                                                 ["nodes", "nothere"])
+        self.assertEqual(len(entries), 2)
+
+    def test_find_zip_txt_entries_accepts_bare_name_or_zip(self):
+        a = build_mod.find_zip_txt_entries(self.tmp.name, ["nodes"])
+        b = build_mod.find_zip_txt_entries(self.tmp.name, ["nodes.zip"])
+        self.assertEqual([e[0] for e in a], [e[0] for e in b])
+
+    def test_build_index_mixed_zip_and_html(self):
+        index = build_mod.build_index(self.tmp.name, ["nodes"])
+        # zip 2 条 + html 1 条
+        self.assertEqual(index["document_count"], 3)
+        paths = [d["path"] for d in index["documents"]]
+        self.assertIn("nodes.zip/sop/attribwrangle.txt", paths)
+        self.assertIn("nodes.zip/sop/box.txt", paths)
+        self.assertIn("loose.html", paths)
+        # doc id 稳定分配（0..2）且 documents 顺序 == id 顺序
+        self.assertEqual([d["id"] for d in index["documents"]], [0, 1, 2])
+
+    def test_build_index_validates_against_schema(self):
+        index = build_mod.build_index(self.tmp.name, ["nodes"])
+        payload = json.dumps(index, ensure_ascii=False)
+        validated = rag._validate_index(payload)
+        self.assertEqual(validated.document_count, 3)
+
+    def test_build_index_title_fallback_to_entry_stem(self):
+        # 无 = 标题 = 的条目 → title 回退 entry stem
+        zip_path = os.path.join(self.tmp.name, "vex.zip")
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("functions/abs.txt",
+                        "#type: vex\n\"\"\"Absolute value.\"\"\"\n"
+                        "Returns the absolute value.\n")
+        index = build_mod.build_index(self.tmp.name, ["vex", "nodes"])
+        doc = [d for d in index["documents"]
+               if d["path"] == "vex.zip/functions/abs.txt"][0]
+        self.assertEqual(doc["title"], "abs")
+        self.assertIn("Absolute value", doc["content"])
+
+    def test_build_index_bad_zip_skipped(self):
+        # 损坏 zip（非 zip 字节）→ 跳过该 zip，不抛
+        bad = os.path.join(self.tmp.name, "broken.zip")
+        with open(bad, "wb") as fh:
+            fh.write(b"not a zip at all")
+        index = build_mod.build_index(self.tmp.name, ["broken", "nodes"])
+        self.assertEqual(index["document_count"], 3)  # 2 zip + 1 html
+
+    def test_build_index_search_hits_internal_name(self):
+        # internal 名回灌 token：query "attribwrangle" 命中 sop 条目
+        index = build_mod.build_index(self.tmp.name, ["nodes"])
+        validated = rag._validate_index(
+            json.dumps(index, ensure_ascii=False))
+        matched = validated.search("attribwrangle")
+        self.assertTrue(matched)
+        top_doc = validated.docs_by_id[matched[0][0]]
+        self.assertEqual(top_doc["path"], "nodes.zip/sop/attribwrangle.txt")
+
+    def test_build_index_no_zips_html_only_backcompat(self):
+        # 无 zip 目录：HTML-only 模式行为不变（超集回退）
+        html_only = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, html_only, ignore_errors=True)
+        _write(html_only, "x.html", "<title>X</title><p>box geometry</p>")
+        index = build_mod.build_index(html_only, ["nodes"])
+        self.assertEqual(index["document_count"], 1)
+        self.assertEqual(index["documents"][0]["path"], "x.html")
+
+    def test_resolve_source_priority(self):
+        # --source 显式 > HOUDINI_MCP_RAG_SOURCE > $HFS/houdini/help
+        saved_source = os.environ.get("HOUDINI_MCP_RAG_SOURCE")
+        saved_hfs = os.environ.get("HFS")
+        os.environ.pop("HOUDINI_MCP_RAG_SOURCE", None)
+        os.environ.pop("HFS", None)
+        try:
+            # 显式命中
+            self.assertEqual(build_mod.resolve_source(self.tmp.name),
+                             os.path.abspath(self.tmp.name))
+            # 显式缺失 + env/HFS 均未设 → None
+            self.assertIsNone(build_mod.resolve_source(
+                os.path.join(self.tmp.name, "absent")))
+            # env 命中
+            os.environ["HOUDINI_MCP_RAG_SOURCE"] = self.tmp.name
+            self.assertEqual(build_mod.resolve_source(None),
+                             os.path.abspath(self.tmp.name))
+            # env 指向不存在目录 → 回退 HFS（也不存在）→ None
+            os.environ["HOUDINI_MCP_RAG_SOURCE"] = os.path.join(
+                self.tmp.name, "nope")
+            os.environ["HFS"] = os.path.join(self.tmp.name, "no_hfs")
+            self.assertIsNone(build_mod.resolve_source(None))
+        finally:
+            for key, value in (("HOUDINI_MCP_RAG_SOURCE", saved_source),
+                               ("HFS", saved_hfs)):
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_resolve_index_dir_default_home(self):
+        saved = os.environ.get("HOUDINI_MCP_RAG_INDEX_DIR")
+        os.environ.pop("HOUDINI_MCP_RAG_INDEX_DIR", None)
+        orig_expanduser = os.path.expanduser
+        os.path.expanduser = (
+            lambda p: self.tmp.name if p == "~" else orig_expanduser(p))
+        try:
+            out = build_mod.resolve_index_dir(None)
+        finally:
+            os.path.expanduser = orig_expanduser
+            if saved is None:
+                os.environ.pop("HOUDINI_MCP_RAG_INDEX_DIR", None)
+            else:
+                os.environ["HOUDINI_MCP_RAG_INDEX_DIR"] = saved
+        self.assertEqual(
+            out.replace("\\", "/"),
+            self.tmp.name.replace("\\", "/") + "/.opera-houdini-mcp/rag")
+
+    def test_main_refuses_zero_docs(self):
+        # 0 doc 拒绝发布（保护既有索引），exit 4
+        empty = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
+        rc = build_mod.main(["--source", empty,
+                             "--output", os.path.join(empty, "out")])
+        self.assertEqual(rc, 4)
+        self.assertFalse(os.path.exists(
+            os.path.join(empty, "out", rag.INDEX_FILENAME)))
+
+    def test_main_end_to_end_publish(self):
+        out_dir = os.path.join(self.tmp.name, "rag")
+        rc = build_mod.main(["--source", self.tmp.name,
+                             "--zips", "nodes", "--output", out_dir])
+        self.assertEqual(rc, 0)
+        final = os.path.join(out_dir, rag.INDEX_FILENAME)
+        self.assertTrue(os.path.isfile(final))
+        with open(final, "r", encoding="utf-8") as handle:
+            validated = rag._validate_index(handle.read())
+        self.assertEqual(validated.document_count, 3)
+
+
+# ---------------------------------------------------------------------------
+# feat-mcp-round2-hardening §4a：_index_path 默认位置解析序
+# ---------------------------------------------------------------------------
+class DefaultIndexLocationTests(unittest.TestCase):
+    """解析序：env → ~/.opera-houdini-mcp/rag/（存在即用）→ 旧模块目录。
+
+    测试用临时目录替换 ``os.path.expanduser`` 的 "~" 结果，避免触碰
+    真实用户 home 目录。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved_env = os.environ.get("HOUDINI_MCP_RAG_INDEX_DIR")
+        os.environ.pop("HOUDINI_MCP_RAG_INDEX_DIR", None)
+        self._orig_expanduser = os.path.expanduser
+
+    def tearDown(self):
+        if self.saved_env is None:
+            os.environ.pop("HOUDINI_MCP_RAG_INDEX_DIR", None)
+        else:
+            os.environ["HOUDINI_MCP_RAG_INDEX_DIR"] = self.saved_env
+        os.path.expanduser = self._orig_expanduser
+        self.tmp.cleanup()
+
+    def _redirect_home(self):
+        home_rag = os.path.join(self.tmp.name, ".opera-houdini-mcp", "rag")
+        os.makedirs(home_rag, exist_ok=True)
+        os.path.expanduser = (
+            lambda p: self.tmp.name if p == "~" else self._orig_expanduser(p))
+        return home_rag
+
+    def test_env_override_wins(self):
+        home_rag = self._redirect_home()
+        with open(os.path.join(home_rag, rag.INDEX_FILENAME), "w",
+                  encoding="utf-8") as handle:
+            handle.write("{}")
+        os.environ["HOUDINI_MCP_RAG_INDEX_DIR"] = os.path.join(
+            self.tmp.name, "envdir")
+        resolved = rag._index_path()
+        self.assertEqual(
+            os.path.dirname(resolved).replace("\\", "/"),
+            os.path.join(self.tmp.name, "envdir").replace("\\", "/"))
+
+    def test_home_rag_preferred_when_present(self):
+        home_rag = self._redirect_home()
+        with open(os.path.join(home_rag, rag.INDEX_FILENAME), "w",
+                  encoding="utf-8") as handle:
+            handle.write("{}")
+        resolved = rag._index_path()
+        self.assertEqual(
+            resolved.replace("\\", "/"),
+            (os.path.join(home_rag, rag.INDEX_FILENAME)).replace("\\", "/"))
+
+    def test_legacy_module_dir_when_home_missing(self):
+        self._redirect_home()  # home 目录在但索引文件不存在
+        resolved = rag._index_path()
+        expected = os.path.join(
+            os.path.dirname(os.path.abspath(rag.__file__)),
+            rag.INDEX_FILENAME)
+        self.assertEqual(os.path.abspath(resolved), expected)
 
 
 if __name__ == "__main__":

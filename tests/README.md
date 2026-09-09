@@ -53,6 +53,41 @@ $env:HOUDINI_MCP_TEST_PORT = "19878"
 .venv\Scripts\python.exe tests\test_tools.py
 ```
 
+## RAG 索引生成（`search_docs` / `get_doc` 数据源）
+
+`search_docs` / `get_doc` 读本地 BM25 JSON 索引（`_rag.py`，bridge-local
+零连接）。索引不是仓库内产物——用 `scripts/build_rag_index.py` 对
+Houdini 帮助源实跑生成（feat-mcp-round2-hardening §4a 接线）：
+
+```powershell
+cd external/houdinimcp
+# 默认：源 $HFS/houdini/help 的 zip 帮助包（nodes/vex/hom/expressions/commands
+# 五个核心 zip，共 ~7800 条 wiki 文本），输出 ~/.opera-houdini-mcp/rag/
+.venv\Scripts\python.exe scripts\build_rag_index.py
+
+# 显式指定源与输出（H21 安装路径含空格要加引号）：
+.venv\Scripts\python.exe scripts\build_rag_index.py `
+  --source "C:\Program Files\Side Effects Software\Houdini 21.0.596\houdini\help" `
+  --output "$env:USERPROFILE\.opera-houdini-mcp\rag"
+
+# 可选：--zips 覆盖 zip 子集（如再纳入 solaris/tops），逗号分隔裸名
+.venv\Scripts\python.exe scripts\build_rag_index.py --zips nodes,vex,hom,expressions,commands,solaris,tops
+```
+
+- 源优先级 `--source` > `HOUDINI_MCP_RAG_SOURCE` > `$HFS/houdini/help`；
+  输出优先级 `--output` > `HOUDINI_MCP_RAG_INDEX_DIR` >
+  `~/.opera-houdini-mcp/rag/`（**不**默认写进 submodule 目录）。
+- H21 帮助源是 **zip 打包的 wiki 文本**（无散装 HTML）；生成器走
+  zip 感知扫描 + wiki 文本解析（`#context/#internal` 回灌检索 token、
+  `@parameters` 参数段剥除）；散装 HTML 目录模式保留（同目录混扫超集）。
+- `_rag.py` 读取端解析序：`HOUDINI_MCP_RAG_INDEX_DIR` env →
+  `~/.opera-houdini-mcp/rag/`（存在即用）→ 旧 fork 模块目录（兼容）。
+- 原子发布：同目录临时文件 + fsync + `os.replace`；0 doc 拒绝发布
+  （保护既有索引）。实跑参考值（H21.0.596，5 zip）：7781 docs /
+  avgdl 119 / 索引 ~14.6MB。
+- 相关单测：`tests/test_rag.py`（wiki 解析器 / zip 扫描 / 混合构建 /
+  默认位置解析序 / 原子发布 / schema 校验）。
+
 ## 文件清单
 
 | 文件 | 角色 | 状态 |
