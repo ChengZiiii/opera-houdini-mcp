@@ -1,8 +1,73 @@
 import numpy as np
 import math
 import os
+import tempfile
 import hou
 from . import _render_policy as _rp
+
+# ======== 渲染临时节点治理（feat-mcp-round2-hardening §2）========
+# 本模块渲染流程自建的临时节点精确名单：OBJ rig（相机 + 中心 null）与
+# /out ROP 节点。名字前缀唯一（MCP_*），误删风险可控。
+# - 渲染流程 finally 段按"本流程创建"清单清理（cleanup_temp_nodes）；
+# - server.py 启动孤儿清扫共用该名单（上一会话残留）。
+# 注意：karma ROP 名随 karma_engine 变化（MCP_<CPU|GPU>_KARMA）。
+RENDER_TEMP_OBJ_PATHS = ("/obj/MCP_CAM_CENTER", "/obj/MCP_CAMERA")
+RENDER_TEMP_OUT_NODE_NAMES = (
+    "MCP_OGL_RENDER", "MCP_CPU_KARMA", "MCP_GPU_KARMA", "MCP_MANTRA")
+RENDER_TEMP_OUT_PATHS = tuple(
+    "/out/" + name for name in RENDER_TEMP_OUT_NODE_NAMES)
+RENDER_TEMP_ALL_PATHS = RENDER_TEMP_OBJ_PATHS + RENDER_TEMP_OUT_PATHS
+
+
+def cleanup_temp_nodes(node_paths):
+    """按路径 best-effort 销毁渲染临时节点，返回失败描述列表。
+
+    feat-mcp-round2-hardening §2：渲染流程 finally 段统一调用；任何
+    单点失败都记录到返回列表而不是抛异常（清理失败 MUST NOT 吞掉
+    渲染结果，由调用方把失败列表附到响应 _cleanup_warning）。
+    节点已不存在（hou.node 返 None）视为清理成功。
+    """
+    failures = []
+    for path in node_paths or ():
+        try:
+            node = hou.node(path)
+            if node is None:
+                continue
+            node.destroy()
+        except Exception as e:
+            failures.append("{0}: {1}".format(path, e))
+    return failures
+
+
+def _finalize_render_cleanup(created_paths, cleanup_report=None):
+    """渲染流程 finally 段统一清理入口。
+
+    销毁 created_paths 里本流程创建的全部临时节点；失败描述写入
+    cleanup_report（调用方传入 list 时），同时打日志。绝不抛异常。
+    """
+    failures = cleanup_temp_nodes(created_paths)
+    if failures:
+        for failure in failures:
+            print("Warning: render temp node cleanup failed: " + failure)
+        if cleanup_report is not None:
+            cleanup_report.extend(failures)
+
+
+def resolve_actual_backend(render_engine):
+    """把 render_engine 映射为实际执行后端标识（feat-mcp-round2 §2c）。
+
+    取值域：opengl_rop（opengl ROP 节点渲染）/ husk（karma ROP 交由
+    husk CLI 离屏渲染）/ mantra_rop（H21 已移除 mantra，仅老版本
+    ifd ROP 走 mantra-bin）。flipbook / qscreen_fallback 属
+    _render_b64 的视口截图路径，不在本模块分支内。
+    """
+    engine = (render_engine or "opengl").lower()
+    if engine == "karma":
+        return "husk"
+    if engine == "mantra":
+        return "mantra_rop"
+    return "opengl_rop"
+
 
 def find_displayed_geometry():
     """Find all displayed geometry nodes in the scene."""
@@ -197,6 +262,26 @@ def rotate_camera_center_y90(null_node):
     """
     rotate_camera_center(null_node, rotation=(0, 90, 0))
 
+def reset_camera_center(null_node):
+    """
+    Reset the camera center null node's rotation to (0, 0, 0).
+
+    feat-mcp-round2-hardening §2：多视图渲染改单 rig 复用后，逐视图
+    切换前必须先归零旋转——rotate_camera_center 是**叠加式**旋转，
+    原实现逐视图 destroy+recreate 时旋转天然从 0 开始，单 rig 复用
+    下不复位会累积前一视图的角度。
+    
+    Args:
+        null_node: The null node to reset
+    """
+    if not null_node:
+        print("No null node provided for rotation reset.")
+        return
+    try:
+        null_node.parmTuple("r").set([0, 0, 0])
+    except Exception as e:
+        print(f"Error resetting camera center rotation: {e}")
+
 def adjust_camera_to_fit_bbox(camera, bbox, padding_factor=1.1):
     """
     Adjust camera's distance or ortho width to fully encompass the bounding box,
@@ -346,7 +431,9 @@ def setup_render_node(render_engine="opengl", karma_engine="cpu", render_path=No
     Args:
         render_engine: The render engine to use ("opengl", "karma", or "mantra")
         karma_engine: For Karma, which engine to use ("cpu" or "gpu")
-        render_path: Path to save the render (default is C:\\temp\\)
+        render_path: Path to save the render；缺省时由调用方（server 端）
+            回退 $TEMP/houdini_mcp/<日期>/ 规范目录，本函数不再默认
+            C:/temp/（feat-mcp-round2-hardening §2b）
         camera_path: Path to the camera to use for rendering
         view_name: Optional name of the view (for filename)
         rotation: Camera rotation (for filename if view_name not provided)
@@ -357,8 +444,18 @@ def setup_render_node(render_engine="opengl", karma_engine="cpu", render_path=No
     """
     try:
         # Set default render path if not specified
+        # §2b：缺省回退 $TEMP/houdini_mcp/<日期>/ 规范目录（7 天清理
+        # 规范内），不再默认 C:/temp/。default_capture_path 返回完整
+        # 文件路径，这里取其日期目录（ROP 节点自行命名输出文件）。
         if not render_path:
-            render_path = "C:/temp/"
+            from . import _capture_paths as _cp
+            try:
+                render_path = os.path.dirname(_cp.default_capture_path(
+                    hou=hou, pane_type="rop",
+                    engine=(render_engine or "opengl").lower()))
+            except Exception as path_err:
+                print(f"Warning: default render dir fallback failed: {path_err}")
+                render_path = os.path.join(tempfile.gettempdir(), "houdini_mcp")
         
         # Ensure directory exists
         if not os.path.exists(render_path):
@@ -489,22 +586,29 @@ def setup_render_node(render_engine="opengl", karma_engine="cpu", render_path=No
 
 # ======== RENDERING FUNCTIONS ========
 
-def render_single_view(orthographic=False, rotation=(0, 90, 0), render_path=None, render_engine="opengl", karma_engine="cpu", consent_token=None):
+def render_single_view(orthographic=False, rotation=(0, 90, 0), render_path=None, render_engine="opengl", karma_engine="cpu", consent_token=None, cleanup_report=None):
     """
     Set up camera rig and render a single view with specified rotation.
 
     fork-render-policy-redirect-and-consent: 入口先做 render policy 校验，
     opengl 走 redirect dict，karma_* 需 consent_token 才放行。
 
+    feat-mcp-round2-hardening §2：本流程创建的全部临时节点（rig +
+    ROP）在 finally 段销毁（成功 / 失败两路径都清）；清理失败不吞
+    渲染结果——失败描述 append 到 ``cleanup_report``（调用方传 list
+    才有），由调用方附到响应 ``_cleanup_warning``。
+
     Args:
         orthographic: If True, create an orthographic camera
         rotation: Tuple of (rx, ry, rz) rotation angles in degrees to apply to the camera center
-        render_path: Path to save the render (default is C:\\temp\\)
+        render_path: Path to save the render (server 端缺省回退
+            $TEMP/houdini_mcp/<日期>/ 规范目录)
         render_engine: The render engine to use ("opengl", "karma", or "mantra")
         karma_engine: For Karma, which engine to use ("cpu" or "gpu")
         consent_token: 用户对 karma 渲染的 consent uuid4（首次调用 karma
             路径时会得到 interrupt dict + 新 token；用户回复 yes 后带该
             token 重调）。opengl / mantra 路径忽略。
+        cleanup_report: 可选 list；finally 清理失败描述追加于此。
 
     Returns:
         Path to the rendered file。redirect 时返 dict（与 HoudiniMCPRender
@@ -521,63 +625,71 @@ def render_single_view(orthographic=False, rotation=(0, 90, 0), render_path=None
 
     # Find all displayed geometry
     displayed_geo = find_displayed_geometry()
-    
+
     if not displayed_geo:
         print("No displayed geometry found in the scene.")
         return None
-    
+
     print(f"Found {len(displayed_geo)} displayed geometry nodes.")
-    
+
     # Calculate the bounding box
     bbox = calculate_bounding_box(displayed_geo)
-    
+
     if not bbox:
         print("Could not calculate bounding box.")
         return None
-    
+
     print(f"Bounding box min: {bbox['min']}")
     print(f"Bounding box max: {bbox['max']}")
     print(f"Bounding box center: {bbox['center']}")
-    
-    # Set up the camera rig
-    null = setup_camera_rig(bbox['center'], orthographic)
-    print(f"Created/updated camera rig at {bbox['center']}")
-    
-    # Rotate the camera center by the specified angles
-    rotate_camera_center(null, rotation)
-    
-    # Get the camera node
-    camera = hou.node("/obj/MCP_CAMERA")
-    if camera:
-        # Adjust camera to fit bounding box
-        adjust_camera_to_fit_bbox(camera, bbox)
-    else:
-        print("Camera not found, couldn't adjust position.")
-        return None
-    
-    # Create render node and render a frame
-    render_node, filepath = setup_render_node(
-        render_engine=render_engine,
-        karma_engine=karma_engine,
-        render_path=render_path,
-        camera_path="/obj/MCP_CAMERA",
-        rotation=rotation,
-        is_ortho=orthographic
-    )
-    
-    if not render_node:
-        print("Failed to create render node.")
-        return None
-    
-    # Render the frame
-    print(f"Rendering with {render_engine.upper()}" + 
-          (f" ({karma_engine.upper()})" if render_engine.lower() == "karma" else ""))
-    render_node.render()
-    
-    print(f"Rendered frame to: {filepath}")
-    return filepath
 
-def render_quad_view(orthographic=True, render_path=None, render_engine="opengl", karma_engine="cpu", consent_token=None):
+    # 本流程创建的临时节点路径（rig + ROP），finally 段统一清理
+    created_paths = []
+    try:
+        # Set up the camera rig
+        null = setup_camera_rig(bbox['center'], orthographic)
+        created_paths.extend(RENDER_TEMP_OBJ_PATHS)
+        print(f"Created/updated camera rig at {bbox['center']}")
+
+        # Rotate the camera center by the specified angles
+        rotate_camera_center(null, rotation)
+
+        # Get the camera node
+        camera = hou.node("/obj/MCP_CAMERA")
+        if camera:
+            # Adjust camera to fit bounding box
+            adjust_camera_to_fit_bbox(camera, bbox)
+        else:
+            print("Camera not found, couldn't adjust position.")
+            return None
+
+        # Create render node and render a frame
+        render_node, filepath = setup_render_node(
+            render_engine=render_engine,
+            karma_engine=karma_engine,
+            render_path=render_path,
+            camera_path="/obj/MCP_CAMERA",
+            rotation=rotation,
+            is_ortho=orthographic
+        )
+
+        if not render_node:
+            print("Failed to create render node.")
+            return None
+        if render_node.path() not in created_paths:
+            created_paths.append(render_node.path())
+
+        # Render the frame
+        print(f"Rendering with {render_engine.upper()}" +
+              (f" ({karma_engine.upper()})" if render_engine.lower() == "karma" else ""))
+        render_node.render()
+
+        print(f"Rendered frame to: {filepath}")
+        return filepath
+    finally:
+        _finalize_render_cleanup(created_paths, cleanup_report)
+
+def render_quad_view(orthographic=True, render_path=None, render_engine="opengl", karma_engine="cpu", consent_token=None, cleanup_report=None):
     """
     Create four standard views and render them:
     - Front view (0,0,0)
@@ -588,12 +700,19 @@ def render_quad_view(orthographic=True, render_path=None, render_engine="opengl"
     fork-render-policy-redirect-and-consent: 入口先做 render policy 校验，
     opengl 走 redirect dict，karma_* 需 consent_token 才放行。
 
+    feat-mcp-round2-hardening §2：多视图渲染**建一次 rig、清一次**
+    （原实现逐视图 destroy+recreate）；全部视图渲完后 finally 段统一
+    销毁本流程创建的临时节点，清理失败不吞渲染结果——失败描述
+    append 到 ``cleanup_report``（调用方附响应 _cleanup_warning）。
+
     Args:
         orthographic: If True, use orthographic projection for ALL views including perspective
-        render_path: Path to save the renders (default is C:/temp/)
+        render_path: Path to save the renders (server 端缺省回退
+            $TEMP/houdini_mcp/<日期>/ 规范目录)
         render_engine: The render engine to use ("opengl", "karma", or "mantra")
         karma_engine: For Karma, which engine to use ("cpu" or "gpu")
         consent_token: karma consent uuid4。
+        cleanup_report: 可选 list；finally 清理失败描述追加于此。
 
     Returns:
         A list of paths to the rendered files。redirect / interrupt 时返 dict。
@@ -608,7 +727,7 @@ def render_quad_view(orthographic=True, render_path=None, render_engine="opengl"
             return _payload
 
     rendered_files = []
-    
+
     # Define the four standard views
     views = [
         {"name": "Front", "rotation": (0, 0, 0), "ortho": orthographic},
@@ -616,92 +735,110 @@ def render_quad_view(orthographic=True, render_path=None, render_engine="opengl"
         {"name": "Top", "rotation": (-90, 0, 0), "ortho": orthographic},
         {"name": "Perspective", "rotation": (-45, -45, 0), "ortho": orthographic}  # Use the orthographic parameter
     ]
-    
+
     # Find displayed geometry once
     displayed_geo = find_displayed_geometry()
-    
+
     if not displayed_geo:
         print("No displayed geometry found in the scene.")
         return rendered_files
-    
+
     print(f"Found {len(displayed_geo)} displayed geometry nodes.")
-    
+
     # Calculate the bounding box once
     bbox = calculate_bounding_box(displayed_geo)
-    
+
     if not bbox:
         print("Could not calculate bounding box.")
         return rendered_files
-    
+
     print(f"Bounding box min: {bbox['min']}")
     print(f"Bounding box max: {bbox['max']}")
     print(f"Bounding box center: {bbox['center']}")
-    
-    # Render each view
-    for view in views:
-        print(f"\n--- Setting up {view['name']} view ---")
-        
-        # Set up the camera rig
-        null = setup_camera_rig(bbox['center'], view['ortho'])
-        
-        # Rotate the camera center
-        rotate_camera_center(null, view['rotation'])
-        
-        # Get the camera node
-        camera = hou.node("/obj/MCP_CAMERA")
-        if camera:
-            # Adjust camera to fit bounding box
-            adjust_camera_to_fit_bbox(camera, bbox)
-        else:
-            print(f"Camera not found, couldn't adjust position for {view['name']} view.")
-            continue
-        
-        # Create a specific name with the view
-        view_name = view['name'].lower()
-        
-        # Create render node
-        render_node, filepath = setup_render_node(
-            render_engine=render_engine,
-            karma_engine=karma_engine,
-            render_path=render_path,
-            camera_path="/obj/MCP_CAMERA",
-            view_name=view_name,
-            is_ortho=view['ortho']
-        )
-        
-        if not render_node:
-            print(f"Failed to create render node for {view_name} view.")
-            continue
-        
-        # Render the frame
-        print(f"Rendering {view_name} view with {render_engine.upper()}" + 
-              (f" ({karma_engine.upper()})" if render_engine.lower() == "karma" else ""))
-        render_node.render()
-        
-        print(f"Rendered {view_name} view to: {filepath}")
-        
-        if filepath:
-            rendered_files.append(filepath)
-    
-    print(f"\nRendered {len(rendered_files)} views:")
-    for file in rendered_files:
-        print(f"  - {file}")
-    
-    return rendered_files
 
-def render_specific_camera(camera_path, render_path=None, render_engine="opengl", karma_engine="cpu", consent_token=None):
+    # 本流程创建的临时节点路径，finally 段统一清理（rig 一次 + 各视图 ROP）
+    created_paths = []
+    try:
+        # §2：四个视图共用同一 projection（原行为即全部传同一
+        # orthographic 参数），rig 只建一次，逐视图仅旋转切换视角
+        null = setup_camera_rig(bbox['center'], orthographic)
+        created_paths.extend(RENDER_TEMP_OBJ_PATHS)
+
+        # Render each view
+        for view in views:
+            print(f"\n--- Setting up {view['name']} view ---")
+
+            # §2：单 rig 复用——每次迭代先归零旋转再叠加本视图旋转
+            # （rotate 是叠加式；首视图归零冗余但幂等，与原"逐视图重建
+            # rig 角度天然从 0 开始"语义一致）
+            reset_camera_center(null)
+            rotate_camera_center(null, view['rotation'])
+
+            # Get the camera node
+            camera = hou.node("/obj/MCP_CAMERA")
+            if camera:
+                # Adjust camera to fit bounding box
+                adjust_camera_to_fit_bbox(camera, bbox)
+            else:
+                print(f"Camera not found, couldn't adjust position for {view['name']} view.")
+                continue
+
+            # Create a specific name with the view
+            view_name = view['name'].lower()
+
+            # Create render node
+            render_node, filepath = setup_render_node(
+                render_engine=render_engine,
+                karma_engine=karma_engine,
+                render_path=render_path,
+                camera_path="/obj/MCP_CAMERA",
+                view_name=view_name,
+                is_ortho=view['ortho']
+            )
+
+            if not render_node:
+                print(f"Failed to create render node for {view_name} view.")
+                continue
+            if render_node.path() not in created_paths:
+                created_paths.append(render_node.path())
+
+            # Render the frame
+            print(f"Rendering {view_name} view with {render_engine.upper()}" +
+                  (f" ({karma_engine.upper()})" if render_engine.lower() == "karma" else ""))
+            render_node.render()
+
+            print(f"Rendered {view_name} view to: {filepath}")
+
+            if filepath:
+                rendered_files.append(filepath)
+
+        print(f"\nRendered {len(rendered_files)} views:")
+        for file in rendered_files:
+            print(f"  - {file}")
+
+        return rendered_files
+    finally:
+        _finalize_render_cleanup(created_paths, cleanup_report)
+
+def render_specific_camera(camera_path, render_path=None, render_engine="opengl", karma_engine="cpu", consent_token=None, cleanup_report=None):
     """
     Render using a specific camera that already exists in the scene.
 
     fork-render-policy-redirect-and-consent: 入口先做 render policy 校验，
     opengl 走 redirect dict，karma_* 需 consent_token 才放行。
 
+    feat-mcp-round2-hardening §2：本流程只创建 ROP 节点（复用用户已有
+    相机，rig 不动），渲染结束后 finally 段销毁该 ROP；清理失败不吞
+    渲染结果——失败描述 append 到 ``cleanup_report``。
+
     Args:
         camera_path: Path to the camera node (e.g., "/obj/mycamera")
-        render_path: Path to save the render (default is C:\\temp\\)
+        render_path: Path to save the render (server 端缺省回退
+            $TEMP/houdini_mcp/<日期>/ 规范目录)
         render_engine: The render engine to use ("opengl", "karma", or "mantra")
         karma_engine: For Karma, which engine to use ("cpu" or "gpu")
         consent_token: karma consent uuid4。
+        cleanup_report: 可选 list；finally 清理失败描述追加于此。
 
     Returns:
         Path to the rendered file。redirect / interrupt 时返 dict。
@@ -714,23 +851,24 @@ def render_specific_camera(camera_path, render_path=None, render_engine="opengl"
         if not (consent_token
                 and _rp.consume_consent_token(consent_token)):
             return _payload
+    created_paths = []
     try:
         # Check if the camera exists
         camera = hou.node(camera_path)
         if not camera:
             print(f"Camera not found at path: {camera_path}")
             return None
-            
+
         # Check if it's actually a camera
         if camera.type().name() != "cam":
             print(f"Node at {camera_path} is not a camera (type: {camera.type().name()})")
             return None
-            
+
         print(f"Found camera: {camera.path()}")
-        
+
         # Determine if the camera is orthographic
         is_ortho = camera.parm("projection").eval() == 1
-        
+
         # Get camera rotation
         # If camera has a parent, we should get the effective rotation
         camera_parent = camera.parent()
@@ -740,10 +878,10 @@ def render_specific_camera(camera_path, render_path=None, render_engine="opengl"
         else:
             # Get rotation from camera itself
             rotation = camera.parmTuple("r").eval()
-        
+
         # Use camera name as view name
         view_name = camera.name()
-        
+
         # Create render node
         render_node, filepath = setup_render_node(
             render_engine=render_engine,
@@ -753,24 +891,28 @@ def render_specific_camera(camera_path, render_path=None, render_engine="opengl"
             view_name=view_name,
             is_ortho=is_ortho
         )
-        
+
         if not render_node:
             print("Failed to create render node.")
             return None
-        
+        if render_node.path() not in created_paths:
+            created_paths.append(render_node.path())
+
         # Render the frame
-        print(f"Rendering with {render_engine.upper()}" + 
+        print(f"Rendering with {render_engine.upper()}" +
               (f" ({karma_engine.upper()})" if render_engine.lower() == "karma" else ""))
         render_node.render()
-        
+
         print(f"Rendered frame using camera {camera_path} to: {filepath}")
         return filepath
-        
+
     except Exception as e:
         print(f"Error rendering specific camera: {e}")
         import traceback
         traceback.print_exc()
         return None
+    finally:
+        _finalize_render_cleanup(created_paths, cleanup_report)
 
 # ======== EXAMPLE USAGE ========
 

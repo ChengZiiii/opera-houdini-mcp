@@ -299,8 +299,14 @@ class WithKeyApiChainTests(unittest.TestCase):
     def tearDown(self):
         self.env_patch.stop()
         sys.modules.pop("_opus_test_fresh", None)
-        # 清理可能被 _opus import 的 fake requests
-        for k in ("requests",):
+        # 清理可能被 _opus import 的 fake requests。
+        # 注意必须连同 requests.exceptions 一起清（_install_fake_requests
+        # 注入了两个键）：只删 requests 会留下无内容的 exceptions 残桩，
+        # 后续任何测试真实 import requests 时 requests/__init__.py 的
+        # ``from .exceptions import RequestsDependencyWarning`` 会命中
+        # 残桩而 ImportError（feat-mcp-round2-hardening §2 实测踩坑：
+        # 全量套件下污染 test_render_resource_governance 的 server 加载）。
+        for k in ("requests", "requests.exceptions"):
             if k in sys.modules and getattr(sys.modules[k], "__file__", None) is None:
                 del sys.modules[k]
 

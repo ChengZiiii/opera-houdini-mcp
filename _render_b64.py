@@ -47,6 +47,35 @@ _RENDERER_TO_LIB_KWARGS = {
 }
 
 
+# feat-mcp-round2-hardening §2：本模块视口截图路径的 actual_backend
+# 取值（renderer 语义如实）。HoudiniMCPRender 的 ROP 路径取值
+# （opengl_rop / husk / mantra_rop）见 HoudiniMCPRender.resolve_actual_backend。
+ACTUAL_BACKEND_FLIPBOOK = "flipbook"
+ACTUAL_BACKEND_QSCREEN = "qscreen_fallback"
+
+# §2：camera rig 精确路径（与 HoudiniMCPRender.setup_camera_rig 实际
+# 创建名一致），render_quad_views 单 rig 复用后 finally 统一清理。
+_RIG_OBJ_PATHS = ("/obj/MCP_CAM_CENTER", "/obj/MCP_CAMERA")
+
+
+def _cleanup_rig_nodes(hou, node_paths):
+    """best-effort 销毁 rig 临时节点，返回失败描述列表（§2 配套清理）。
+
+    hou 注入式纯函数（本模块约定）；节点已不存在（hou.node 返 None）
+    视为清理成功；单点失败记录到返回列表，绝不抛异常。
+    """
+    failures = []
+    for path in node_paths or ():
+        try:
+            node = hou.node(path) if hasattr(hou, "node") else None
+            if node is None:
+                continue
+            node.destroy()
+        except Exception as e:
+            failures.append("{0}: {1}".format(path, e))
+    return failures
+
+
 # ---------------------------------------------------------------------------
 # Section 2: 内部 helper
 # ---------------------------------------------------------------------------
@@ -320,6 +349,17 @@ def render_viewport(hou, camera_path=None, geometry_path=None,
         ``_render_policy`` 构造的结构化 dict（含 ``_redirect`` /
         ``_interrupt`` 键，无 ``image_base64``）。
 
+    feat-mcp-round2-hardening §2c（renderer 语义如实）：
+        - ``renderer`` / ``requested_renderer`` 均为**调用方请求值**
+          （兼容字段，不代表实际执行的渲染后端）；
+        - ``actual_backend`` 为实际执行路径：``flipbook``（_pane_capture
+          SceneViewer flipbook 截图）或 ``qscreen_fallback``（旧版
+          saveImage 直读视口快照）。karma_cpu / karma_xpu 请求在本模块
+          实际走的是视口截图而非 karma 离屏渲染（真 karma ROP/husk
+          路径在 HoudiniMCPRender），响应 MUST NOT 仅标 karma；
+        - 旧 B4 标记 ``_renderer: "qscreen_fallback"`` 保留兼容，语义由
+          ``actual_backend`` 取代。
+
     Raises:
         ValueError: ``renderer`` 不在 ``VALID_RENDERERS`` 中。
     """
@@ -354,6 +394,7 @@ def render_viewport(hou, camera_path=None, geometry_path=None,
             "width": 0,
             "height": 0,
             "renderer": norm_renderer,
+            "requested_renderer": norm_renderer,
             "camera_path": resolved_camera,
             "geometry_path": geom_str,
             "size_bytes": 0,
@@ -380,6 +421,10 @@ def render_viewport(hou, camera_path=None, geometry_path=None,
                 "width": fallback["width"],
                 "height": fallback["height"],
                 "renderer": norm_renderer,
+                "requested_renderer": norm_renderer,
+                # §2c：_pane_capture SceneViewer 实际走 Houdini 内部
+                # flipbook 管线；旧 B4 标记 _renderer 保留兼容
+                "actual_backend": ACTUAL_BACKEND_FLIPBOOK,
                 "camera_path": resolved_camera,
                 "geometry_path": geom_str,
                 "size_bytes": fallback["size_bytes"],
@@ -403,6 +448,7 @@ def render_viewport(hou, camera_path=None, geometry_path=None,
             "width": 0,
             "height": 0,
             "renderer": norm_renderer,
+            "requested_renderer": norm_renderer,
             "camera_path": resolved_camera,
             "geometry_path": geom_str,
             "size_bytes": 0,
@@ -426,6 +472,10 @@ def render_viewport(hou, camera_path=None, geometry_path=None,
         "width": width,
         "height": height,
         "renderer": norm_renderer,
+        "requested_renderer": norm_renderer,
+        # §2c：saveImage 直读视口快照——请求的是 karma 时 MUST NOT
+        # 被理解为 karma 离屏渲染实际执行
+        "actual_backend": ACTUAL_BACKEND_QSCREEN,
         "camera_path": resolved_camera,
         "geometry_path": geom_str,
         "size_bytes": size_b,
@@ -524,29 +574,45 @@ def render_quad_views(hou, geometry_path=None, renderer="opengl",
         return cmn._add_response_metadata(result, renderer=norm_renderer,
                                           geometry_path=geom_str, format=format)
 
-    # 2. 每个 view 调一次 setup_camera_rig + adjust_camera_to_fit_bbox
+    # 2. §2（feat-mcp-round2-hardening）：单 rig 复用——rig 只建一次、
+    #    逐视图旋转切换视角，finally 段统一清理（原实现逐视图
+    #    destroy+recreate 共 4 次）。清理失败打日志、不吞渲染结果。
     out = {}
-    for view in _QUAD_VIEWS:
-        cam_path = "/obj/MCP_CAMERA"
-        null = None
-        try:
-            null = _render_lib.setup_camera_rig(bbox["center"],
-                                                orthographic=False)
-            if hasattr(_render_lib, "rotate_camera_center"):
-                _render_lib.rotate_camera_center(null, view["rotation"])
-            camera_node = hou.node(cam_path)
-            if camera_node is not None:
-                _render_lib.adjust_camera_to_fit_bbox(camera_node, bbox)
-        except Exception:
-            null = None
+    rig_created = False
+    null = None
+    try:
+        for view in _QUAD_VIEWS:
+            cam_path = "/obj/MCP_CAMERA"
+            try:
+                if not rig_created:
+                    null = _render_lib.setup_camera_rig(bbox["center"],
+                                                        orthographic=False)
+                    rig_created = True
+                elif hasattr(_render_lib, "reset_camera_center"):
+                    # §2：单 rig 复用下先归零旋转（rotate 是叠加式，
+                    # 原逐视图重建 rig 时角度天然从 0 开始）
+                    _render_lib.reset_camera_center(null)
+                if hasattr(_render_lib, "rotate_camera_center"):
+                    _render_lib.rotate_camera_center(null, view["rotation"])
+                camera_node = hou.node(cam_path)
+                if camera_node is not None:
+                    _render_lib.adjust_camera_to_fit_bbox(camera_node, bbox)
+            except Exception:
+                pass
 
-        # 3. 每个 view 内部走 render_viewport 路径，但 camera_path 固定
-        view_result = render_viewport(
-            hou, camera_path=cam_path, geometry_path=geometry_path,
-            renderer=norm_renderer, resolution=resolution, format=format,
-            consent_token=consent_token)
-        # 保留 image_base64 / size_bytes / format 等字段，加 view_name 标记
-        out[view["name"]] = view_result
+            # 3. 每个 view 内部走 render_viewport 路径，但 camera_path 固定
+            view_result = render_viewport(
+                hou, camera_path=cam_path, geometry_path=geometry_path,
+                renderer=norm_renderer, resolution=resolution, format=format,
+                consent_token=consent_token)
+            # 保留 image_base64 / size_bytes / format 等字段，加 view_name 标记
+            out[view["name"]] = view_result
+    finally:
+        if rig_created:
+            rig_failures = _cleanup_rig_nodes(hou, _RIG_OBJ_PATHS)
+            for rig_failure in rig_failures:
+                print("Warning: render_quad_views rig cleanup failed: "
+                      + rig_failure)
 
     # 顶层 _meta（cmn._add_response_metadata 不会重复加 _meta）
     out["_meta"] = {"renderer": norm_renderer, "geometry_path": geom_str,

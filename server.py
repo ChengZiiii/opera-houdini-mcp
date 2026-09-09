@@ -216,6 +216,98 @@ def _evaluate_render_policy_command(command, params):
 
 
 # ---------------------------------------------------------------------------
+# §2 渲染链路资源治理（feat-mcp-round2-hardening）
+# ---------------------------------------------------------------------------
+
+def _sweep_orphan_render_nodes(hou_module=None):
+    """server 启动时清扫上一会话残留的渲染临时节点（§2 孤儿清扫）。
+
+    对精确已知名字（HoudiniMCPRender.RENDER_TEMP_ALL_PATHS：/obj rig
+    MCP_CAM_CENTER / MCP_CAMERA + /out ROP MCP_OGL_RENDER /
+    MCP_CPU_KARMA / MCP_GPU_KARMA / MCP_MANTRA）逐个检查并销毁；
+    名字前缀唯一（MCP_*），误删风险可控。任何单点失败都记录到
+    failed 列表而不中断其余节点的清理，也绝不抛异常影响启动。
+
+    Args:
+        hou_module: 注入 hou 模块（测试 mock 用）；缺省用顶层 hou。
+
+    Returns:
+        dict: {found: [path...], destroyed: int, failed: ["path: err"...]}
+    """
+    hou_mod = hou_module if hou_module is not None else hou
+    found = []
+    destroyed = 0
+    failed = []
+    for path in RENDER_TEMP_ALL_PATHS:
+        node = None
+        try:
+            node = hou_mod.node(path)
+        except Exception as node_err:
+            failed.append("{0}: {1}".format(path, node_err))
+            continue
+        if node is None:
+            continue
+        found.append(path)
+        try:
+            node.destroy()
+            destroyed += 1
+        except Exception as destroy_err:
+            failed.append("{0}: {1}".format(path, destroy_err))
+    return {"found": found, "destroyed": destroyed, "failed": failed}
+
+
+def _default_render_output_dir(render_engine):
+    """render_path 未显式传时回退 $TEMP/houdini_mcp/<日期>/ 规范目录。
+
+    §2b（feat-mcp-round2-hardening）：bridge 三个渲染工具默认不再发送
+    "C:/temp/"（默认 None）；server 端用 cap.default_capture_path 生成
+    规范目录（纳入启动时 7 天清理）。default_capture_path 返回完整
+    文件路径（含文件名），渲染 ROP 自行命名输出文件，这里取其日期
+    目录部分；生成失败回退 tempfile.gettempdir()（保持旧兜底，不阻塞
+    渲染流程）。
+    """
+    try:
+        full = cap.default_capture_path(
+            hou=hou, pane_type="rop",
+            engine=str(render_engine or "opengl").lower())
+        directory = os.path.dirname(full)
+        if directory and os.path.isdir(directory):
+            return directory
+        print("HoudiniMCP render 默认目录创建失败，回退 tempfile.gettempdir()")
+    except Exception as dir_err:
+        print("HoudiniMCP render 默认目录生成失败（"
+              + str(dir_err) + "），回退 tempfile.gettempdir()")
+    return tempfile.gettempdir()
+
+
+def _attach_render_semantics(result, render_engine, karma_engine=None,
+                             cleanup_report=None):
+    """渲染响应统一附加 renderer 语义字段（§2c renderer 语义如实）。
+
+    - requested_renderer：调用方请求的 renderer（engine + karma_engine
+      归一为 bridge 词表：opengl / karma_cpu / karma_xpu / mantra）；
+    - actual_backend：实际执行后端（opengl_rop / husk / mantra_rop；
+      flipbook / qscreen_fallback 属 _render_b64 视口截图路径）；
+      karma 请求缺 saveImage 主机走截图回退时由 _render_b64 侧如实
+      标注，MUST NOT 单独宣称 karma 已实际执行；
+    - _cleanup_warning：finally 段清理失败描述（仅失败时附加）；
+    - renderer：兼容字段，语义 = requested_renderer（docstring 明示）。
+
+    已存在的同名字段不覆盖（setdefault）；非 dict 原样返回。
+    """
+    if not isinstance(result, dict):
+        return result
+    requested = _rp.render_engine_to_renderer(render_engine, karma_engine)
+    result.setdefault("requested_renderer", requested)
+    result.setdefault("renderer", requested)
+    result.setdefault("actual_backend", resolve_actual_backend(render_engine))
+    if cleanup_report:
+        result["_cleanup_warning"] = "; ".join(
+            str(item) for item in cleanup_report)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # add-workflow-knowledge-capture: capture_workflow_snapshot 内部 helper
 # （模块级；全部兜底不抛，异常降级不 crash）
 # ---------------------------------------------------------------------------
@@ -930,6 +1022,22 @@ class HoudiniMCPServer:
                             result["kept"], len(result["errors"])))
             except Exception as cleanup_err:
                 print("HoudiniMCP 启动清理失败（不影响 MCP 服务）: " + str(cleanup_err))
+
+            # §2 渲染链路资源治理（feat-mcp-round2-hardening）：启动时
+            # 清扫上一会话残留的 MCP_* rig / ROP 临时节点（精确已知名
+            # 单，见 _sweep_orphan_render_nodes）。不抛异常（清扫失败
+            # 不影响 MCP 服务本身）。
+            try:
+                sweep = _sweep_orphan_render_nodes()
+                print(
+                    "HoudiniMCP 启动孤儿清扫: found={0} destroyed={1} failed={2}{3}".format(
+                        len(sweep["found"]), sweep["destroyed"],
+                        len(sweep["failed"]),
+                        (" remaining=[" + "; ".join(sweep["failed"]) + "]")
+                        if sweep["failed"] else ""))
+            except Exception as sweep_err:
+                print("HoudiniMCP 启动孤儿清扫失败（不影响 MCP 服务）: "
+                      + str(sweep_err))
         except Exception as e:
             print(f"Failed to start server: {str(e)}")
             self.stop()
@@ -3049,6 +3157,11 @@ class HoudiniMCPServer:
 
         fork-render-policy-redirect-and-consent: 入口先做 render policy
         校验，opengl 走 redirect dict，karma_* 需 consent_token 才放行。
+
+        feat-mcp-round2-hardening §2：render_path 缺省（bridge 默认
+        None）回退 $TEMP/houdini_mcp/<日期>/ 规范目录；响应附
+        requested_renderer / actual_backend / renderer（兼容），
+        HoudiniMCPRender finally 清理失败时附 _cleanup_warning。
         """
         # self._check_render_lib()
 
@@ -3061,10 +3174,11 @@ class HoudiniMCPServer:
         if policy_result is not None:
             return policy_result
 
-        # Use a temporary directory for the render output
+        # §2b：render_path 缺省 → 规范目录回退；显式传参行为不变
         if not render_path:
-            render_path = tempfile.gettempdir()
+            render_path = _default_render_output_dir(render_engine)
 
+        cleanup_report = []
         try:
             # Ensure rotation is a tuple
             if isinstance(rotation, list): rotation = tuple(rotation)
@@ -3076,26 +3190,33 @@ class HoudiniMCPServer:
                 render_path=render_path,
                 render_engine=render_engine,
                 karma_engine=karma_engine,
-                consent_token=consent_token
+                consent_token=consent_token,
+                cleanup_report=cleanup_report
             )
             print(f"render_single_view returned filepath: {filepath}")
 
             # Process the result
             # Determine camera path used (it's always /obj/MCP_CAMERA for this func)
             camera_path = "/obj/MCP_CAMERA"
-            return self._process_rendered_image(filepath, camera_path)
+            result = self._process_rendered_image(filepath, camera_path)
 
         except Exception as e:
             error_message = f"Render Single View Failed: {str(e)}"
             print(error_message)
             traceback.print_exc()
-            return {"status": "error", "message": error_message, "origin": "handle_render_single_view"}
+            result = {"status": "error", "message": error_message, "origin": "handle_render_single_view"}
+        return _attach_render_semantics(
+            result, render_engine, karma_engine, cleanup_report)
 
     def handle_render_quad_view(self, orthographic=True, render_path=None, render_engine="opengl", karma_engine="cpu", consent_token=None):
         """Handles the 'render_quad_view' command.
 
         fork-render-policy-redirect-and-consent: 入口先做 render policy
         校验，opengl 走 redirect dict，karma_* 需 consent_token 才放行。
+
+        feat-mcp-round2-hardening §2：render_path 缺省回退规范目录；
+        多视图渲染建一次 rig、清一次，清理失败附 _cleanup_warning；
+        顶层响应附 requested_renderer / actual_backend / renderer。
         """
         # self._check_render_lib()
 
@@ -3108,9 +3229,11 @@ class HoudiniMCPServer:
         if policy_result is not None:
             return policy_result
 
+        # §2b：render_path 缺省 → 规范目录回退；显式传参行为不变
         if not render_path:
-            render_path = tempfile.gettempdir()
+            render_path = _default_render_output_dir(render_engine)
 
+        cleanup_report = []
         try:
             print(f"Calling HoudiniMCPRender.render_quad_view with ortho={orthographic}, engine={render_engine}...")
             filepaths = render_quad_view(
@@ -3118,7 +3241,8 @@ class HoudiniMCPServer:
                 render_path=render_path,
                 render_engine=render_engine,
                 karma_engine=karma_engine,
-                consent_token=consent_token
+                consent_token=consent_token,
+                cleanup_report=cleanup_report
             )
             print(f"render_quad_view returned filepaths: {filepaths}")
 
@@ -3139,19 +3263,26 @@ class HoudiniMCPServer:
                 results.append(self._process_rendered_image(fp, camera_path, view_name))
                 
             # Return the list of results
-            return {"status": "success", "results": results}
+            result = {"status": "success", "results": results}
 
         except Exception as e:
             error_message = f"Render Quad View Failed: {str(e)}"
             print(error_message)
             traceback.print_exc()
-            return {"status": "error", "message": error_message, "origin": "handle_render_quad_view"}
+            result = {"status": "error", "message": error_message, "origin": "handle_render_quad_view"}
+        return _attach_render_semantics(
+            result, render_engine, karma_engine, cleanup_report)
 
     def handle_render_specific_camera(self, camera_path, render_path=None, render_engine="opengl", karma_engine="cpu", consent_token=None):
         """Handles the 'render_specific_camera' command.
 
         fork-render-policy-redirect-and-consent: 入口先做 render policy
         校验，opengl 走 redirect dict，karma_* 需 consent_token 才放行。
+
+        feat-mcp-round2-hardening §2：render_path 缺省回退规范目录；
+        只清理本流程创建的 ROP（用户相机不动）；响应附
+        requested_renderer / actual_backend / renderer 与
+        _cleanup_warning（如清理失败）。
         """
         # self._check_render_lib()
 
@@ -3164,12 +3295,14 @@ class HoudiniMCPServer:
         if policy_result is not None:
             return policy_result
 
+        # §2b：render_path 缺省 → 规范目录回退；显式传参行为不变
         if not render_path:
-            render_path = tempfile.gettempdir()
+            render_path = _default_render_output_dir(render_engine)
 
         if not camera_path or not hou.node(camera_path):
              return {"status": "error", "message": f"Camera path '{camera_path}' is invalid or node not found.", "origin": "handle_render_specific_camera"}
 
+        cleanup_report = []
         try:
             print(f"Calling HoudiniMCPRender.render_specific_camera for camera={camera_path}, engine={render_engine}...")
             filepath = render_specific_camera(
@@ -3177,18 +3310,21 @@ class HoudiniMCPServer:
                 render_path=render_path,
                 render_engine=render_engine,
                 karma_engine=karma_engine,
-                consent_token=consent_token
+                consent_token=consent_token,
+                cleanup_report=cleanup_report
             )
             print(f"render_specific_camera returned filepath: {filepath}")
 
             # Process the result, using the provided camera_path
-            return self._process_rendered_image(filepath, camera_path)
+            result = self._process_rendered_image(filepath, camera_path)
 
         except Exception as e:
             error_message = f"Render Specific Camera Failed: {str(e)}"
             print(error_message)
             traceback.print_exc()
-            return {"status": "error", "message": error_message, "origin": "handle_render_specific_camera"}
+            result = {"status": "error", "message": error_message, "origin": "handle_render_specific_camera"}
+        return _attach_render_semantics(
+            result, render_engine, karma_engine, cleanup_report)
 
     # -------------------------------------------------------------------------
     # PR 14: Render Base64 (thin wrappers to _render_b64 + apply_response_cap)

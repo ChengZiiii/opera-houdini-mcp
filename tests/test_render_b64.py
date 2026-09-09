@@ -78,6 +78,8 @@ class _FakeRenderHelpers(object):
         self.calculate_bounding_box_calls = []
         self.setup_camera_rig_calls = []
         self.adjust_camera_to_fit_bbox_calls = []
+        # feat-mcp-round2-hardening §2：单 rig 复用下的逐视图归零旋转计数
+        self.reset_camera_center_calls = []
 
     def find_displayed_geometry(self):
         # Record (args, kwargs) of every call so tests can assert the
@@ -105,6 +107,10 @@ class _FakeRenderHelpers(object):
     def rotate_camera_center(self, null, rotation):
         # Optional helper for quad views; provide a no-op for completeness.
         pass
+
+    def reset_camera_center(self, null):
+        # §2 单 rig 复用：逐视图切换前归零旋转（rotate 是叠加式）。
+        self.reset_camera_center_calls.append(True)
 
 
 # Install a separate fresh fake for each test class so per-test mutation
@@ -820,14 +826,20 @@ class RenderQuadViewsTests(unittest.TestCase):
             len(self.render_helpers.calculate_bounding_box_calls), 1,
             "calculate_bounding_box should be called once for all views")
 
-    def test_each_view_has_unique_camera_rig(self):
-        """render_quad_views should call setup_camera_rig for each of 4 views."""
+    def test_quad_views_single_rig_reuse(self):
+        """§2（feat-mcp-round2-hardening）：render_quad_views 建**一次**
+        rig、逐视图归零旋转复用（原实现逐视图 destroy+recreate 共 4 次）；
+        finally 段由 _cleanup_rig_nodes 清理（节点级断言见
+        test_render_resource_governance）。"""
         hou = _make_hou_with_default_camera()
         hou.hipFile = object()
         self.mod.render_quad_views(hou)
         self.assertEqual(
-            len(self.render_helpers.setup_camera_rig_calls), 4,
-            "setup_camera_rig should be called 4 times (one per view)")
+            len(self.render_helpers.setup_camera_rig_calls), 1,
+            "setup_camera_rig should be called once (single reused rig)")
+        self.assertEqual(
+            len(self.render_helpers.reset_camera_center_calls), 3,
+            "views 2-4 must reset rotation before applying their own")
 
     def test_renderer_propagates(self):
         hou = _make_hou_with_default_camera()

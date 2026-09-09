@@ -2166,7 +2166,7 @@ def get_geometry_data(ctx: Context, path: str, element: str = "points",
 def render_single_view(ctx: Context,
                        orthographic: bool = False,
                        rotation: List[float] = [0, 90, 0],
-                       render_path: str = "C:/temp/",
+                       render_path: str = None,
                        render_engine: str = "opengl",
                        karma_engine: str = "cpu",
                        consent_token: str = None) -> dict:
@@ -2179,6 +2179,17 @@ def render_single_view(ctx: Context,
         回的 ``_interrupt`` 字段中获得。详见 ``_render_policy.py``。
 
     Render a single view inside Houdini and return a structured result dict.
+
+    feat-mcp-round2-hardening §2:
+        - render_path 默认 None：MUST NOT 默认发送 "C:/temp/"；server 端
+          缺省时回退 ``$TEMP/houdini_mcp/<日期>/`` 规范目录（纳入 7 天
+          清理）。显式传参行为不变。
+        - 渲染流程自建的 MCP_* 临时节点（rig + ROP）在渲染结束后由
+          server 端清理；清理失败时响应附 ``_cleanup_warning``。
+        - 响应含 ``requested_renderer``（请求值）与 ``actual_backend``
+          （实际执行路径：opengl_rop / husk / flipbook / qscreen_fallback
+          等）；``renderer`` 为兼容字段，语义 = requested_renderer，
+          不代表实际执行的后端。
 
     Returns a dict (carrying renderer / image_path / size_bytes / etc.)
     instead of a string. Pydantic-typed MCP output models reject dicts
@@ -2220,7 +2231,7 @@ def render_single_view(ctx: Context,
 
 @mcp.tool()
 def render_quad_views(ctx: Context,
-                      render_path: str = "C:/temp/",
+                      render_path: str = None,
                       render_engine: str = "opengl",
                       karma_engine: str = "cpu",
                       consent_token: str = None) -> dict:
@@ -2231,6 +2242,15 @@ def render_quad_views(ctx: Context,
         / karma_xpu 需带 ``consent_token`` 重调。详见 ``_render_policy.py``。
 
     Render 4 canonical views from Houdini and return a structured result dict.
+
+    feat-mcp-round2-hardening §2:
+        - render_path 默认 None（MUST NOT 默认发送 "C:/temp/"）；server
+          端缺省回退 ``$TEMP/houdini_mcp/<日期>/`` 规范目录（7 天清理）。
+          显式传参行为不变。
+        - 多视图渲染建一次 MCP_* rig、渲完清一次；清理失败响应附
+          ``_cleanup_warning``。
+        - 响应含 ``requested_renderer`` / ``actual_backend``（实际执行
+          路径）；``renderer`` 为兼容字段（= requested_renderer）。
 
     Returns a dict (4 views × {image_path, size_bytes, ...}) instead of a
     string. See render_single_view docstring for the dict-vs-str Pydantic
@@ -2269,7 +2289,7 @@ def render_quad_views(ctx: Context,
 @mcp.tool()
 def render_specific_camera(ctx: Context,
                            camera_path: str,
-                           render_path: str = "C:/temp/",
+                           render_path: str = None,
                            render_engine: str = "opengl",
                            karma_engine: str = "cpu",
                            consent_token: str = None) -> dict:
@@ -2280,6 +2300,15 @@ def render_specific_camera(ctx: Context,
         / karma_xpu 需带 ``consent_token`` 重调。详见 ``_render_policy.py``。
 
     Render from a specific camera path in the Houdini scene.
+
+    feat-mcp-round2-hardening §2:
+        - render_path 默认 None（MUST NOT 默认发送 "C:/temp/"）；server
+          端缺省回退 ``$TEMP/houdini_mcp/<日期>/`` 规范目录（7 天清理）。
+          显式传参行为不变。
+        - 只清理本流程创建的 MCP_* ROP 节点（用户相机不动）；清理失败
+          响应附 ``_cleanup_warning``。
+        - 响应含 ``requested_renderer`` / ``actual_backend``（实际执行
+          路径）；``renderer`` 为兼容字段（= requested_renderer）。
 
     Returns a structured dict (renderer / image_path / size_bytes) instead
     of a string. See render_single_view docstring for the dict-vs-str
