@@ -29,6 +29,8 @@ import json
 import math
 import os
 import re
+import threading
+from collections import OrderedDict
 
 try:
     from . import _common as cmn
@@ -469,18 +471,85 @@ def _validate_index(raw_text):
 
 
 # ---------------------------------------------------------------------------
-# 索引路径与 cache（tasks 1.5 / 1.6）
+# 索引路径与 cache（tasks 1.5 / 1.6；perf-mcp-round3 §3 改 LRU）
 # ---------------------------------------------------------------------------
 # cache key = (absolute_path, st_mtime_ns, st_size) -> BM25Index
-_CACHE = {}
 # path -> 最后一次已校验成功的 BM25Index（stale 降级用）
-_LAST_GOOD = {}
+#
+# perf-mcp-round3 §3：两张表从无界 dict 改 OrderedDict LRU——命中
+# move_to_end、容量外 popitem(last=False) 淘汰最旧；容量默认 8、
+# ``HOUDINI_MCP_CACHE_CAPACITY`` 可调（int、clamp [1,128]、非法回退
+# 默认 + 日志）。mtime 即时失效语义保留：key 含 (mtime_ns, size)，
+# 文件变化 → 新 key 不命中旧条目、走重新校验加载；旧条目随 LRU
+# 自然淘汰。线程安全：OrderedDict 复合操作（get+move_to_end /
+# put+popitem）非原子，用独立模块级 Lock 串行化（检索路径无既有锁，
+# 此处不引入磁盘 IO，最小侵入）。
+_CACHE = OrderedDict()
+_LAST_GOOD = OrderedDict()
+_CACHE_LOCK = threading.Lock()
+
+_CACHE_CAPACITY_DEFAULT = 8
+_CACHE_CAPACITY_MIN = 1
+_CACHE_CAPACITY_MAX = 128
+
+
+def _cache_capacity():
+    """读 HOUDINI_MCP_CACHE_CAPACITY；未设默认 8，非法/越界回退默认 + 日志。"""
+    raw = os.environ.get("HOUDINI_MCP_CACHE_CAPACITY")
+    if raw is None:
+        return _CACHE_CAPACITY_DEFAULT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        print("_rag: HOUDINI_MCP_CACHE_CAPACITY={0!r} 非整数，"
+              "回退默认 {1}".format(raw, _CACHE_CAPACITY_DEFAULT))
+        return _CACHE_CAPACITY_DEFAULT
+    if not (_CACHE_CAPACITY_MIN <= value <= _CACHE_CAPACITY_MAX):
+        print("_rag: HOUDINI_MCP_CACHE_CAPACITY={0!r} 越界 "
+              "[{1},{2}]，回退默认 {3}".format(
+                  raw, _CACHE_CAPACITY_MIN, _CACHE_CAPACITY_MAX,
+                  _CACHE_CAPACITY_DEFAULT))
+        return _CACHE_CAPACITY_DEFAULT
+    return value
+
+
+def _cache_get(key):
+    with _CACHE_LOCK:
+        value = _CACHE.get(key)
+        if value is not None:
+            _CACHE.move_to_end(key)
+        return value
+
+
+def _cache_put(key, value):
+    with _CACHE_LOCK:
+        _CACHE[key] = value
+        _CACHE.move_to_end(key)
+        while len(_CACHE) > _cache_capacity():
+            _CACHE.popitem(last=False)
+
+
+def _last_good_get(path):
+    with _CACHE_LOCK:
+        value = _LAST_GOOD.get(path)
+        if value is not None:
+            _LAST_GOOD.move_to_end(path)
+        return value
+
+
+def _last_good_put(path, index):
+    with _CACHE_LOCK:
+        _LAST_GOOD[path] = index
+        _LAST_GOOD.move_to_end(path)
+        while len(_LAST_GOOD) > _cache_capacity():
+            _LAST_GOOD.popitem(last=False)
 
 
 def clear_cache():
     """清空进程内 cache（测试 / 显式失效用）。"""
-    _CACHE.clear()
-    _LAST_GOOD.clear()
+    with _CACHE_LOCK:
+        _CACHE.clear()
+        _LAST_GOOD.clear()
 
 
 def _index_path(path=None):
@@ -515,7 +584,7 @@ def _index_path(path=None):
 
 
 def _lookup_last_good(path):
-    return _LAST_GOOD.get(path)
+    return _last_good_get(path)
 
 
 def _stale_status(path, index, reason):
@@ -566,7 +635,7 @@ def load_index(path=None):
                 "warning": ""}
 
     key = (resolved, stat_result.st_mtime_ns, stat_result.st_size)
-    cached = _CACHE.get(key)
+    cached = _cache_get(key)
     if cached is not None:
         return {"state": "ok", "index": cached, "reason": "",
                 "path": resolved, "warning": ""}
@@ -604,8 +673,8 @@ def load_index(path=None):
                 "path": resolved, "warning": ""}
 
     # 成功：才允许写 cache。坏文件永远不会污染缓存。
-    _CACHE[key] = index
-    _LAST_GOOD[resolved] = index
+    _cache_put(key, index)
+    _last_good_put(resolved, index)
     return {"state": "ok", "index": index, "reason": "",
             "path": resolved, "warning": ""}
 

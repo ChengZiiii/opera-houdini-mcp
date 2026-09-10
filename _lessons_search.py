@@ -46,7 +46,8 @@ import math
 import os
 import re
 import tempfile
-from collections import Counter
+import threading
+from collections import Counter, OrderedDict
 from datetime import datetime
 
 try:
@@ -124,12 +125,66 @@ HINT_TEXT = "已踩 {0} 次，请补充 fix"
 _CJK_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
 
 # cache key = (cache 文件绝对路径, source_sig) -> index dict
-_CACHE = {}
+#
+# perf-mcp-round3 §3：进程内缓存改 OrderedDict LRU——原 dict 键含
+# source_sig 但无淘汰（无界增长 + 陈旧项常驻）。语义：
+# - 命中 move_to_end（最近用移尾）；容量外 popitem(last=False) 淘汰最旧；
+# - 容量默认 8，``HOUDINI_MCP_CACHE_CAPACITY`` 可调（int、clamp [1,128]、
+#   非法回退默认 + print 日志）；
+# - mtime/sig 即时失效语义保留：key 含 source_sig，源文件变化 → 新
+#   key 不命中旧条目、走重建；旧 key 条目随 LRU 自然淘汰。
+# - 线程安全：round2 §3 的 per-root 双层锁只包磁盘写路径（save_*），
+#   本缓存的读写发生在检索路径（锁外）；OrderedDict 的 get+move_to_end
+#   / put+popitem 是复合操作非原子，故用独立模块级 Lock 串行化缓存
+#   自身访问（最小侵入：不改 _root_lock 语义、不涉磁盘 IO）。
+_CACHE = OrderedDict()
+_CACHE_LOCK = threading.Lock()
+
+_CACHE_CAPACITY_DEFAULT = 8
+_CACHE_CAPACITY_MIN = 1
+_CACHE_CAPACITY_MAX = 128
+
+
+def _cache_capacity():
+    """读 HOUDINI_MCP_CACHE_CAPACITY；未设默认 8，非法/越界回退默认 + 日志。"""
+    raw = os.environ.get("HOUDINI_MCP_CACHE_CAPACITY")
+    if raw is None:
+        return _CACHE_CAPACITY_DEFAULT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        print("_lessons_search: HOUDINI_MCP_CACHE_CAPACITY={0!r} 非整数，"
+              "回退默认 {1}".format(raw, _CACHE_CAPACITY_DEFAULT))
+        return _CACHE_CAPACITY_DEFAULT
+    if not (_CACHE_CAPACITY_MIN <= value <= _CACHE_CAPACITY_MAX):
+        print("_lessons_search: HOUDINI_MCP_CACHE_CAPACITY={0!r} 越界 "
+              "[{1},{2}]，回退默认 {3}".format(
+                  raw, _CACHE_CAPACITY_MIN, _CACHE_CAPACITY_MAX,
+                  _CACHE_CAPACITY_DEFAULT))
+        return _CACHE_CAPACITY_DEFAULT
+    return value
+
+
+def _cache_get(key):
+    with _CACHE_LOCK:
+        value = _CACHE.get(key)
+        if value is not None:
+            _CACHE.move_to_end(key)
+        return value
+
+
+def _cache_put(key, value):
+    with _CACHE_LOCK:
+        _CACHE[key] = value
+        _CACHE.move_to_end(key)
+        while len(_CACHE) > _cache_capacity():
+            _CACHE.popitem(last=False)
 
 
 def clear_cache():
     """清空进程内索引缓存（测试 / 显式失效用）。"""
-    _CACHE.clear()
+    with _CACHE_LOCK:
+        _CACHE.clear()
 
 
 def _now_iso():
@@ -519,13 +574,13 @@ def _write_cache(cache_path, sig, root_name, index):
 def _load_or_build_root_index(desc, sig):
     """加载或重建单 root 索引。返回 ``(index_dict, warnings_list)``。
 
-    优先级：进程内缓存（key=cache 路径+sig）→ 磁盘缓存（校验通过）→ 重建。
-    坏缓存绝不替换进程内已校验数据；重建结果原子落盘。warnings 仅在重建
-    路径产生（缓存命中时为空列表）。
+    优先级：进程内 LRU 缓存（key=cache 路径+sig）→ 磁盘缓存（校验通过）
+    → 重建。坏缓存绝不替换进程内已校验数据；重建结果原子落盘。warnings
+    仅在重建路径产生（缓存命中时为空列表）。
     """
     cache_path = _cache_file(desc["name"])
     key = (cache_path, sig)
-    cached = _CACHE.get(key)
+    cached = _cache_get(key)
     if cached is not None:
         return cached, []
 
@@ -541,9 +596,9 @@ def _load_or_build_root_index(desc, sig):
     if data is None:
         data, warnings = _build_root_index(desc["path"], desc["name"])
         _write_cache(cache_path, sig, desc["name"], data)
-        _CACHE[key] = data
+        _cache_put(key, data)
         return data, warnings
-    _CACHE[key] = data
+    _cache_put(key, data)
     return data, []
 
 
