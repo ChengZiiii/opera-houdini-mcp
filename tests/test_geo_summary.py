@@ -78,26 +78,21 @@ class _FakeAttrib(object):
         return self._size
 
 
-class _FakeGroupType(object):
-    def __init__(self, name):
-        self._name = name
-
-    def name(self):
-        return self._name
-
-
 class _FakeGroup(object):
-    def __init__(self, name, group_type="Point", size=0):
+    """对齐 H21 真实 API 的 group stub：只有 name()/__len__。
+
+    2026-09-10 全量 review 修复：旧 fake 伪造了 hou.PointGroup/PrimGroup
+    并不存在的 ``type()`` 方法，掩盖了生产代码调用即炸的 bug（现生产
+    侧已改为从来源集合派生 type）。fake 保持无 type() 是回归守卫——
+    再有人改回问对象要 type 时本文件会立刻失败。
+    """
+
+    def __init__(self, name, size=0):
         self._name = name
-        # Houdini real group type names: 'Point' / 'Primitive' / 'Vertex'
-        self._type = group_type
         self._size = size
 
     def name(self):
         return self._name
-
-    def type(self):
-        return _FakeGroupType(self._type)
 
     def __len__(self):
         return self._size
@@ -325,10 +320,10 @@ def _make_simple_geometry(point_count=10, primitive_count=8,
     ]
     pra = prim_attribs if prim_attribs is not None else []
     pgs = point_groups if point_groups is not None else [
-        _FakeGroup("selected", "Point", 5),
+        _FakeGroup("selected", 5),
     ]
     prgs = prim_groups if prim_groups is not None else [
-        _FakeGroup("visible", "Primitive", 8),
+        _FakeGroup("visible", 8),
     ]
     pd = points_data if points_data is not None else [
         _FakePoint(i, {"P": (float(i), 0.0, 0.0),
@@ -555,8 +550,8 @@ class DegradationTests(unittest.TestCase):
             vertex_count=point_count * 2,
             point_attribs=[_FakeAttrib("P", "Float", 3),
                            _FakeAttrib("N", "Float", 3)],
-            point_groups=[_FakeGroup("g1", "Point", 100)],
-            prim_groups=[_FakeGroup("g2", "Primitive", 50)],
+            point_groups=[_FakeGroup("g1", 100)],
+            prim_groups=[_FakeGroup("g2", 50)],
             points_data=[],
         )
         sop = _FakeSopNode("/obj/huge", geo)
@@ -614,7 +609,7 @@ class DegradationTests(unittest.TestCase):
             vertex_count=1_500_000,
             point_attribs=[_FakeAttrib("P", "Float", 3),
                            _FakeAttrib("id", "Int", 1)],
-            point_groups=[_FakeGroup("all", "Point", 100)],
+            point_groups=[_FakeGroup("all", 100)],
             prim_groups=[],
             points_data=[],
         )

@@ -88,18 +88,18 @@ def _attrib_entry_no_size(attrib):
     return {"name": attrib.name(), "type": type_name}
 
 
-def _group_entry(group):
+def _group_entry(group, type_name):
     """生成单个 group 的 dict: {name, type, size}.
 
-    group.type().name() 在 Houdini 中为 'Point' / 'Primitive' / 'Vertex'；
-    我们 normalize 成小写 'point' / 'primitive' / 'vertex' 以便统一。
+    H21 官方 hom.zip 核对（2026-09-10 全量 review）：hou.PointGroup /
+    PrimGroup **没有** ``type()`` 方法——旧实现调用即 AttributeError，
+    mock 伪 ``type()`` 曾掩盖（真机全字段模式遇 group 必炸）。group
+    类别改为从来源集合（pointGroups / primGroups 循环）派生，不问
+    对象本身；normalize 成小写 'point' / 'primitive'。
     """
-    gtype = group.type()
-    type_name = gtype.name() if hasattr(gtype, "name") else str(gtype)
-    type_lower = type_name.lower()
     return {
         "name": group.name(),
-        "type": type_lower,
+        "type": type_name,
         "size": len(group) if hasattr(group, "__len__") else 0,
     }
 
@@ -164,12 +164,12 @@ def _collect_attributes_degraded(geo, raw_attribs):
 
 
 def _collect_groups_full(geo):
-    """收集 point + prim groups."""
+    """收集 point + prim groups（type 从来源集合派生，见 _group_entry）."""
     out = []
     for g in geo.pointGroups():
-        out.append(_group_entry(g))
+        out.append(_group_entry(g, "point"))
     for g in geo.primGroups():
-        out.append(_group_entry(g))
+        out.append(_group_entry(g, "primitive"))
     return out
 
 

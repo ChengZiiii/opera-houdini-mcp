@@ -670,6 +670,32 @@ def set_render_settings(hou, node_path, parameters):
 # ---------------------------------------------------------------------------
 # Section 7: 公共 API — create_render_node
 # ---------------------------------------------------------------------------
+def _creation_type_name(hou, parent, type_name):
+    """返回 createNode 实际可用的类型名（H21/H22 karma 名差异适配）。
+
+    H21.0.x out 上下文的原生名是 ``karma``（nodes.zip 无
+    ``out/karmarender``；H22.0+ 才是 ``karmarender``）。内部白名单归一
+    用 ``karmarender``，创建时必须翻译回宿主版本的真实名：探测
+    ``parent.childTypeCategory().nodeTypes()`` 命中谁用谁（karma 优先
+    探测）；探测不可用（mock / 异常）回退归一名直传（legacy 行为，
+    真实宿主上若创建失败由 node_creation_failed 结构化 error 兜底）。
+    2026-09-10 全量 review 修复：旧实现直接用归一名创建，H21 传
+    ``karmarender`` 必失败。
+    """
+    if type_name != _KARMA_NORMALIZED:
+        return type_name
+    try:
+        available = parent.childTypeCategory().nodeTypes()
+    except Exception:
+        available = None
+    if available is None:
+        return type_name
+    for candidate in ("karma", "karmarender"):
+        if candidate in available:
+            return candidate
+    return "karma"
+
+
 def create_render_node(hou, node_type, parent_path="/out", name=None,
                         parameters=None):
     """受限创建 ROP 节点（design.md §"create_render_node"）。
@@ -698,7 +724,19 @@ def create_render_node(hou, node_type, parent_path="/out", name=None,
             "parent not found at path %r") % parent_path,
             "field": "parent_path"}
 
-    node = parent.createNode(type_name, node_name=name)
+    # 2026-09-10 review 修复：createNode 纳入结构化 error（旧实现裸露
+    # 在 try 外，类型名/父上下文异常会绕过本函数的 error 契约）
+    actual_type = _creation_type_name(hou, parent, type_name)
+    try:
+        node = parent.createNode(actual_type, node_name=name)
+    except Exception as exc:
+        return cmn.apply_response_cap({
+            "status": "error",
+            "error_code": "node_creation_failed",
+            "message": ("createNode(%r) failed: %s"
+                        % (actual_type, exc)),
+            "field": "node_type",
+        })
     try:
         if parameters:
             set_result = set_render_settings(

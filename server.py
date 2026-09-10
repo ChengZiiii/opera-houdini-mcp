@@ -1,7 +1,6 @@
 import hou
 import json
 import struct
-import threading
 import socket
 import time
 import difflib
@@ -3009,7 +3008,7 @@ class HoudiniMCPServer:
              # Clean up potentially incomplete file
              if os.path.exists(local_path):
                   try: os.remove(local_path)
-                  except: pass
+                  except OSError: pass
              raise ConnectionError(f"Failed to download file: {str(e)}") from e
 
     def _unzip_file(self, zip_path, dest_folder):

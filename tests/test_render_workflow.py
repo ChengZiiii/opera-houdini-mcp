@@ -557,6 +557,57 @@ class CreateRenderNodeTests(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertEqual(len(out.children_list), before_count)
 
+    def _parent_with_types(self, available_types):
+        """构造带 childTypeCategory 探针 + karma engine parm 的 fake /out。"""
+        hou, _, out = _build_hou("ifd")
+        out.childTypeCategory = lambda: types.SimpleNamespace(
+            nodeTypes=lambda: {t: object() for t in available_types})
+        real_create = out.createNode
+
+        def _create_with_engine(type_name, node_name=None):
+            child = real_create(type_name, node_name)
+            # 真实 karma/karmarender ROP 自带 engine parm（默认 cpu）
+            if type_name in ("karma", "karmarender"):
+                child._parms["engine"] = _FakeParmTuple(
+                    "engine", ["cpu"], type_name="Menu")
+            return child
+        out.createNode = _create_with_engine
+        return hou, out
+
+    def test_karmarender_translates_to_karma_on_h21(self):
+        """H21 out 上下文只有 karma 类型（nodes.zip 无 out/karmarender）
+        ——白名单归一名 karmarender 创建时必须翻译为 karma。
+        2026-09-10 全量 review 修复的回归守卫。"""
+        hou, out = self._parent_with_types({"ifd", "opengl", "karma"})
+        result = _render_settings.create_render_node(
+            hou, "karmarender", name="k21")
+        self.assertEqual(result["status"], "success")
+        # 实际创建名是 karma；响应归一回报 karmarender + renderer
+        self.assertEqual(out.creation_calls[-1][0], "karma")
+        self.assertEqual(result["type"], "karmarender")
+
+    def test_karmarender_stays_on_h22(self):
+        """H22 上下文只有 karmarender 类型——直传不误翻。"""
+        hou, out = self._parent_with_types(
+            {"ifd", "opengl", "karmarender"})
+        result = _render_settings.create_render_node(
+            hou, "karmarender", name="k22")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(out.creation_calls[-1][0], "karmarender")
+
+    def test_create_node_exception_structured_error(self):
+        """createNode 抛异常返回结构化 error（旧实现裸露在 try 外，
+        会绕过 error 契约直接 raise）。"""
+        hou, _, out = _build_hou("ifd")
+
+        def _boom(type_name, node_name=None):
+            raise RuntimeError("nonexistent child type")
+        out.createNode = _boom
+        result = _render_settings.create_render_node(hou, "ifd")
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error_code"], "node_creation_failed")
+        self.assertIn("ifd", result["message"])
+
 
 # ---------------------------------------------------------------------------
 # Section 5: _render_jobs — frame_range / Layer 3 / Layer 4

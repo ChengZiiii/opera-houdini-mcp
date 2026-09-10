@@ -38,7 +38,9 @@ VCC = os.path.join(HFS, "bin", "vcc.exe")
 def _make_sop_parent():
     """每次创建全新 SOP 网络，避免 undo 干扰。"""
     geo = hou.node("/obj").createNode("geo", "NPV_smoke_geo")
-    geo.moveToGoodPosition()
+    geo.moveToGoodPosition(
+        move_inputs=False, move_outputs=False,
+        move_unconnected=False)
     return geo
 
 
