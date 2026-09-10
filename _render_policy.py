@@ -200,6 +200,33 @@ def _default_redirect(renderer):
     )
 
 
+def _karma_viewport_redirect(renderer):
+    """karma 视口渲染的 redirect 构造（fallback = capture_pane_screenshot）。
+
+    仅用于 **视口语义** 工具（render_single_view / render_quad_views /
+    render_specific_camera，engine 维度 gate）；``start_render`` 的
+    karma disk 渲染（husk 子进程，无 GL）不经过本构造，仍走 consent
+    interrupt。
+
+    依据（2026-09-10 用户机实证）：karma ROP ``render()`` 在本机触发
+    「OpenGL Fatal Error: not able to run OpenGL 3.3」模态框，点击后
+    **Houdini 进程整体退出**，MCP 桥接随之死亡——危害级别高于 opengl
+    的"仅路径不可用"，故视口 karma 无条件 redirect（与 opengl 同哲学：
+    用户机 fork 假定 GL-broken）。
+    """
+    return _redirect_dict(
+        renderer=renderer,
+        fallback_tool="capture_pane_screenshot",
+        fallback_args={"pane_type_name": "SceneViewer",
+                       "fit_contents": True,
+                       "save_path": None},
+        reason=("用户机 H21 缺 OGL 3.3 驱动，karma 视口渲染实测触发 OpenGL "
+                "fatal error 并导致 Houdini 进程退出（2026-09-10 实证）；"
+                "请改用 capture_pane_screenshot(SceneViewer) 走 flipbook 路径，"
+                "karma disk 渲染请改用 start_render（background 优先）"),
+    )
+
+
 def _default_interrupt(renderer, token, expires_in_seconds):
     """karma 的标准 interrupt 构造（中文 prompt + 5 分钟过期）。
 
@@ -431,7 +458,14 @@ def render_engine_to_renderer(render_engine, karma_engine=None):
 
 
 def enforce_render_engine_policy(render_engine, karma_engine=None):
-    """``HoudiniMCPRender`` 风格的入口校验。
+    """``HoudiniMCPRender`` 风格的入口校验（**视口语义工具专用**）。
+
+    karma 分支行为（2026-09-10 变更）：视口工具的 karma_cpu / karma_xpu
+    **无条件 redirect** 到 flipbook——用户机 GL-broken 实证 karma ROP
+    ``render()`` 触发 OpenGL fatal 并杀死 Houdini 进程；consent interrupt
+    不足以防御（用户放行后仍崩），故先于 consent 直接 redirect。
+    ``start_render`` 的 karma disk 渲染走 ``enforce_render_policy``，
+    不受本函数影响（husk 子进程无 GL，保持 consent 门）。
 
     Args:
         render_engine: ``render_engine`` 参数（``opengl`` / ``karma`` /
@@ -442,8 +476,10 @@ def enforce_render_engine_policy(render_engine, karma_engine=None):
     Returns:
         (str, dict_or_None): 同 ``enforce_render_policy``。
     """
-    return enforce_render_policy(
-        render_engine_to_renderer(render_engine, karma_engine))
+    renderer = render_engine_to_renderer(render_engine, karma_engine)
+    if renderer in ("karma_cpu", "karma_xpu"):
+        return ("redirect", _karma_viewport_redirect(renderer))
+    return enforce_render_policy(renderer)
 
 
 def _engine_policy_adapter(params):

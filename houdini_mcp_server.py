@@ -2178,8 +2178,10 @@ def render_single_view(ctx: Context,
         在用户机 H21 缺 OGL 3.3 环境下，本工具的 opengl renderer 已被 fork
         强制 redirect 到 ``capture_pane_screenshot(SceneViewer)``（不再
         触发 opengl output node 链路，避免 Houdini 主线程死锁）；karma_cpu /
-        karma_xpu renderer 需带 ``consent_token`` 重调，token 在首次调用返
-        回的 ``_interrupt`` 字段中获得。详见 ``_render_policy.py``。
+        karma_xpu 视口渲染同样无条件 redirect 到 flipbook（2026-09-10 实证：
+        karma ROP render() 在本机触发 OpenGL fatal 并导致 Houdini 进程退出，
+        consent 不足以防御）。karma disk 渲染请改用 ``start_render``
+        （background 优先）。详见 ``_render_policy.py``。
 
     Render a single view inside Houdini and return a structured result dict.
 
@@ -2242,7 +2244,9 @@ def render_quad_views(ctx: Context,
     IMPORTANT (fork-render-policy-redirect-and-consent):
         在用户机 H21 缺 OGL 3.3 环境下，本工具的 opengl renderer 已被 fork
         强制 redirect 到 ``capture_pane_screenshot(SceneViewer)``；karma_cpu
-        / karma_xpu 需带 ``consent_token`` 重调。详见 ``_render_policy.py``。
+        / karma_xpu 视口渲染同样无条件 redirect 到 flipbook（2026-09-10
+        实证 GL fatal 杀进程，consent 不足以防御）。karma disk 渲染改用
+        ``start_render``。详见 ``_render_policy.py``。
 
     Render 4 canonical views from Houdini and return a structured result dict.
 
@@ -2300,7 +2304,9 @@ def render_specific_camera(ctx: Context,
     IMPORTANT (fork-render-policy-redirect-and-consent):
         在用户机 H21 缺 OGL 3.3 环境下，本工具的 opengl renderer 已被 fork
         强制 redirect 到 ``capture_pane_screenshot(SceneViewer)``；karma_cpu
-        / karma_xpu 需带 ``consent_token`` 重调。详见 ``_render_policy.py``。
+        / karma_xpu 视口渲染同样无条件 redirect 到 flipbook（2026-09-10
+        实证 GL fatal 杀进程，consent 不足以防御）。karma disk 渲染改用
+        ``start_render``。详见 ``_render_policy.py``。
 
     Render from a specific camera path in the Houdini scene.
 

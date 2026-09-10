@@ -365,17 +365,24 @@ class EnforceRenderEnginePolicyTests(unittest.TestCase):
         self.assertEqual(action, "redirect")
         self.assertEqual(payload["renderer"], "opengl")
 
-    def test_enforce_render_engine_karma_cpu_interrupt(self):
+    def test_enforce_render_engine_karma_cpu_redirects(self):
+        """karma 视口渲染无条件 redirect（2026-09-10 GL fatal 实证后变更：
+        consent 不足以防御——用户放行后 karma ROP render() 仍触发 OpenGL
+        fatal 并杀死 Houdini 进程）。"""
         action, payload = self.mod.enforce_render_engine_policy(
             "karma", "cpu")
-        self.assertEqual(action, "interrupt")
+        self.assertEqual(action, "redirect")
         self.assertEqual(payload["renderer"], "karma_cpu")
+        self.assertEqual(payload["_redirect"], "flipbook")
+        self.assertEqual(
+            payload["fallback_tool"], "capture_pane_screenshot")
 
-    def test_enforce_render_engine_karma_gpu_interrupt(self):
+    def test_enforce_render_engine_karma_gpu_redirects(self):
         action, payload = self.mod.enforce_render_engine_policy(
             "karma", "gpu")
-        self.assertEqual(action, "interrupt")
+        self.assertEqual(action, "redirect")
         self.assertEqual(payload["renderer"], "karma_xpu")
+        self.assertEqual(payload["_redirect"], "flipbook")
 
     def test_enforce_render_engine_mantra_allows(self):
         action, payload = self.mod.enforce_render_engine_policy(
@@ -735,15 +742,15 @@ class FourLayerEnforceRegressionTests(unittest.TestCase):
         self.assertIsNotNone(r)
         self.assertEqual(r["_redirect"], "flipbook")
 
-    def test_engine_command_karma_interrupts_without_token(self):
-        """engine command karma -> interrupt dict（无 token）。"""
+    def test_engine_command_karma_redirects_without_token(self):
+        """engine command karma -> redirect dict（2026-09-10 GL fatal 变更：
+        视口 karma 无条件 redirect，token 不再参与）。"""
         r = self.mod.evaluate_render_policy_command(
             "render_single_view", {"render_engine": "karma",
                                    "karma_engine": "cpu"})
         self.assertIsNotNone(r)
-        self.assertEqual(r["_interrupt"], "user_consent_required")
-        self.assertEqual(r["expires_in_seconds"], 300)
-        self.assertEqual(len(r["consent_token"]), 32)
+        self.assertEqual(r["_redirect"], "flipbook")
+        self.assertNotIn("_interrupt", r)
 
     def test_renderer_base64_command_opengl_redirects(self):
         """renderer base64 command opengl -> redirect dict。"""
@@ -752,21 +759,23 @@ class FourLayerEnforceRegressionTests(unittest.TestCase):
         self.assertIsNotNone(r)
         self.assertEqual(r["_redirect"], "flipbook")
 
-    def test_valid_token_allows_interrupt_command(self):
-        """有效 consent token 使 interrupt command 放行（Layer 1 preflight
-        返 None）—— token 传播到 quad 嵌套 viewport 的前提。"""
+    def test_valid_token_cannot_bypass_karma_viewport_redirect(self):
+        """2026-09-10 GL fatal 变更：engine command（视口工具）karma 无条件
+        redirect，**有效 token 也不能绕过**（consent 不足以防御进程死亡）。"""
         token = self.mod.create_consent_token(expires_in_seconds=300)
-        # 四层都用同一 token consume，应全部通过
-        for _ in range(4):
+        for cmd in ("render_quad_view", "render_specific_camera"):
             r = self.mod.evaluate_render_policy_command(
-                "render_quad_view",
+                cmd,
                 {"render_engine": "karma", "karma_engine": "gpu",
                  "consent_token": token})
-            self.assertIsNone(
-                r, "有效 token 应使 karma 放行，不应再返回 interrupt")
+            self.assertIsNotNone(
+                r, "视口 karma redirect 不应被 token 绕过")
+            self.assertEqual(r["_redirect"], "flipbook")
 
-    def test_expired_token_re_interrupts(self):
-        """过期 token 重新 interrupt（R12 缺失 / 过期 token 行为不变）。"""
+    def test_expired_token_re_interrupts_on_start_render(self):
+        """过期 token 重新 interrupt（R12 缺失 / 过期 token 行为不变）；
+        2026-09-10 视口 karma 改 redirect 后，本语义由 start_render
+        （renderer 维度 consent 门，husk disk 渲染）承载。"""
         token = self.mod.create_consent_token(expires_in_seconds=300)
         # backdate
         epath = os.path.join(self.mod._consent_dir(), token)
@@ -776,8 +785,8 @@ class FourLayerEnforceRegressionTests(unittest.TestCase):
         try:
             self.mod.time.time = lambda: created_at + 1000
             r = self.mod.evaluate_render_policy_command(
-                "render_specific_camera",
-                {"render_engine": "karma", "karma_engine": "cpu",
+                "start_render",
+                {"policy_renderer": "karma_cpu",
                  "consent_token": token})
             self.assertIsNotNone(r, "过期 token 应重新 interrupt")
             self.assertEqual(r["_interrupt"], "user_consent_required")
