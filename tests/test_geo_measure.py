@@ -695,6 +695,72 @@ class GetAttribValuesTests(unittest.TestCase):
         self.assertEqual(r["result"]["values"], [])
         self.assertEqual(r["result"]["next_offset"], None)
 
+    def test_streaming_page_does_not_materialize_all(self):
+        # perf-mcp-round3 §2：total 走 intrinsic 计数、页数据 islice 流式——
+        # 大几何分页查询只迭代 start+size 个元素，不再全量物化。
+        pulled = [0]
+
+        class _CountingPoint(_FakePoint):
+            def __init__(self, number):
+                _FakePoint.__init__(self, number, (0.0, 0.0, 0.0),
+                                    {"id": number})
+
+        def _iter_points():
+            for i in range(100000):
+                pulled[0] += 1
+                yield _CountingPoint(i)
+
+        class _StreamingGeometry(_FakeGeometry):
+            def __init__(self):
+                _FakeGeometry.__init__(self, attribs={
+                    "point_id": _FakeAttrib("id", "Int", 1)})
+
+            def iterPoints(self):
+                return _iter_points()
+
+            def intrinsicValue(self, key):
+                # O(1) 计数（真实 hou 的 pointcount intrinsic 同语义）
+                if key == "pointcount":
+                    return 100000
+                return _FakeGeometry.intrinsicValue(self, key)
+
+        geo = _StreamingGeometry()
+        sop = _FakeSopNode("/obj/box", geo)
+        hou = _FakeHou({"/obj/box": sop})
+        r = gme.get_attrib_values(
+            hou, "/obj/box", "id", attrib_class="point",
+            offset=200, limit=50)
+        self.assertEqual(r["status"], "success")
+        res = r["result"]
+        # total 来自 intrinsic（O(1)，不迭代）
+        self.assertEqual(res["total"], 100000)
+        self.assertEqual(res["values"], list(range(200, 250)))
+        self.assertEqual(res["next_offset"], 250)
+        # islice 只拉取 [0, start+size) = 250 个元素
+        self.assertEqual(pulled[0], 250)
+
+    def test_intrinsic_unavailable_falls_back_to_materialization(self):
+        # intrinsic 计数不可得（老版本 / 奇异 geo）→ 回退全量物化，
+        # 契约与旧实现一致。
+        class _NoIntrinsicGeometry(_FakeGeometry):
+            def intrinsicValue(self, key):
+                raise KeyError(key)
+
+        pts = [_FakePoint(i, (0.0, 0.0, 0.0), {"id": 10 + i})
+               for i in range(7)]
+        geo = _NoIntrinsicGeometry(
+            points=pts, attribs={"point_id": _FakeAttrib("id", "Int", 1)})
+        sop = _FakeSopNode("/obj/box", geo)
+        hou = _FakeHou({"/obj/box": sop})
+        r = gme.get_attrib_values(
+            hou, "/obj/box", "id", attrib_class="point",
+            offset=3, limit=2)
+        self.assertEqual(r["status"], "success")
+        res = r["result"]
+        self.assertEqual(res["total"], 7)
+        self.assertEqual(res["values"], [13, 14])
+        self.assertEqual(res["next_offset"], 5)
+
 
 # ===========================================================================
 # Section F: get_prim_intrinsics — 必须 prim_index

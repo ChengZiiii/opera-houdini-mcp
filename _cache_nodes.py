@@ -19,6 +19,7 @@
 - 所有公共返回（success / warning / error）均经过 ``apply_response_cap``。
 """
 import os
+from collections import deque
 
 from . import _common as cmn
 
@@ -346,9 +347,11 @@ def list_caches(hou, parent_path="/", max_nodes=_DEFAULT_LIMIT):
     except Exception:
         root_path = parent_path
     visited.add(root_path)
-    queue = [(parent, 0)]
+    # perf-mcp-round3 §2：BFS frontier 用 deque + popleft（list.pop(0)
+    # 是 O(n²)；deque 保证 O(1) 出队）。max_nodes 预算语义不变。
+    queue = deque([(parent, 0)])
     while queue and budget_left > 0:
-        current, _depth = queue.pop(0)
+        current, _depth = queue.popleft()
         try:
             children = current.children() or []
         except Exception:

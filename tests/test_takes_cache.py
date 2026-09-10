@@ -690,9 +690,10 @@ class CacheAdapterTests(unittest.TestCase):
             elif isinstance(node, ast.ImportFrom):
                 imports.add(node.module or "")
         self.assertNotIn("hou", imports)
-        # _common is package-internal; os is stdlib; "" is the
-        # ``from . import _common`` relative marker.
-        self.assertTrue(imports <= {"os", "_common", ""})
+        # _common is package-internal; os / collections are stdlib
+        # （collections.deque = perf-mcp-round3 §2 BFS frontier）; "" is
+        # the ``from . import _common`` relative marker.
+        self.assertTrue(imports <= {"os", "collections", "_common", ""})
 
     def test_filecache_in_whitelist_sop_file_not(self):
         # whitelist contains filecache variants
@@ -741,6 +742,94 @@ class CacheAdapterTests(unittest.TestCase):
         self.assertIn("/obj/geo1/fc", paths)
         self.assertNotIn("/obj/geo1/file1", paths)
         self.assertNotIn("/obj/geo1/box1", paths)
+
+    def test_list_caches_deep_network_budget_and_bfs_order(self):
+        # perf-mcp-round3 §2：frontier 改 deque 后，max_nodes 预算语义
+        # 与 BFS（先进先出）发现顺序契约不变。
+        class _ContainerNode(object):
+            def __init__(self, path, children):
+                self._path = path
+                self._children = list(children)
+
+            def path(self):
+                return self._path
+
+            def children(self):
+                return list(self._children)
+
+            def type(self):
+                return _TypeObj("geo")
+
+            def parm(self, name):
+                return None
+
+        # 深链：/obj → d0 → d1 → ... → d59，每层挂一个 filecache
+        depth_total = 60
+        filecaches = []
+        child = None
+        for depth in range(depth_total - 1, -1, -1):
+            container_children = []
+            fc = _FileCacheNode("/obj/d%d/fc" % depth, "/tmp/x.bgeo")
+            filecaches.append(fc)
+            container_children.append(fc)
+            if child is not None:
+                container_children.append(child)
+            child = _ContainerNode("/obj/d%d" % depth, container_children)
+        filecaches.reverse()  # depth 0..59 顺序
+        root = _ContainerNode("/obj", [filecaches[0], child])
+
+        hou = _Hou()
+        hou.node = lambda p: root if p == "/obj" else None
+
+        # 预算内截断：max_nodes=10 只发现前 10 个（深度链 BFS=同序），
+        # truncated=True
+        result = self.cache.list_caches(hou, "/obj", max_nodes=10)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["count"], 10)
+        self.assertTrue(result["truncated"])
+        self.assertEqual([c["path"] for c in result["caches"]],
+                         ["/obj/d%d/fc" % d for d in range(10)])
+
+        # 预算充足：全量发现、truncated=False
+        result = self.cache.list_caches(hou, "/obj", max_nodes=256)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["count"], depth_total)
+        self.assertFalse(result["truncated"])
+        self.assertEqual([c["path"] for c in result["caches"]],
+                         ["/obj/d%d/fc" % d for d in range(depth_total)])
+
+    def test_list_caches_bfs_order_branching(self):
+        # 分支结构区分 BFS 与 DFS：/obj 下 A、B 两个容器各挂一个
+        # filecache，A 先入队 → fc_A 必须先于 fc_B 出现（FIFO 契约）。
+        class _ContainerNode(object):
+            def __init__(self, path, children):
+                self._path = path
+                self._children = list(children)
+
+            def path(self):
+                return self._path
+
+            def children(self):
+                return list(self._children)
+
+            def type(self):
+                return _TypeObj("geo")
+
+            def parm(self, name):
+                return None
+
+        fc_a = _FileCacheNode("/obj/A/fc", "/tmp/a.bgeo")
+        fc_b = _FileCacheNode("/obj/B/fc", "/tmp/b.bgeo")
+        container_a = _ContainerNode("/obj/A", [fc_a])
+        container_b = _ContainerNode("/obj/B", [fc_b])
+        root = _ContainerNode("/obj", [container_a, container_b])
+
+        hou = _Hou()
+        hou.node = lambda p: root if p == "/obj" else None
+        result = self.cache.list_caches(hou, "/obj", max_nodes=16)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual([c["path"] for c in result["caches"]],
+                         ["/obj/A/fc", "/obj/B/fc"])
 
     def test_get_cache_status_rejects_unknown_type(self):
         hou = _Hou()

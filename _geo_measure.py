@@ -51,6 +51,7 @@
 import math
 import os
 import tempfile
+from itertools import islice
 
 from . import _common as cmn
 
@@ -615,20 +616,48 @@ def get_attrib_values(hou, node_path, attribute, attrib_class="point",
             "next_offset": None,
         })
 
-    # point / prim / vertex：按 owner 拿 iterator，按 offset/limit 切片
+    # point / prim / vertex：流式分页读取（perf-mcp-round3 §2）。
+    #
+    # 旧实现先 ``list(geo.iterPoints())`` 全量物化再切片——大几何下单次
+    # 查询也物化全部 element。现改为：
+    # - ``total`` 走 intrinsic 计数（pointcount / primitivecount /
+    #   vertexcount，O(1)）；
+    # - 页数据用 ``itertools.islice`` 只物化 ``[start, start+size)`` 区间；
+    # - intrinsic 不可得（老版本 / 奇异 geo）时回退旧的全量物化路径
+    #   （最坏情况与旧实现一致）。
+    # 返回契约零变化：{values, offset, limit, total, next_offset, storage,
+    # tuple_size} 的键与语义均不动。
+    _intrinsic_count_key = {
+        "point": "pointcount",
+        "prim": "primitivecount",
+        "vertex": "vertexcount",
+    }
+
+    def _owner_entries(geo, owner):
+        if owner == "point":
+            return geo.iterPoints()
+        if owner == "prim":
+            return geo.iterPrims()
+        return geo.iterVertices()
+
     try:
-        if attrib_class == "point":
-            entries = list(geo.iterPoints())
-        elif attrib_class == "prim":
-            entries = list(geo.iterPrims())
+        total = None
+        try:
+            total = int(geo.intrinsicValue(
+                _intrinsic_count_key[attrib_class]))
+        except Exception:
+            total = None
+        if total is not None:
+            page = list(islice(_owner_entries(geo, attrib_class),
+                               start, start + size))
         else:
-            entries = list(geo.iterVertices())
+            entries = list(_owner_entries(geo, attrib_class))
+            total = len(entries)
+            page = entries[start:start + size]
     except Exception as err:
         return {"status": "error", "message": (
             "iterator failed: %s") % err,
                 "exception": err.__class__.__name__}
-    total = len(entries)
-    page = entries[start:start + size]
     values = []
     for entry in page:
         try:
