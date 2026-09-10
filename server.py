@@ -753,6 +753,46 @@ def _snapshot_value_parm_types():
     return allowed
 
 
+# ---------------------------------------------------------------------------
+# perf-mcp-round3 §1：QTimer 轮询间隔（默认 10ms，env 可调）
+# ---------------------------------------------------------------------------
+# 2026-09-10 实测（生产 9876）：100ms 间隔让每条命令的完整非模型管道
+# 延迟恒定 ~110ms（命令平均等 ~50ms、最坏 ~100ms 才进派发），而
+# Houdini 端执行本身亚毫秒。默认收紧到 10ms；现场可用
+# HOUDINI_MCP_POLL_INTERVAL_MS 回退 / 调优（int、合法窗口 [1,1000]、
+# 非整数或越界回退默认并打日志）。
+#
+# 边界契约（specs/mcp-tools「命令派发轮询间隔」）：
+# - 每 tick ``_process_server`` 内 ``while True`` 排空接收缓冲中全部
+#   完整帧逐条同步执行——排队命令不逐条各付一个轮询周期，本改动不碰；
+# - 帧协议 / sendall 阻塞切换 / 恶意前缀断连等 TCP 出入站契约零改动；
+# - headless_host.py 复用本类，共享同一间隔（其独立 1000ms idle 看门狗
+#   不受影响）。
+_DEFAULT_POLL_INTERVAL_MS = 10
+_POLL_INTERVAL_MIN_MS = 1
+_POLL_INTERVAL_MAX_MS = 1000
+
+
+def _poll_interval_ms():
+    """解析 HOUDINI_MCP_POLL_INTERVAL_MS；未设回默认 10，非法/越界回退 + 日志。"""
+    raw = os.environ.get("HOUDINI_MCP_POLL_INTERVAL_MS")
+    if raw is None:
+        return _DEFAULT_POLL_INTERVAL_MS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        print("HoudiniMCP: HOUDINI_MCP_POLL_INTERVAL_MS={0!r} 非整数，"
+              "回退默认 {1}ms".format(raw, _DEFAULT_POLL_INTERVAL_MS))
+        return _DEFAULT_POLL_INTERVAL_MS
+    if value < _POLL_INTERVAL_MIN_MS or value > _POLL_INTERVAL_MAX_MS:
+        print("HoudiniMCP: HOUDINI_MCP_POLL_INTERVAL_MS={0!r} 越界 [{1},{2}]，"
+              "回退默认 {3}ms".format(raw, _POLL_INTERVAL_MIN_MS,
+                                      _POLL_INTERVAL_MAX_MS,
+                                      _DEFAULT_POLL_INTERVAL_MS))
+        return _DEFAULT_POLL_INTERVAL_MS
+    return value
+
+
 class HoudiniMCPServer:
     MUTATING_COMMANDS = frozenset({
         "create_node", "modify_node", "delete_node", "set_material",
@@ -1008,7 +1048,8 @@ class HoudiniMCPServer:
 
             self.timer = QtCore.QTimer()
             self.timer.timeout.connect(self._process_server)
-            self.timer.start(100)
+            interval = _poll_interval_ms()
+            self.timer.start(interval)
 
             self.running = True
             self._last_activity = time.monotonic()
@@ -1017,7 +1058,8 @@ class HoudiniMCPServer:
             except Exception as callback_error:
                 print("HoudiniMCP 事件 callback attach 失败（不影响服务）: "
                       + str(callback_error))
-            print(f"HoudiniMCP server started on {self.host}:{self.port}")
+            print(f"HoudiniMCP server started on {self.host}:{self.port} "
+                  f"(poll interval {interval}ms)")
 
             # Bug C（PR 21）：启动时清理 > 7 天的过期截图 / 渲染目录。
             # 不抛异常（启动失败不影响 MCP 服务本身）。
