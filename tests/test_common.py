@@ -629,23 +629,8 @@ class FlattenParmTemplatesTests(unittest.TestCase):
 
 
 # ===========================================================================
-# Section M: ExecutionTimeoutError
-# ===========================================================================
-class ExecutionTimeoutErrorTests(unittest.TestCase):
-    def test_is_exception_subclass(self):
-        self.assertTrue(issubclass(cmn.ExecutionTimeoutError, Exception))
-
-    def test_carries_message(self):
-        err = cmn.ExecutionTimeoutError("timed out after 30s")
-        self.assertIn("timed out after 30s", str(err))
-
-    def test_can_be_raised_and_caught(self):
-        with self.assertRaises(cmn.ExecutionTimeoutError):
-            raise cmn.ExecutionTimeoutError("nope")
-
-
-# ===========================================================================
 # Section N: __all__ export contract
+#（Section M（超时异常）已随类移除：perf-mcp-round3 §4，主线程化后无调用方）
 # ===========================================================================
 class ExportContractTests(unittest.TestCase):
     def test_all_contains_expected_names(self):
@@ -669,10 +654,13 @@ class ExportContractTests(unittest.TestCase):
             "_add_response_metadata",
             "_json_safe_hou_value",
             "_flatten_parm_templates",
-            "ExecutionTimeoutError",
         }
         self.assertTrue(expected.issubset(set(cmn.__all__)),
                         "missing from __all__: " + str(expected - set(cmn.__all__)))
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 
 if __name__ == "__main__":

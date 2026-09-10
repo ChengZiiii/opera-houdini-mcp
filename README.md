@@ -34,6 +34,7 @@
 
 ## Features
 
+- **174 个已注册 MCP 工具**（perf-mcp-round3 §4.4 对账口径：`houdini_mcp_server.py` 中**活动**的 `@mcp.tool` 装饰器数，即 AI 工具 `tools/list` 可见数；另有 9 个工具的装饰器按 slim-mcp-toolset 计划注释停用——6 个 OPUS 资产 + 3 个 base64 渲染——不计入）
 - **13 个 Tier 1 工具** — 场景 CRUD / 节点发现 / 图编辑 / 错误扫描（含 warnings）/ 几何摘要 / 材质 / 截图 / 文档查询 / 缓存管理 / 诊断，独立模块化
 - **`execute_code` 三档安全 policy** — `read-only` / `normal` / `privileged` × dangerous / heavy / mutation 三类黑名单（正则 + AST 别名双检）
 - **双开关 bypass** — 任何 dangerous / heavy / privileged 操作都需「请求端参数 + 服务端 `HOUDINI_MCP_ALLOW_BYPASS=1`」同时开启

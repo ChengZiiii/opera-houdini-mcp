@@ -9,7 +9,6 @@
 - 列表分页 / 响应元数据补全
 - hou 对象的 JSON 安全递归序列化（含 hou.Ramp/Vector/Color/EnumValue 分支）
 - 参数模板扁平化辅助
-- ExecutionTimeoutError 异常
 
 约束：
 - 仅依赖 Python 3.12 标准库
@@ -50,7 +49,6 @@ __all__ = [
     "_add_response_metadata",
     "_json_safe_hou_value",
     "_flatten_parm_templates",
-    "ExecutionTimeoutError",
     "validate_policy",
     "_bypass_config_enabled",
     "check_execute_code_policy",
@@ -742,18 +740,9 @@ def _parm_type_name(tpl):
 
 
 # ---------------------------------------------------------------------------
-# Section 9: timeout exception
-# ---------------------------------------------------------------------------
-class ExecutionTimeoutError(Exception):
-    """执行超时时抛出；handler 捕获后转为 error dict。"""
-
-    def __init__(self, message="execution timed out"):
-        super().__init__(message)
-        self.message = message
-
-
-# ---------------------------------------------------------------------------
-# Section 10: execute_code policy / bypass / audit (PR 4)
+# Section 9: execute_code policy / bypass / audit (PR 4)
+#（原 Section 9「timeout exception」已移除：feat-mcp-round2 §1 主线程化
+#  后无生产调用方，perf-mcp-round3 §4 连导出一并清理）
 # ---------------------------------------------------------------------------
 _VALID_POLICIES = ("read-only", "normal", "privileged")
 _BYPASS_TRUTHY = {"1", "true", "yes", "on"}

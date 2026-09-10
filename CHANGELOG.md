@@ -35,7 +35,7 @@
 
 ### 计划中（按 PR 顺序）
 
-- [ ] PR 3 — `_common.py` 基础设施（handle_connection_errors / validate_resolution / apply_response_cap / DANGEROUS_PATTERNS / HEAVY_GEOMETRY_PATTERNS / MUTATION_PATTERNS / _detect_dangerous_code / _detect_heavy_geometry_code / _detect_import_hou / _truncate_output / paginate_list / _json_safe_hou_value / _flatten_parm_templates / ExecutionTimeoutError）
+- [ ] PR 3 — `_common.py` 基础设施（handle_connection_errors / validate_resolution / apply_response_cap / DANGEROUS_PATTERNS / HEAVY_GEOMETRY_PATTERNS / MUTATION_PATTERNS / _detect_dangerous_code / _detect_heavy_geometry_code / _detect_import_hou / _truncate_output / paginate_list / _json_safe_hou_value / _flatten_parm_templates；超时异常类已由 perf-mcp-round3 §4 移除）
 - [ ] PR 4 — `execute_code` 安全强化（policy / bypass 双开关 / AST 别名检测 / threading + timeout / undo 守护 / 结构化 audit / get_last_scene_diff）
 - [ ] PR 5 — `_scene.py`（get_scene_info / save_scene / load_scene / new_scene）
 - [ ] PR 6 — `_discovery.py`（NodeTypeCache / list_node_types / list_children / find_nodes / manage_cache）

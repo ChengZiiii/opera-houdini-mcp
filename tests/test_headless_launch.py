@@ -37,9 +37,23 @@ def _load_host():
 
 
 def _load_bridge():
+    # perf-mcp-round3 §4.3（套件隔离伪影复查）：本 loader 原先把
+    # fake mcp* / requests / dotenv / 合成 houdinimcp 包留在 sys.modules
+    # 且**不成对清理**——与 round2 requests.exceptions 残桩同型的泄漏，
+    # 是 test_render_workflow 等后续文件 del+reimport 真桥时偶发炸裂的
+    # 嫌疑源头。照 test_render_b64._load_bridge_with_stub_registry 的
+    # 已验证模式：加载完成后恢复 sys.modules 原条目、删除本次新建的
+    # stub 键。桥模块自身已在 import 时把 fake 引用绑定进自己的命名
+    # 空间（顶层 import，无懒加载），恢复不影响本文件既有测试。
+    _STUB_KEYS = ("mcp", "requests", "dotenv", "houdinimcp")
+
+    def _is_stub_key(key):
+        return (key in _STUB_KEYS
+                or any(key.startswith(k + ".") for k in _STUB_KEYS))
+
+    # stub 对象构造（无 sys.modules 副作用）
     package = types.ModuleType("houdinimcp")
     package.__path__ = [ROOT]
-    sys.modules["houdinimcp"] = package
 
     mcp = types.ModuleType("mcp")
     mcp_server = types.ModuleType("mcp.server")
@@ -87,21 +101,33 @@ def _load_bridge():
     fastmcp.Context = object
     mcp_server.fastmcp = fastmcp
     mcp.server = mcp_server
-    sys.modules["mcp"] = mcp
-    sys.modules["mcp.server"] = mcp_server
-    sys.modules["mcp.server.fastmcp"] = fastmcp
-
     requests = types.ModuleType("requests")
     requests.exceptions = types.SimpleNamespace(
         RequestException=Exception, HTTPError=Exception)
-    sys.modules["requests"] = requests
     dotenv = types.ModuleType("dotenv")
     dotenv.load_dotenv = lambda **kwargs: None
-    sys.modules["dotenv"] = dotenv
 
-    _load("houdinimcp._render_policy", os.path.join(ROOT, "_render_policy.py"))
-    return _load("houdini_mcp_server_test_module", os.path.join(
-        ROOT, "houdini_mcp_server.py"))
+    # 副作用段：sys.modules 写入 + 桥加载，finally 成对恢复
+    saved = {k: v for k, v in sys.modules.items() if _is_stub_key(k)}
+    try:
+        sys.modules["houdinimcp"] = package
+        sys.modules["mcp"] = mcp
+        sys.modules["mcp.server"] = mcp_server
+        sys.modules["mcp.server.fastmcp"] = fastmcp
+        sys.modules["requests"] = requests
+        sys.modules["dotenv"] = dotenv
+
+        _load("houdinimcp._render_policy", os.path.join(
+            ROOT, "_render_policy.py"))
+        return _load("houdini_mcp_server_test_module", os.path.join(
+            ROOT, "houdini_mcp_server.py"))
+    finally:
+        for key in list(sys.modules):
+            if key in saved:
+                continue
+            if _is_stub_key(key):
+                del sys.modules[key]
+        sys.modules.update(saved)
 
 
 def _load_capture_multiple_handler(pcp_result):

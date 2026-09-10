@@ -713,16 +713,40 @@ class StartRenderPolicyGateTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Section 6: bridge Layer 1 helper 与 batch preflight
 # ---------------------------------------------------------------------------
+def _import_real_bridge():
+    """del + reimport 真桥模块，带 stub 成对防护（§4.3 护栏）。
+
+    round2 已修 ``_load_server_module`` 的 requests 残桩泄漏；本文件
+    另有两处 setUpClass 直接 ``importlib.import_module`` 真桥
+    （houdini_mcp_server 顶层 import mcp / requests / dotenv），同样
+    可能吃到前序文件（historically test_headless_launch，round3 §4.3
+    已改为成对清理）留下的无 ``__file__`` fake。此处统一走本 helper：
+    import 前临时移除 fake（无 ``__file__`` 即 stub），finally 恢复——
+    真模块若已在 sys.modules 则原样保留。
+    """
+    if "houdini_mcp_server" in sys.modules:
+        del sys.modules["houdini_mcp_server"]
+    if ROOT not in sys.path:
+        sys.path.insert(0, ROOT)
+    saved_fakes = {}
+    for key in ("mcp", "mcp.server", "mcp.server.fastmcp",
+                "requests", "requests.exceptions", "dotenv"):
+        mod = sys.modules.get(key)
+        if mod is not None and not hasattr(mod, "__file__"):
+            saved_fakes[key] = sys.modules.pop(key)
+    try:
+        return importlib.import_module("houdini_mcp_server")
+    finally:
+        for key, value in saved_fakes.items():
+            sys.modules[key] = value
+
+
 class BridgeLayer1AdapterTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # bridge 模块必须 reload，否则 register_render_policy_command 幂等返回
         # 上次 session 的 adapter
-        if "houdini_mcp_server" in sys.modules:
-            del sys.modules["houdini_mcp_server"]
-        if ROOT not in sys.path:
-            sys.path.insert(0, ROOT)
-        cls.bridge = importlib.import_module("houdini_mcp_server")
+        cls.bridge = _import_real_bridge()
 
     def test_register_start_render_in_registry(self):
         self.assertIn("start_render",
@@ -1054,11 +1078,7 @@ class DirectTcpBatchLayer2Tests(unittest.TestCase):
 class MonitorRenderTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if "houdini_mcp_server" in sys.modules:
-            del sys.modules["houdini_mcp_server"]
-        if ROOT not in sys.path:
-            sys.path.insert(0, ROOT)
-        cls.bridge = importlib.import_module("houdini_mcp_server")
+        cls.bridge = _import_real_bridge()
 
     def test_posix_ps_filters_basename(self):
         # 模拟 ps 输出
