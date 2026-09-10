@@ -2702,7 +2702,12 @@ class HoudiniMCPServer:
             run_over_token = self._set_run_over(node, run_over)
             if input_node:
                 node.setInput(0, self._resolve_node(input_node))
-            node.moveToGoodPosition()
+            # fxhoudinimcp #37 同款坑：moveToGoodPosition 三个 move_*
+            # 参数默认 True，放置一个新节点会把用户已连接/未连接的既有
+            # 节点一起拖走。pin 为 False，只摆这一个新节点。
+            node.moveToGoodPosition(
+                move_inputs=False, move_outputs=False,
+                move_unconnected=False)
         except Exception:
             node.destroy()  # don't leave a half-configured node behind
             raise
