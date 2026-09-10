@@ -791,6 +791,25 @@ class FourLayerEnforceRegressionTests(unittest.TestCase):
                 cmd, {"render_engine": "mantra", "renderer": "mantra"})
             self.assertIsNone(r)
 
+    def test_start_render_background_true_policy_not_loosened(self):
+        """perf-mcp-round3 §5：background=True 不松动 Layer 1 policy——
+        karma 无 token 仍 interrupt、opengl 仍 redirect、mantra 仍放行
+        （adapter 只读 policy_renderer / consent_token）。"""
+        r = self.mod.evaluate_render_policy_command(
+            "start_render", {"policy_renderer": "karma_cpu",
+                             "background": True})
+        self.assertIsNotNone(r)
+        self.assertEqual(r["_interrupt"], "user_consent_required")
+        r = self.mod.evaluate_render_policy_command(
+            "start_render", {"policy_renderer": "opengl",
+                             "background": True})
+        self.assertIsNotNone(r)
+        self.assertEqual(r["_redirect"], "flipbook")
+        r = self.mod.evaluate_render_policy_command(
+            "start_render", {"policy_renderer": "mantra",
+                             "background": True})
+        self.assertIsNone(r)
+
     def test_render_policy_module_ast_has_four_layer_structure(self):
         """3.6：AST 断言四层 enforce 结构（register + 两个 adapter +
         evaluate）完整，housekeeping 未删 enforcement。"""

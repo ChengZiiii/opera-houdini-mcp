@@ -3168,9 +3168,11 @@ def monitor_render(ctx: Context) -> dict:
 
 @mcp.tool()
 def start_render(ctx: Context, node_path: str, policy_renderer: str,
-                  frame_range: List[float] = None,
-                  consent_token: str = None) -> dict:
-    """同步启动一次 ROP 渲染；四层防御见 ``_render_jobs.start_render``。
+                 frame_range: List[float] = None,
+                 consent_token: str = None,
+                 background: bool = False) -> dict:
+    """启动一次 ROP 渲染（缺省同步；``background=True`` 派生 detached
+    hython 子进程）；四层防御见 ``_render_jobs.start_render``。
 
     Args:
         node_path: 真实 ROP 节点路径（如 ``/out/mantra1``）。
@@ -3180,11 +3182,21 @@ def start_render(ctx: Context, node_path: str, policy_renderer: str,
         frame_range: 可选 2 或 3 元 ``[start, end[, inc]]``，缺省走
             ROP 自身设置。
         consent_token: 可选，karma 路径重调时携带。
+        background: 可选（perf-mcp-round3 §5）。``True`` 时四层 policy
+            全部 allow 后派生 **detached hython 子进程**渲染**磁盘上
+            已保存的 hip 快照**——H21 实测无 ``render(background=)`` /
+            ``renderThreaded`` / hscript 后台标志，异步只能真出进程。
+            前置要求 hip 已保存（未保存返回结构化 error 提示先
+            ``save_scene``）；MUST NOT 自动保存用户场景。成功响应
+            ``state="launched_background"`` + ``pid`` / ``log_path`` /
+            ``output_paths`` / ``monitor_hint``。``background`` 不参与
+            任何层 policy 判定（不影响 redirect / consent 语义）。
 
     Returns:
         dict: 直接 relay server 响应；blocked 时为 redirect / interrupt /
-        error 字典；正常完成时为 ``status=success`` 含
-        ``state / elapsed / frame_range``。
+        error 字典；同步完成时为 ``status=success`` 含
+        ``state / elapsed / frame_range``；background 启动成功时为
+        ``state="launched_background"``。
     """
     preflight = _rp.evaluate_render_policy_command(
         "start_render", {
@@ -3198,6 +3210,10 @@ def start_render(ctx: Context, node_path: str, policy_renderer: str,
         params["frame_range"] = list(frame_range)
     if consent_token is not None:
         params["consent_token"] = consent_token
+    if background:
+        # 仅在显式 True 时上链路：缺省 False 的 wire 格式与既有客户端
+        # 逐字节一致（server handler 端 background 缺省亦为 False）。
+        params["background"] = True
     return _houdini_call("start_render", params)
 
 

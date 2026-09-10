@@ -3526,8 +3526,8 @@ class HoudiniMCPServer:
             parameters=parameters)
 
     def handle_start_render(self, node_path, frame_range=None,
-                            consent_token=None):
-        """C9：同步启动 ROP 渲染（design.md §"start_render 四层防御"）。
+                            consent_token=None, background=False):
+        """C9：启动 ROP 渲染（design.md §"start_render 四层防御"）。
 
         入口为 server Layer 2：从真实 node 重新推断 policy renderer，
         不信任 bridge 传入值（bridge 提供的 ``policy_renderer`` 仅
@@ -3536,8 +3536,13 @@ class HoudiniMCPServer:
         ``_render_jobs.start_render`` 内部再次校验。任何 redirect /
         interrupt / error 立即 return，**不**调 ``node.render()``。
 
-        响应过 apply_response_cap。同步阻塞到 render 完成 / 失败 /
-        中断；不签发 progress handle。
+        ``background``（perf-mcp-round3 §5）MUST NOT 影响本层及任何
+        层 policy 判定，仅在四层全部 allow 后决定执行模式：False 同步
+        阻塞到 render 完成（现行为），True 派生 detached hython 子进程
+        渲染磁盘快照（``_render_jobs._render_node_background``）。
+
+        响应过 ``apply_response_cap``。同步路径不签发 progress
+        handle；background 路径不签发 job handle / registry / TTL。
         """
         # Layer 2：从真实 node 独立 infer + policy；client 给的 hint
         # 由 bridge Layer 1 处理，这里不接受。
@@ -3557,7 +3562,7 @@ class HoudiniMCPServer:
             return cmn.apply_response_cap(payload)
         return _rjobs.start_render(
             hou, node_path, frame_range=frame_range,
-            consent_token=consent_token)
+            consent_token=consent_token, background=background)
 
     # -------------------------------------------------------------------------
     # add-hda-management-tools：10 个 HDA/OTL handler（薄封装

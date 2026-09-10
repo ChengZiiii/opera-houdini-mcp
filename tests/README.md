@@ -40,6 +40,37 @@ uv sync          # 按 pyproject + uv.lock 安装（含 [dependency-groups] dev 
 - 真机 e2e / 手动 smoke **显式 opt-in**：
   `$env:HOUDINI_MCP_TEST_ALLOW_LIVE="1"` 后再跑，防护完全放行。
 
+### start_render background 模式（perf-mcp-round3 §5）
+
+H21.0.596 实测（2026-09-10 hython 直测）：`RopNode.render(background=True)`
+对 ifd / opengl / karmarender 三 ROP 类型全部 `TypeError`，且无
+`renderThreaded`、hscript `render` 无后台标志——**H21 没有任何会话内异步
+渲染 API，异步只能真出进程**（detached hython 子进程渲染磁盘快照）。
+
+用法（AI / 客户端工作流）：
+
+```
+save_scene                                   # 前置：hip 必须已保存
+start_render(node_path, policy_renderer,
+             frame_range=[...], background=True)
+# 返回 state="launched_background" + pid + log_path + output_paths
+monitor_render                               # bridge-only，观察 husk/mantra 孙进程
+# 完成确认：output_paths 文件存在 + log_path 不再增长
+```
+
+- 未保存（untitled）场景返回结构化 error `background_requires_saved_hip`
+  （提示先 `save_scene`；background 渲染的是最后一次保存的快照，MUST NOT
+  自动保存用户场景）。
+- `background` 不参与任何层 policy 判定：karma 无 token 仍 interrupt、
+  opengl 仍 redirect；仅在四层全部 allow 后决定执行模式。
+- 命令行注入安全：hip / 节点路径 / 帧范围以 `json.dumps` 字面量嵌入
+  `hython -c` 代码（ensure_ascii，纯 ASCII），任意引号 / 反斜杠 /
+  Unicode 均无法逃出字符串字面量。
+- 相关单测：`tests/test_render_background.py`（缺省回归逐 dict 相等 /
+  响应形状 + Popen detach 标志与日志句柄 / 未保存 hip 拒绝 / policy
+  不松动 / 注入安全 / 接线静态断言）+ `tests/test_render_policy.py`
+  （Layer 1 adapter background=True 参数化变体）。
+
 ### test_tools.py 手跑用法
 
 `test_tools.py` 是 standalone 集成脚本（import 期即执行完整集成场景），
