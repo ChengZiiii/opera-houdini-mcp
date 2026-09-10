@@ -290,6 +290,10 @@ def _attach_render_semantics(result, render_engine, karma_engine=None,
       flipbook / qscreen_fallback 属 _render_b64 视口截图路径）；
       karma 请求缺 saveImage 主机走截图回退时由 _render_b64 侧如实
       标注，MUST NOT 单独宣称 karma 已实际执行；
+      **policy redirect 响应**（缺 OGL 3.3 主机 opengl 强制改走视口
+      截图）同样适用：actual_backend 取 ``_redirect`` 目标值（如
+      ``flipbook``），不虚构未执行的 ROP 后端（2026-09-10 GUI 冒烟
+      实测发现 redirect 早返回漏挂语义字段后补）；
     - _cleanup_warning：finally 段清理失败描述（仅失败时附加）；
     - renderer：兼容字段，语义 = requested_renderer（docstring 明示）。
 
@@ -300,7 +304,13 @@ def _attach_render_semantics(result, render_engine, karma_engine=None,
     requested = _rp.render_engine_to_renderer(render_engine, karma_engine)
     result.setdefault("requested_renderer", requested)
     result.setdefault("renderer", requested)
-    result.setdefault("actual_backend", resolve_actual_backend(render_engine))
+    redirect_backend = result.get("_redirect")
+    if redirect_backend:
+        # redirect 响应：实际执行路径 = 重定向目标（flipbook /
+        # qscreen_fallback），请求的 ROP 后端并未运行
+        result.setdefault("actual_backend", str(redirect_backend))
+    else:
+        result.setdefault("actual_backend", resolve_actual_backend(render_engine))
     if cleanup_report:
         result["_cleanup_warning"] = "; ".join(
             str(item) for item in cleanup_report)
@@ -3172,7 +3182,11 @@ class HoudiniMCPServer:
                 "consent_token": consent_token,
             })
         if policy_result is not None:
-            return policy_result
+            # §2c：redirect/interrupt 响应同样携带语义字段（actual_backend
+            # = _redirect 目标，见 _attach_render_semantics；2026-09-10 GUI
+            # 冒烟发现此早返回漏挂后补）
+            return _attach_render_semantics(
+                policy_result, render_engine, karma_engine)
 
         # §2b：render_path 缺省 → 规范目录回退；显式传参行为不变
         if not render_path:
@@ -3227,7 +3241,11 @@ class HoudiniMCPServer:
                 "consent_token": consent_token,
             })
         if policy_result is not None:
-            return policy_result
+            # §2c：redirect/interrupt 响应同样携带语义字段（actual_backend
+            # = _redirect 目标，见 _attach_render_semantics；2026-09-10 GUI
+            # 冒烟发现此早返回漏挂后补）
+            return _attach_render_semantics(
+                policy_result, render_engine, karma_engine)
 
         # §2b：render_path 缺省 → 规范目录回退；显式传参行为不变
         if not render_path:
@@ -3293,7 +3311,11 @@ class HoudiniMCPServer:
                 "consent_token": consent_token,
             })
         if policy_result is not None:
-            return policy_result
+            # §2c：redirect/interrupt 响应同样携带语义字段（actual_backend
+            # = _redirect 目标，见 _attach_render_semantics；2026-09-10 GUI
+            # 冒烟发现此早返回漏挂后补）
+            return _attach_render_semantics(
+                policy_result, render_engine, karma_engine)
 
         # §2b：render_path 缺省 → 规范目录回退；显式传参行为不变
         if not render_path:

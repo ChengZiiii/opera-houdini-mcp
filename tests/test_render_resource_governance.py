@@ -612,6 +612,31 @@ class AttachRenderSemanticsTests(unittest.TestCase):
         self.assertEqual(result["actual_backend"], "opengl_rop")
         self.assertEqual(result["renderer"], "opengl")
 
+    def test_redirect_response_semantics(self):
+        """§2c（2026-09-10 GUI 冒烟补）：policy redirect 响应同样携带
+        语义字段；actual_backend 取 _redirect 目标（flipbook），MUST NOT
+        虚构未运行的 opengl_rop。"""
+        redirect = {"_redirect": "flipbook", "renderer": "opengl",
+                    "reason": "H21 缺 OGL 3.3", "fallback_tool":
+                    "capture_pane_screenshot"}
+        result = self.srv._attach_render_semantics(redirect, "opengl")
+        self.assertEqual(result["requested_renderer"], "opengl")
+        self.assertEqual(result["actual_backend"], "flipbook")
+        self.assertEqual(result["renderer"], "opengl")
+
+    def test_redirect_backend_wins_over_engine_mapping(self):
+        """redirect 目标与 engine 映射冲突时以 _redirect 为准。"""
+        redirect = {"_redirect": "qscreen_fallback"}
+        result = self.srv._attach_render_semantics(redirect, "karma", "cpu")
+        self.assertEqual(result["requested_renderer"], "karma_cpu")
+        self.assertEqual(result["actual_backend"], "qscreen_fallback")
+
+    def test_existing_actual_backend_not_clobbered_by_redirect(self):
+        """既有 actual_backend（如 _render_b64 侧已如实标注）不覆盖。"""
+        redirect = {"_redirect": "flipbook", "actual_backend": "flipbook"}
+        result = self.srv._attach_render_semantics(redirect, "opengl")
+        self.assertEqual(result["actual_backend"], "flipbook")
+
     def test_karma_cpu_mapping(self):
         result = self.srv._attach_render_semantics({}, "karma", "cpu")
         self.assertEqual(result["requested_renderer"], "karma_cpu")
