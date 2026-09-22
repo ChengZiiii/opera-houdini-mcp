@@ -488,6 +488,13 @@ _CACHE = OrderedDict()
 _LAST_GOOD = OrderedDict()
 _CACHE_LOCK = threading.Lock()
 
+# 正在解析中的 resolved path 集合（versioned-rag-index task 3.4：
+# warming fast-path 需区分「加载中」与「未加载」；与 _CACHE 同锁保护）。
+# 语义：任一线程处于 load_index 的 read+validate 窗口即视为 loading；
+# 双线程并发加载同一 path 最坏重复解析一次（design D4 接受），无正确性
+# 问题——成功写 cache 幂等。
+_LOADING = set()
+
 _CACHE_CAPACITY_DEFAULT = 8
 _CACHE_CAPACITY_MIN = 1
 _CACHE_CAPACITY_MAX = 128
@@ -640,6 +647,18 @@ def load_index(path=None):
         return {"state": "ok", "index": cached, "reason": "",
                 "path": resolved, "warning": ""}
 
+    # 加载窗口标记（cache_status 的 loading 判据；任何退出路径都释放）
+    with _CACHE_LOCK:
+        _LOADING.add(resolved)
+    try:
+        return _load_and_validate(resolved, key)
+    finally:
+        with _CACHE_LOCK:
+            _LOADING.discard(resolved)
+
+
+def _load_and_validate(resolved, key):
+    """read + validate + 写缓存（load_index 的加载窗口体）。"""
     try:
         with open(resolved, "r", encoding="utf-8") as handle:
             raw_text = handle.read()
@@ -677,6 +696,42 @@ def load_index(path=None):
     _last_good_put(resolved, index)
     return {"state": "ok", "index": index, "reason": "",
             "path": resolved, "warning": ""}
+
+
+def cache_status(path=None):
+    """查询索引缓存状态（**不触发 load**；versioned-rag-index task 3.4）。
+
+    供 bridge 侧 warming fast-path 判定（design D4：预热完成判定 MUST 不
+    依赖触发加载本身）。返回::
+
+        {"state": "loaded" | "loading" | "not_loaded",
+         "path": <resolved 绝对路径>, "file_exists": bool}
+
+    - ``loaded``：当前 (mtime_ns, size) key 已在进程内 cache（同参 load
+      会即时命中，可安全放行走正常检索）。
+    - ``loading``：有线程正处于该 path 的 read+validate 窗口。
+    - ``not_loaded``：其余（含文件不存在 / key 失效 / 从未加载）。
+    纯查询：stat 一次文件 + 两把锁内 dict 查找，绝不读文件内容。
+    """
+    try:
+        resolved = _index_path(path)
+    except RagIndexError:
+        return {"state": "not_loaded", "path": "", "file_exists": False}
+    with _CACHE_LOCK:
+        if resolved in _LOADING:
+            return {"state": "loading", "path": resolved,
+                    "file_exists": True}
+    try:
+        stat_result = os.stat(resolved)
+    except OSError:
+        return {"state": "not_loaded", "path": resolved,
+                "file_exists": False}
+    key = (resolved, stat_result.st_mtime_ns, stat_result.st_size)
+    with _CACHE_LOCK:
+        if key in _CACHE:
+            return {"state": "loaded", "path": resolved,
+                    "file_exists": True}
+    return {"state": "not_loaded", "path": resolved, "file_exists": True}
 
 
 # ---------------------------------------------------------------------------

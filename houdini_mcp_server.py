@@ -81,6 +81,13 @@ try:
 except ImportError:
     import _rag as _rag  # type: ignore
 
+# RAG 索引生命周期（versioned-rag-index §3）：版本路由/封存/自动构建/
+# 预热 gate——旁挂模块，不 import hou，经 _houdini_call 回调与 server 通信
+try:
+    from . import _rag_lifecycle as _raglc
+except ImportError:
+    import _rag_lifecycle as _raglc  # type: ignore
+
 try:
     from . import _hip_parser as _hip
 except ImportError:
@@ -982,7 +989,18 @@ def search_docs(ctx, query, limit: int = 10):
     score / 围绕首个命中位置的 snippet）。索引缺失返回
     rag_index_missing；损坏 / 不兼容返回 rag_index_unavailable；命中
     stale 缓存时附 _index_warning。响应整体过 apply_response_cap。
+
+    版本化生命周期（versioned-rag-index）：首次调用经 TCP 向 server 查
+    当前 Houdini 版本并路由到 ``rag/<ver>/`` 索引；缺失时后台自动构建
+    （envelope 附 ``building: true`` + ``eta_hint``，本轮回退
+    ``get_houdini_help``）；索引存在但预热未完时快速返回
+    ``warming_up: true``（不阻塞 bridge 事件循环）。
     """
+    gate = _raglc.pre_tool_gate(
+        tcp_call=_houdini_call,
+        response_cap_fn=getattr(cmn, "apply_response_cap", None))
+    if gate is not None:
+        return gate
     return _rag.search_docs(
         query=query, limit=limit,
         response_cap_fn=getattr(cmn, "apply_response_cap", None))
@@ -1006,7 +1024,16 @@ def get_doc(ctx, path):
     content（全文，过 apply_response_cap）、returned（1 命中 / 0 未命中）。
     path 不存在或非法返回 rag_doc_not_found；索引缺失 / 损坏分别返回
     rag_index_missing / rag_index_unavailable。
+
+    版本化生命周期（versioned-rag-index）：与 search_docs 同款 gate——
+    构建中返回 building envelope（附 path/content 空字段）、预热未完
+    返回 warming_up envelope。
     """
+    gate = _raglc.pre_tool_gate(
+        tcp_call=_houdini_call, path=path,
+        response_cap_fn=getattr(cmn, "apply_response_cap", None))
+    if gate is not None:
+        return gate
     return _rag.get_doc(
         path=path,
         response_cap_fn=getattr(cmn, "apply_response_cap", None))
