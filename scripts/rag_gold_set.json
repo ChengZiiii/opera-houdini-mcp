@@ -1,0 +1,242 @@
+[
+  {
+    "query": "how to scatter points onto a surface",
+    "gold": ["nodes.zip/sop/scatter.txt"],
+    "domain": "nodes",
+    "form": "natural",
+    "note": "典型 SOP 工作流查询；Scatter 节点文档",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "attribwrangle",
+    "gold": ["nodes.zip/sop/attribwrangle.txt"],
+    "domain": "nodes",
+    "form": "title",
+    "note": "节点 internal 名直查（索引把 #internal 回灌为检索键的形态）",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "cache simulation results to disk so i don't recook every time",
+    "gold": ["nodes.zip/sop/filecache.txt"],
+    "domain": "nodes",
+    "form": "natural",
+    "note": "File Cache；正文含 disk/caching 语义",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "jitter point positions with random offset",
+    "gold": ["nodes.zip/sop/pointjitter.txt"],
+    "domain": "nodes",
+    "form": "natural",
+    "note": "Point Jitter；随机抖动点位置",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "perlin style noise function in vex",
+    "gold": ["vex.zip/functions/pnoise.txt"],
+    "domain": "vex",
+    "form": "natural",
+    "note": "pnoise = Perlin-Style Noise 可简写函数",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "npoints",
+    "gold": ["vex.zip/functions/npoints.txt", "expressions.zip/npoints.txt"],
+    "domain": "vex",
+    "form": "title",
+    "note": "多 gold：同名符号在 vex 函数与 expression 两处成文，任一命中即 hit",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "read a point attribute value by index in vex",
+    "gold": ["vex.zip/functions/point.txt"],
+    "domain": "vex",
+    "form": "natural",
+    "note": "point() 函数按序号读点属性",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "remap a value from one range to another",
+    "gold": ["vex.zip/functions/fit.txt", "expressions.zip/fit.txt"],
+    "domain": "vex",
+    "form": "natural",
+    "note": "fit 族函数；vex/expression 双落点",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "hou.Node",
+    "gold": ["hom.zip/hou/Node.txt"],
+    "domain": "hom",
+    "form": "title",
+    "note": "tokenizer 对 hou.xxx API 整体保留的验证形态",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "python api for the playbar frame range",
+    "gold": ["hom.zip/hou/playbar.txt"],
+    "domain": "hom",
+    "form": "natural",
+    "note": "hou.playbar 文档",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "run hscript commands from python",
+    "gold": ["hom.zip/hou/hscript.txt"],
+    "domain": "hom",
+    "form": "natural",
+    "note": "hou.hscript 转换层文档",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "rand",
+    "gold": ["expressions.zip/rand.txt"],
+    "domain": "expressions",
+    "form": "title",
+    "note": "表达式函数名直查",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "expression to read a channel parameter value",
+    "gold": ["expressions.zip/ch.txt", "vex.zip/functions/ch.txt"],
+    "domain": "expressions",
+    "form": "natural",
+    "note": "ch() 双落点",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "count the number of points in the input geometry",
+    "gold": ["expressions.zip/npoints.txt", "vex.zip/functions/npoints.txt"],
+    "domain": "expressions",
+    "form": "natural",
+    "note": "与 vex/npoints 条目互为领域视角（查询文本不同、gold 允许重叠）",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "opcf",
+    "gold": ["commands.zip/opcf.txt"],
+    "domain": "commands",
+    "form": "title",
+    "note": "hscript 命令名直查（切换操作符目录）",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "print a message to the console from hscript",
+    "gold": ["commands.zip/echo.txt"],
+    "domain": "commands",
+    "form": "natural",
+    "note": "echo 命令",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "usd basics concepts overview",
+    "gold": ["solaris.zip/usd.txt"],
+    "domain": "solaris",
+    "form": "natural",
+    "note": "USD Basics 概念页（5-zip 索引缺失域——gold_missing 守卫探针）",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "bring sop geometry into the usd stage",
+    "gold": ["solaris.zip/sop_import.txt"],
+    "domain": "solaris",
+    "form": "natural",
+    "note": "SOP Import LOP 转 USD 流程",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "karma xpu",
+    "gold": ["solaris.zip/karma_xpu.txt", "solaris.zip/karma.txt"],
+    "domain": "solaris",
+    "form": "title",
+    "note": "XPU 渲染引擎（karma 主条目作次 gold）",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "how does pyro simulate smoke and fire",
+    "gold": ["pyro.zip/intro.txt", "pyro.zip/background.txt"],
+    "domain": "pyro",
+    "form": "natural",
+    "note": "Pyro 概览 + 工作原理双 gold",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "pyro simulation fields like velocity and temperature",
+    "gold": ["pyro.zip/background.txt"],
+    "domain": "pyro",
+    "form": "natural",
+    "note": "Understanding how pyro works：fields 一节",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "using pyro inside a compositing network",
+    "gold": ["pyro.zip/copintro.txt"],
+    "domain": "pyro",
+    "form": "natural",
+    "note": "Pyro in COPs",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "motion blur for fast moving objects",
+    "gold": ["render.zip/blur.txt"],
+    "domain": "render",
+    "form": "natural",
+    "note": "Motion Blur 概念页",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "automated batch rendering with hython in a pipeline",
+    "gold": ["render.zip/batch.txt"],
+    "domain": "render",
+    "form": "natural",
+    "note": "Rendering as part of a workflow（含 hython/hbatch）",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "how mantra raytraced shading works",
+    "gold": ["render.zip/bsdf.txt"],
+    "domain": "render",
+    "form": "natural",
+    "note": "Understanding Mantra raytraced shading（BSDF）",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "set up a cloth simulation workflow",
+    "gold": ["vellum.zip/clothsimulation.txt"],
+    "domain": "vellum",
+    "form": "natural",
+    "note": "Cloth simulation 流程页",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "create constraints while the simulation is running",
+    "gold": ["vellum.zip/dynamicconstraints.txt"],
+    "domain": "vellum",
+    "form": "natural",
+    "note": "Dynamic constraints",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "wedge variations of parameters into work items",
+    "gold": ["tops.zip/wedge.txt"],
+    "domain": "tops",
+    "form": "natural",
+    "note": "Wedging attributes",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "what are work item attributes",
+    "gold": ["tops.zip/attributes.txt"],
+    "domain": "tops",
+    "form": "natural",
+    "note": "Using attributes（TOP attributes ≈ point attributes 类比）",
+    "verified_on": "2026-09-22"
+  },
+  {
+    "query": "pdg.Scheduler",
+    "gold": ["tops.zip/pdg/Scheduler.txt"],
+    "domain": "tops",
+    "form": "title",
+    "note": "PDG Python class 直查",
+    "verified_on": "2026-09-22"
+  }
+]
