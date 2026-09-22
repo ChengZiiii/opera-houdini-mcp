@@ -699,6 +699,49 @@ def _snapshot_normalize_path(path):
     return resolved.replace("\\", "/").lower()
 
 
+def _resolve_hfs_path():
+    """解析 ``$HFS`` 绝对路径（versioned-rag-index task 2.1）。
+
+    供 ``get_scene_info`` 的 ``hfs_path`` 字段使用——bridge 侧无 hou 无
+    HFS，需经 TCP 拿到 server 权威的 HFS 路径来定位 help 源（自动构建
+    RAG 索引用）。三级回退：``hou.text.expandString`` →
+    ``hou.expandStringAt``（单参/双参两种 HOM 签名宽松尝试）→ ``HFS``
+    环境变量。Houdini 给出的可能是 8.3 短名（实测 ``C:/PROGRA~1/...``），
+    统一 ``realpath`` 归一为长名。全部失败返回 ``None``（调用方缺省该
+    字段，不抛错）。
+    """
+    try:
+        value = hou.text.expandString("$HFS")
+        if isinstance(value, str) and value.strip():
+            return _hfs_long_path(value)
+    except Exception:
+        pass
+    try:
+        try:
+            value = hou.expandStringAt("$HFS")
+        except TypeError:
+            value = hou.expandStringAt("$HFS", 0)
+        if isinstance(value, str) and value.strip():
+            return _hfs_long_path(value)
+    except Exception:
+        pass
+    try:
+        value = os.environ.get("HFS", "")
+        if value.strip():
+            return _hfs_long_path(value)
+    except Exception:
+        pass
+    return None
+
+
+def _hfs_long_path(value):
+    """8.3 短名 → 长名（realpath）；失败原样返回。"""
+    try:
+        return os.path.realpath(value) or value
+    except Exception:
+        return value
+
+
 def _snapshot_user_asset_definition(definition):
     """判定 definition 是否属于**用户数字资产**（非 Houdini 内建库）。
 
@@ -1867,6 +1910,11 @@ class HoudiniMCPServer:
                 "end_frame": scene_meta.get("end_frame", hou.playbar.frameRange()[1]),
                 "contexts": {},
             }
+            # versioned-rag-index task 2.1：HFS 路径（bridge 定位 help 源做
+            # 索引自动构建用）。解析失败时字段缺省（不抛错、不回空串误导）。
+            hfs_path = _resolve_hfs_path()
+            if hfs_path:
+                scene_info["hfs_path"] = hfs_path
 
             # Collect per-context node summaries (avoids expensive allSubChildren traversal)
             root = hou.node("/")
