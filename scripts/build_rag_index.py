@@ -9,11 +9,26 @@
 ## 源实况（2026-09-10 实机侦察，feat-mcp-round2-hardening §4a）
 
 H21 的 ``$HFS/houdini/help`` 下没有散装 HTML——文档以 **zip 打包的 wiki
-文本**发布（nodes.zip 4768 条 / vex.zip 1163 / hom.zip 939 /
-expressions.zip 475 / commands.zip 439，条目为 ``sop/adaptiveprune.txt``
-风格：``#type/#context`` 元数据 + ``= 标题 =`` + ``\"\"\"摘要\"\"\"`` +
-正文 + ``@parameters`` 段）。本脚本默认扫这 5 个核心 zip（``--zips`` 可
-参数化）；散装 HTML 目录扫描模式**保留**（超集，同一目录两者可混扫）。
+文本**发布（46 个内容 zip：nodes.zip 4768 条 / vex.zip 1163 / hom.zip
+939 / expressions.zip 475 / commands.zip 439 / solaris / pyro / render /
+vellum / tops 等，条目为 ``sop/adaptiveprune.txt`` 风格：
+``#type/#context`` 元数据 + ``= 标题 =`` + ``\"\"\"摘要\"\"\"`` + 正文 +
+``@parameters`` 段）。**默认扫全部内容 zip 减排除清单**（初始排除
+``images`` 纯图片包；versioned-rag-index task 1.1），``--zips`` 显式
+传参可覆盖；散装 HTML 目录扫描模式**保留**（超集，可混扫）。
+
+## 构建状态与锁（versioned-rag-index tasks 1.1 / 3.3）
+
+- 输出目录内维护 ``build.status.json``（原子写）：字段 ``state``
+  （building/done/failed）/ ``started_at`` / ``finished_at`` / ``pid`` /
+  ``exit_code`` / ``error`` / ``zips``（本次 zip 全名集）/ ``doc_count``
+  / ``source_path``；额外可选 ``zip_entry_failures``（异常 zip 统计，
+  task 1.2）。bridge 侧 ``_rag_lifecycle.py`` 依赖该文件做防并发与
+  完成检测。
+- **锁清理契约**：bridge 触发自动构建前会在输出目录独占创建
+  ``build.lock``；本脚本退出时（无论成败）best-effort 移除该锁文件。
+- ``--version-dir <ver>``（task 1.3）：输出落到 ``<output>/<ver>/``
+  子目录（版本化布局）；不传则保持平铺（手工用法兼容）。
 
 wiki 文本解析规则（``parse_wiki_text``）：
 - ``#key: value`` 元数据行：剥出正文；``#context`` / ``#internal`` /
@@ -37,19 +52,25 @@ doc path（索引内稳定 POSIX 标识）：zip 条目用 ``<zip 名>/<entry �
 - 源优先级：``--source`` > ``HOUDINI_MCP_RAG_SOURCE`` >
   ``$HFS/houdini/help``。
 - 输出优先级：``--output`` > ``HOUDINI_MCP_RAG_INDEX_DIR`` >
-  ``~/.opera-houdini-mcp/rag/``（**不得**默认写入 git submodule 目录）。
+  ``~/.opera-houdini-mcp/rag/``（**不得**默认写入 git submodule 目录）；
+  ``--version-dir`` 在其下再落 ``<ver>/`` 子目录。
 - 构建 documents/postings/avgdl/document_count，全文内嵌 JSON；
   ``json.dump`` 流式写句柄（不一次性物化整串）；postings 逐 term
-  ``popitem`` 转换释放中间 dict（峰值 ≈ 单份结构）。
+  ``popitem`` 转换释放中间 dict（峰值 ≈ 单份结构）。索引顶层附加
+  ``zips``（实际入库 zip 全名集，供 eval 可比性指纹使用）。
+- 异常 zip 统计（task 1.2）：单条目读取/解码失败只计数不中断（防单点
+  坏条目拖垮全量构建）；整包打不开的 zip 单列。统计进 stderr 报告与
+  状态文件 ``zip_entry_failures`` 字段。
 - 原子发布（task 2.5）：同目录写唯一临时文件，flush + ``os.fsync()``
   后 ``os.replace()``；写入/替换失败保留旧索引并 best-effort 清临时
   文件。0 doc 时拒绝发布（保护既有索引）。
-- 源目录缺失时 graceful 退出并给出配置提示（task 2.6）。
+- 源目录缺失时 graceful 退出并给出配置提示（task 2.6）；此时未启动
+  构建，不写状态文件。
 
 运行示例：
     python external/houdinimcp/scripts/build_rag_index.py
     python build_rag_index.py --source "C:/Program Files/Side Effects \\
-        Software/Houdini 21.0.596/houdini/help"
+        Software/Houdini 21.0.596/houdini/help" --version-dir 21.0.596
     python build_rag_index.py --zips nodes,vex --output D:/rag
     hython external/houdinimcp/scripts/build_rag_index.py
 """
@@ -83,11 +104,37 @@ SKIP_TAGS = frozenset(("script", "style", "noscript"))
 TITLE_TAG = "title"
 INDEX_FILENAME = _rag.INDEX_FILENAME
 
-# 默认核心 zip 子集（H21 帮助包；--zips 可覆盖/扩展）
-DEFAULT_ZIP_NAMES = ("nodes", "vex", "hom", "expressions", "commands")
+# 默认 zip 集策略（versioned-rag-index task 1.1）：help 目录全部 *.zip 减
+# 排除清单。排除按 stem 小写比较；--zips 显式传参可整体覆盖。
+EXCLUDED_ZIP_STEMS = frozenset(("images",))  # 纯图片包，无文本
+
+# 构建状态文件 / 锁文件名（tasks 1.1 / 3.3；与 bridge _rag_lifecycle 协议）
+STATUS_FILENAME = "build.status.json"
+LOCK_FILENAME = "build.lock"
 
 # 默认输出目录（round2 §4a：不再默认写 fork 模块目录）
 DEFAULT_OUTPUT_DIRNAME = os.path.join(".opera-houdini-mcp", "rag")
+
+
+def discover_zip_names(source_root):
+    """默认 zip 集：``source_root`` 下全部 ``*.zip`` 减排除清单。
+
+    返回按名排序的 **含 .zip 后缀** 的 basename 列表（与 ``--zips``
+    显式传参统一形态，便于状态文件与 eval 指纹使用）；目录不可读返回
+    ``[]``。
+    """
+    try:
+        names = os.listdir(source_root)
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        if not name.lower().endswith(".zip"):
+            continue
+        if name[:-4].lower() in EXCLUDED_ZIP_STEMS:
+            continue
+        found.append(name)
+    return sorted(found)
 
 
 # ---------------------------------------------------------------------------
@@ -264,11 +311,12 @@ def find_zip_txt_entries(source_root, zip_names=None):
 
     返回 ``[(doc_path, zip_abs_path, entry_name), ...]``，按 doc_path
     稳定排序。``doc_path`` 为 ``<zip 文件名>/<entry 相对路径>`` 的稳定
-    POSIX 标识（如 ``nodes.zip/sop/attribwrangle.txt``）。zip 缺失 /
-    损坏时跳过该 zip（不抛）。
+    POSIX 标识（如 ``nodes.zip/sop/attribwrangle.txt``）。``zip_names``
+    为 ``None`` 时走默认发现（全部 zip 减排除清单，task 1.1）；zip
+    缺失 / 损坏时跳过该 zip（不抛）。
     """
     if zip_names is None:
-        zip_names = DEFAULT_ZIP_NAMES
+        zip_names = discover_zip_names(source_root)
     results = []
     source_root = os.path.abspath(source_root)
     for zname in zip_names:
@@ -315,14 +363,27 @@ def _index_one_text(doc_id, doc_path, title, body, documents, postings):
     return length
 
 
-def build_index(source_root, zip_names=None):
+def build_index(source_root, zip_names=None, stats=None):
     """扫描源（zip wiki 文本 + 散装 HTML 超集）并构造符合
     ``houdinimcp.rag-index`` v1 schema 的 dict。
 
     doc id 按合并后 path 排序分配（确定性）；zip 逐包打开一次流式处理
     entry（不重复解压索引结构）；postings 逐 term popitem 转换释放中间
     dict，``json.dump`` 由 publish 阶段流式写盘。
+
+    ``stats``（可选 dict，调用方原地收集，task 1.2 异常 zip 统计）：
+    - ``entry_failures``：``{zip 名: 读取/解码失败条目数}``——单条目
+      失败只计数不中断整体构建。
+    - ``bad_zips``：整包打不开（缺失/损坏）的 zip 名列表。
+    - ``indexed_zips``：实际产出 >=1 个文档的 zip 全名集（进索引顶层
+      ``zips`` 字段，供 eval 可比性指纹）。
     """
+    if stats is None:
+        stats = {}
+    stats.setdefault("entry_failures", {})
+    stats.setdefault("bad_zips", [])
+    stats.setdefault("indexed_zips", set())
+
     zip_entries = find_zip_txt_entries(source_root, zip_names)
     html_files = find_html_files(source_root)
 
@@ -345,12 +406,23 @@ def build_index(source_root, zip_names=None):
                     zf = zipfile.ZipFile(zip_abs)
                 except (OSError, zipfile.BadZipFile, RuntimeError):
                     zf = None
+                    # find_zip_txt_entries 已能列出条目说明目录项完好，
+                    # 此处整包打不开属异常 zip：记名、跳过、不中断
+                    zip_base = os.path.basename(zip_abs)
+                    if zip_base not in stats["bad_zips"]:
+                        stats["bad_zips"].append(zip_base)
                 current_zip = zip_abs
             if zf is None:
                 continue
             try:
                 text = zf.read(entry).decode("utf-8", "replace")
-            except (OSError, KeyError, RuntimeError):
+            except Exception:
+                # 单条目失败：计数不中断（task 1.2）。宽捕获是有意的——
+                # 损坏条目可能抛 BadZipFile（坏 CRC）/ zlib.error /
+                # KeyError / OSError 等多种类型，逐一列举必漏。
+                zip_base = os.path.basename(zip_abs)
+                stats["entry_failures"][zip_base] = (
+                    stats["entry_failures"].get(zip_base, 0) + 1)
                 continue
             title, body = parse_wiki_text(text)
             if not title:
@@ -360,6 +432,7 @@ def build_index(source_root, zip_names=None):
                 title = stem[:-4] if stem.lower().endswith(".txt") else stem
             total_length += _index_one_text(
                 doc_id, doc_path, title, body, documents, postings)
+            stats["indexed_zips"].add(doc_path.split("/", 1)[0])
             doc_id += 1
             zip_doc_count += 1
     finally:
@@ -399,8 +472,11 @@ def build_index(source_root, zip_names=None):
         "source": "build_rag_index.py from {0} (zips={1}, zip_docs={2}, "
                   "html_docs={3})".format(
                       os.path.abspath(source_root),
-                      ",".join(zip_names) if zip_names else "",
+                      ",".join(sorted(stats["indexed_zips"])),
                       zip_doc_count, html_doc_count),
+        # 实际入库 zip 全名集（versioned-rag-index：eval 可比性指纹用；
+        # loader 对未知顶层字段宽容忽略）
+        "zips": sorted(stats["indexed_zips"]),
         "document_count": document_count,
         "avgdl": avgdl,
         "documents": documents,
@@ -483,13 +559,100 @@ def publish_index(index, index_dir):
 
 
 # ---------------------------------------------------------------------------
-# CLI（round2 §4a：--source / --output / --zips）
+# 构建状态文件与锁清理（versioned-rag-index tasks 1.1 / 3.3）
+# ---------------------------------------------------------------------------
+def _utc_now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def write_build_status(status_dir, payload):
+    """原子写 ``<status_dir>/build.status.json``（temp + ``os.replace``）。
+
+    状态文件是 bridge 防并发/完成检测的依据：内容必须始终完整可解析，
+    绝不出现半写状态（原子替换保障）。
+    """
+    if not os.path.isdir(status_dir):
+        os.makedirs(status_dir, exist_ok=True)
+    final_path = os.path.join(status_dir, STATUS_FILENAME)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".build.status.", suffix=".tmp", dir=status_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, final_path)
+    except OSError:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+    return final_path
+
+
+def _write_status_best_effort(status_dir, payload):
+    """状态写失败不杀构建本身：警告后继续（索引可用性优先于可观测性）。"""
+    try:
+        write_build_status(status_dir, payload)
+    except OSError as exc:
+        sys.stderr.write(
+            "build_rag_index: write status failed ({0}): {1}\n".format(
+                status_dir, exc))
+
+
+def _remove_build_lock(index_dir):
+    """构建退出契约：best-effort 移除 bridge 预建的独占锁文件。
+
+    无论成败，本脚本退出时都应释放锁，让 bridge 的二次探测能推进。
+    """
+    lock_path = os.path.join(index_dir, LOCK_FILENAME)
+    try:
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+    except OSError:
+        pass
+
+
+def _sanitize_version_dir(value):
+    """校验 ``--version-dir``：非空、单段、无分隔符（防路径逃逸）。"""
+    if value is None:
+        return None
+    ver = str(value).strip()
+    if not ver:
+        return None
+    if "/" in ver or "\\" in ver or ver in (".", ".."):
+        raise ValueError(
+            "--version-dir must be a single path segment, got: {0!r}".format(
+                value))
+    return ver
+
+
+# ---------------------------------------------------------------------------
+# CLI（round2 §4a：--source / --output / --zips；
+#      versioned-rag-index：默认全量 zip + --version-dir + 状态文件）
 # ---------------------------------------------------------------------------
 def _parse_zips(value):
+    """``--zips`` 解析：``None``/空 → 返回 ``None``（= 默认发现全部 zip）。"""
     if value is None:
-        return list(DEFAULT_ZIP_NAMES)
+        return None
     names = [part.strip() for part in str(value).split(",") if part.strip()]
-    return names if names else list(DEFAULT_ZIP_NAMES)
+    return names or None
+
+
+def _normalize_zip_names(names):
+    """统一为含 ``.zip`` 后缀的 basename（状态文件/指纹形态）。"""
+    out = []
+    for name in names:
+        base = str(name).strip()
+        if not base:
+            continue
+        if not base.lower().endswith(".zip"):
+            base = base + ".zip"
+        out.append(base)
+    return out
 
 
 def main(argv=None):
@@ -506,36 +669,113 @@ def main(argv=None):
     parser.add_argument(
         "--zips", default=None,
         help="comma-separated zip basenames under the source dir "
-             "(default: %s)" % ",".join(DEFAULT_ZIP_NAMES))
+             "(default: ALL *.zip under source minus exclusion list "
+             "{images})")
+    parser.add_argument(
+        "--version-dir", default=None,
+        help="optional version subdirectory: output lands in "
+             "<output>/<version-dir>/ (e.g. 21.0.596); flat layout when "
+             "omitted (manual usage compatible)")
     args = parser.parse_args(argv)
 
-    zip_names = _parse_zips(args.zips)
+    # 版本段校验（单段路径，防拼接逃逸）
+    try:
+        version_dir = _sanitize_version_dir(args.version_dir)
+    except ValueError as exc:
+        sys.stderr.write("build_rag_index: {0}\n".format(exc))
+        return 2
+
     source = resolve_source(args.source)
     if source is None:
+        # 未启动构建：不写状态文件（bridge 侧不应看到 building）
         sys.stderr.write(
             "build_rag_index: no help source found.\n"
             "Pass --source <dir>, or set HOUDINI_MCP_RAG_SOURCE, or run "
             "inside hython (HFS set).\n")
         return 2
+
+    zip_names = _parse_zips(args.zips)
+    if zip_names is None:
+        zip_names = discover_zip_names(source)
+        if not zip_names:
+            sys.stderr.write(
+                "build_rag_index: no *.zip found under {0} (exclusion "
+                "list: {1}); nothing to index.\n".format(
+                    source, ",".join(sorted(EXCLUDED_ZIP_STEMS))))
+            return 2
+    zips_field = _normalize_zip_names(zip_names)
+
     index_dir = resolve_index_dir(args.output)
-    sys.stderr.write("build_rag_index: scanning {0} (zips: {1})\n".format(
-        source, ",".join(zip_names)))
-    index = build_index(source, zip_names)
-    if index["document_count"] <= 0:
-        # 0 doc 多为源配置错误：拒绝发布，保护既有索引
-        sys.stderr.write(
-            "build_rag_index: 0 documents indexed (no matching zips or "
-            "html under source); refusing to publish.\n")
-        return 4
+    if version_dir:
+        index_dir = os.path.join(index_dir, version_dir)
+
+    # 状态文件：building 起手（字段清单三层统一：state/started_at/
+    # finished_at/pid/exit_code/error/zips/doc_count/source_path）
+    status = {
+        "state": "building",
+        "started_at": _utc_now_iso(),
+        "finished_at": None,
+        "pid": os.getpid(),
+        "exit_code": None,
+        "error": None,
+        "zips": zips_field,
+        "doc_count": None,
+        "source_path": os.path.abspath(source),
+    }
+    _write_status_best_effort(index_dir, status)
+
+    exit_code = 0
+    stats = {}
     try:
-        final_path = publish_index(index, index_dir)
+        sys.stderr.write("build_rag_index: scanning {0} ({1} zips)\n".format(
+            source, len(zips_field)))
+        index = build_index(source, zip_names, stats=stats)
+        if index["document_count"] <= 0:
+            # 0 doc 多为源配置错误：拒绝发布，保护既有索引
+            sys.stderr.write(
+                "build_rag_index: 0 documents indexed (no matching zips or "
+                "html under source); refusing to publish.\n")
+            status.update(state="failed", exit_code=4,
+                          error="0 documents indexed; refusing to publish",
+                          finished_at=_utc_now_iso())
+            exit_code = 4
+        else:
+            final_path = publish_index(index, index_dir)
+            sys.stderr.write(
+                "build_rag_index: wrote {0} ({1} docs, avgdl={2:.1f})\n"
+                .format(final_path, index["document_count"],
+                        index["avgdl"]))
+            status.update(state="done", exit_code=0,
+                          doc_count=index["document_count"],
+                          finished_at=_utc_now_iso())
     except OSError as exc:
         sys.stderr.write("build_rag_index: publish failed: {0}\n".format(exc))
-        return 3
-    sys.stderr.write(
-        "build_rag_index: wrote {0} ({1} docs, avgdl={2:.1f})\n".format(
-            final_path, index["document_count"], index["avgdl"]))
-    return 0
+        status.update(state="failed", exit_code=3, error=str(exc),
+                      finished_at=_utc_now_iso())
+        exit_code = 3
+    except Exception as exc:  # 意外异常也要落 failed（bridge 依赖状态推进）
+        sys.stderr.write("build_rag_index: unexpected failure: {0}\n".format(
+            exc))
+        status.update(
+            state="failed", exit_code=1,
+            error="{0}: {1}".format(type(exc).__name__, exc),
+            finished_at=_utc_now_iso())
+        exit_code = 1
+    finally:
+        # 异常 zip 统计（task 1.2）：进状态文件 + stderr 报告
+        if stats.get("entry_failures") or stats.get("bad_zips"):
+            status["zip_entry_failures"] = {
+                "entry_failures": stats.get("entry_failures", {}),
+                "bad_zips": stats.get("bad_zips", []),
+            }
+            sys.stderr.write(
+                "build_rag_index: anomalous zips: entry_failures={0} "
+                "bad_zips={1}\n".format(
+                    stats.get("entry_failures", {}),
+                    stats.get("bad_zips", [])))
+        _write_status_best_effort(index_dir, status)
+        _remove_build_lock(index_dir)
+    return exit_code
 
 
 if __name__ == "__main__":

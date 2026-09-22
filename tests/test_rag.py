@@ -1082,12 +1082,26 @@ class ZipSourceBuildTests(unittest.TestCase):
             self.tmp.name.replace("\\", "/") + "/.opera-houdini-mcp/rag")
 
     def test_main_refuses_zero_docs(self):
-        # 0 doc 拒绝发布（保护既有索引），exit 4
+        # 0 doc 拒绝发布（保护既有索引），exit 4。versioned-rag-index 后
+        # 默认 zip 集走发现：目录里要有 zip（但无 .txt 条目）才会真正
+        # 启动构建并落到 0-doc 拒绝分支；完全无 zip 是 exit 2（未启动）。
+        empty = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
+        with zipfile.ZipFile(os.path.join(empty, "hollow.zip"), "w") as zf:
+            zf.writestr("readme.md", "no txt entries")
+        rc = build_mod.main(["--source", empty,
+                             "--output", os.path.join(empty, "out")])
+        self.assertEqual(rc, 4)
+        self.assertFalse(os.path.exists(
+            os.path.join(empty, "out", rag.INDEX_FILENAME)))
+
+    def test_main_no_discoverable_zips_is_exit_2(self):
+        # versioned-rag-index task 1.1：无可发现 zip → 不启动构建，exit 2
         empty = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
         rc = build_mod.main(["--source", empty,
                              "--output", os.path.join(empty, "out")])
-        self.assertEqual(rc, 4)
+        self.assertEqual(rc, 2)
         self.assertFalse(os.path.exists(
             os.path.join(empty, "out", rag.INDEX_FILENAME)))
 
