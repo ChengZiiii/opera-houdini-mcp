@@ -234,6 +234,83 @@ POSIX 前导 `/`、UNC `\\server\share`、前导 `\`）。绝对路径支持团�
 
 ---
 
+## RAG 文档检索与版本化索引
+
+`search_docs` / `get_doc`（BM25 跨文档检索）面向「跨文档主题检索」，与
+`get_houdini_help` / `verify_hou_api`（单条 API 结构化查询）互补。索引产物按
+**Houdini 版本隔离**（`versioned-rag-index`）：多版本共存互不覆盖，Houdini 升级后
+自动为新版本构建全量索引。
+
+**双进程架构**（检索与路由全部在 bridge 进程，env 不跨进程边界）：
+
+```
+AI 客户端 ──stdio── bridge（houdini_mcp_server.py + _rag.py + _rag_lifecycle.py）
+                      │  无 hou、无 HFS；LRU/BM25/预热都在此进程
+                      │  版本路由：TCP 查 get_scene_info（hou_version + hfs_path）
+                      │            → 进程内设 HOUDINI_MCP_RAG_INDEX_DIR
+                      └──TCP 9876── server（server.py，Houdini GUI 进程，import hou）
+```
+
+**目录布局**（个人目录，不入 git）：
+
+```
+~/.opera-houdini-mcp/rag/
+├── 21.0.596/                # 每个 Houdini 版本一个目录，互不干扰
+│   ├── index.v1.json        # 全量索引（H21：46 zip / 10,093 docs / 27.7 MB）
+│   ├── build.status.json    # 构建状态（state/started_at/finished_at/pid/...）
+│   └── eval/                # 评测报告落点（eval_rag.py 默认 out-dir）
+├── 22.0.100/                # H22 升级后首次使用时自动构建
+└── index.v1.json.legacy-5zip-20260909   # 旧 flat 索引封存（内容保留，不迁移）
+```
+
+**生命周期**（首次 RAG 工具调用时 lazy 触发，`_rag_lifecycle.py`）：
+
+1. **版本路由**：bridge 经 TCP 向 server 查 `get_scene_info` 取
+   `houdini_version` + `hfs_path` → 设 env 指向 `rag/<ver>/`（进程内一次，
+   粘滞）。server 不在线 → 回退 flat 解析序，30s 后重试；手工预设 env 则整体跳过。
+2. **封存**：rag 根存在旧 flat 索引且版本目录无索引 → 改名
+   `.legacy-5zip-20260909`（内容保留；它是 5-zip 局部快照，迁移等于把 11%
+   覆盖合法化）。幂等，失败仅警告。
+3. **自动构建**：版本目录无索引 → 独占 `build.lock` + 二次探测 → detached
+   无窗口子进程（bridge 内嵌 Python 3.12，`CREATE_NO_WINDOW`，零端口）跑
+   `scripts/build_rag_index.py --source $HFS/houdini/help --output <verdir>`；
+   状态文件 pid 探活 + 300s 龄期双判据防并发/自愈；H21 全量构建实测 ~7.5s。
+4. **预热**：daemon 线程 `load_index()`（27.7MB 加载 ~2.9s，绝不上事件循环——
+   FastMCP 同步工具直接跑在事件循环上）；构建完成后 watcher 自动 re-preheat。
+
+**envelope 语义**（只加字段不改签名，现有消费者零影响）：构建中 →
+`rag_index_missing` + `building: true` + `eta_hint`（本轮回退
+`get_houdini_help`）；预热未完 → `rag_index_warming_up` + `warming_up: true`
+（快速返回，不阻塞 bridge）。
+
+**eval 门禁**（`scripts/eval_rag.py` + `scripts/rag_gold_set.json`，随 submodule
+入库的 `scripts/rag_baseline.json` 为 H21 基线：MRR 0.4040 / hit@10 0.70）：
+
+```bash
+# 对任意索引评测（报告默认落 <index 目录>/eval/，Markdown+JSON）
+python scripts/eval_rag.py --index ~/.opera-houdini-mcp/rag/21.0.596/index.v1.json
+
+# 与基线对比（可比性指纹判定：gold hash 相同且 zip 差异仅新增才可比）
+python scripts/eval_rag.py --index <idx> --baseline scripts/rag_baseline.json
+
+# 新版本索引定新基线
+python scripts/eval_rag.py --index <idx> --write-baseline scripts/rag_baseline.json
+```
+
+门禁双层判据（整体 MRR 降幅 > 0.05 红 + RR 降幅 > 0.3 条目占比 ≥ 25% 红）+
+gold_missing 守卫（> 2 条或 > 10% 红）+ 双向告警（MRR 异常升高黄灯，污染/
+分母逃逸形态）；告警不阻断构建。**注意**：5-zip 旧索引的 MRR 与全量不可比
+（分母逃逸，实测 14/30 条 gold_missing 时 MRR 反而虚高）。
+
+手工构建（不依赖 bridge 自动链）：
+
+```bash
+python scripts/build_rag_index.py --source "$HFS/houdini/help" --version-dir 21.0.596
+# 默认 zip 集 = help 目录全部 *.zip 减排除清单（images）；--zips 可覆盖
+```
+
+---
+
 ## `execute_code` 安全模型
 
 | Policy | mutation | dangerous | heavy_geometry | import hou | 默认 bypass |
