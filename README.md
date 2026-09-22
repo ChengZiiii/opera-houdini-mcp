@@ -364,7 +364,7 @@ python scripts/build_rag_index.py --source "$HFS/houdini/help" --version-dir 21.
 | `HOUDINI_MCP_LOCAL_HELP_TIMEOUT` | `8.0` | 本地探测短超时（秒，clamp `[0.5, 60.0]`；fix-mcp-help-cap-protocol：2.5→8.0，H21 本地 ~1MB 页面实测需 6-8s） | `get_houdini_help` / `verify_hou_api` |
 | `HOUDINI_MCP_LOCAL_HELP_COOLDOWN` | `60` | 本地失败后 cooldown 窗口（秒，clamp `[0.0, 600.0]`） | `get_houdini_help` / `verify_hou_api` |
 | `HOUDINI_MCP_LOCAL_HELP_DISABLE` | 未设 | `1` / `true` / `yes` / `on` 时完全禁用 local-first，退化到"仅在线" | `get_houdini_help` / `verify_hou_api` |
-| `HOUDINI_MCP_RAG_INDEX_DIR` | `~/.opera-houdini-mcp/rag/` | RAG 索引目录覆盖；未设时解析序 home 目录（存在即用）→ 旧 fork 模块目录（兼容）。索引由 `scripts/build_rag_index.py` 生成（对 `$HFS/houdini/help` zip 帮助包实跑，命令见 `tests/README.md`） | `search_docs` / `get_doc` |
+| `HOUDINI_MCP_RAG_INDEX_DIR` | bridge 路由时自动设为 `~/.opera-houdini-mcp/rag/<ver>/` | RAG 索引目录覆盖；bridge 首次 RAG 调用时查 Houdini 版本自动指向版本目录（versioned-rag-index）；手工预设则整体跳过路由。未设且路由失败时解析序 home 目录（存在即用）→ 旧 fork 模块目录（兼容）。索引由 `scripts/build_rag_index.py` 生成（默认自动构建，手动命令见「RAG 文档检索与版本化索引」章节） | `search_docs` / `get_doc` |
 | `RAPIDAPI_KEY` | 未设 | OPUS 资产库 API key | `_opus.py` |
 | `RAPIDAPI_HOST` | `opus5.p.rapidapi.com` | OPUS API host | `_opus.py` |
 | `RAPIDAPI_HOST_URL` | `https://opus5.p.rapidapi.com/` | OPUS API base URL | `_opus.py` |
@@ -427,19 +427,21 @@ RAPIDAPI_KEY=<your-key>
 ## Testing
 
 ```bash
-# 单元测试（不依赖 Houdini）
-cd tests
-pytest test_common.py test_execute_code_safety.py test_help.py \
-       test_three_tier_fallback.py test_verify_hou_api.py
+# 全量回归（推荐入口；2026-09-22 口径：70 个测试文件 / 2230 passed / 0 failed）
+cd external/houdinimcp
+pytest tests/
 
-# Live smoke（依赖运行中的 Houdini 21+）
-pytest tests/h21_live_*.py
-
-# 完整回归
-pytest tests/phase5_full_regression.py
+# 单文件示例
+pytest tests/test_rag_lifecycle.py tests/test_rag_versioned.py
 ```
 
-测试基线：Houdini 21.0 + Python 3.11。详细 fixture / 共享 helper 见 `tests/conftest.py` 与 `tests/_e2e_helpers.py`。
+**防泄漏护栏（fixture 自动生效，无需手工设 env）**：`tests/conftest.py` 的 autouse
+fixture 默认把桥端口钉到死端口，测试**不会穿透真机 9876**；确需真机的手动 e2e
+必须显式 opt-in（`HOUDINI_MCP_TEST_ALLOW_LIVE=1 pytest tests/h21_live_*.py`）且
+先征得用户同意。注意 `search_docs` / `get_doc` 有遗留必填参数 `ctx`（体内未用，
+调用时传空串即可）。
+
+测试基线：Houdini 21.0 + Python 3.11。详细 fixture / 共享 helper 见 `tests/conftest.py` 与 `tests/_e2e_helpers.py`；历史专项回归 `tests/phase5_full_regression.py` 保留可用。
 
 ---
 
