@@ -75,6 +75,21 @@
 
 ---
 
+## 0.5.0-opera · 2026-09-26 · feat-mcp-console-log-audit + feat-mcp-tool-guidance（console 日志 / 命令审计 / AI 调用引导）
+
+> **状态**：已合入。openspec changes `feat-mcp-console-log-audit`（§1-§3）与 `feat-mcp-tool-guidance`（§1-§4）。
+
+- **Console 日志（server 侧，change A）**：`_console_log.py` tee 环形缓冲（默认 4000 行，`HOUDINI_MCP_CONSOLE_LOG_LINES`）包装 Python 层 `sys.stdout` / `sys.stderr`；`execute_code` 执行期输出经 `append_capture` 接口同步入缓冲（不绕 tee）；`HOUDINI_MCP_CONSOLE_LOG=0` 总开关。新工具 `get_console_log`（READ_ONLY，offset/limit/tail/last_seconds 分页，时间窗优先）+ `clear_console_log`（NO_UNDO，返回清空前条数）。覆盖边界：仅 Python 层（节点 PythonModule / execute_code / server 自身日志），C++ 层直写不在范围。
+- **命令审计（bridge 侧 JSONL，change A）**：`_audit_log.py` 包装 `ToolManager.call_tool`（含 protocol path 的 `list[TextContent]` 与 direct path 的 dict 双形态 `classify_result`），全部工具每次调用 append 一行 JSON 到 `$TEMP/houdini_mcp/audit/audit-<yyyymmdd>-<seq>.jsonl`（ts/session_id/tool/ok/duration_ms/args≤256，失败附 error_code/error_message）；空闲 15 分钟开新段、保留 30 段；落盘失败仅 warning 不影响调用；v1 只记录不重放。
+- **Tool annotations 三分类映射（change B）**：`_tool_annotations.py` 启动时后处理全部工具 `annotations`——server READ_ONLY 命令 → `readOnlyHint=true`（+idempotent）；破坏性 12 工具（delete_node / load_scene / new_scene / execute_houdini_code / hda 装缷 / cache 清写等）→ `destructiveHint=true`；其余变更类显式双 false。对账测试与 server 三分类双向守卫（含 7 对 bridge↔server 改名映射）。显式全量设置规避 mcp 1.12.2 `destructiveHint` 默认 true 坑。
+- **instructions 行为契约（change B）**：`initialize` 可见 instructions 重写为 ≤1200 字符四要点契约（专用工具优先 / execute_code 最后手段、verify_hou_api 前置、遇错先查 search_lessons/get_best_practices、渲染 start_render + capture_pane_screenshot 取证）。
+- **execute_code 失败引导（change B）**：`_exec_hint.py` 返回文本含 `hou.*` 异常模式（Traceback / Stderr 段）时追加 `_ai_hint:` 行（提取 API 名去重 ≤3 + verify 指引，零噪音门控）；会话计数达阈值（默认 5，`HOUDINI_MCP_EXEC_HINT_THRESHOLD`，0 关闭）起每次追加 `_hint:` 专用工具指引行。hint 为文本行追加，返回形态仍 str。
+- **描述全量瘦身 + lint（change B）**：全部工具 docstring 两层拆分——调用方信息留描述，实现备忘（PR 编号 / 设计史 / 路径怪癖）搬家函数体注释（信息搬家不裁剪）；`tests/test_tool_description_lint.py` 守卫 pattern 禁令（`PR \d` / issue 号 / change 代号 / `§`）+ 长度上限（默认 ≤1200，历史 8+12 工具更严特例）+ help 类首行触发时机 + 备忘搬家抽查（20 工具跨五批）。知识库工具按基线 spec 保留紧凑版注解关键词（主动沉淀触发 / 加深方法论 / 不替代）。
+- **执行链顺序**：`apply_tool_annotations(mcp)` → `_install_capture_hook()` → `install_audit_hook(mcp)`（audit 最外层，duration 覆盖全链）。
+- **工具数**：174 → 176（+get_console_log / clear_console_log）。基线：全量 pytest **2298 passed / 1 skipped / 0F**（74 测试文件）；hython 隔离实机 13/13（console log server 侧）；实机验收见主仓 CHECKPOINTS。
+
+---
+
 ## 0.4.0-opera · 2026-09-10 · feat-mcp-round2-hardening（主线程 execute_code / 渲染治理 / 知识库并发 / RAG 接线）
 
 > **状态**：已合入。openspec change `feat-mcp-round2-hardening`（§1-§4）。

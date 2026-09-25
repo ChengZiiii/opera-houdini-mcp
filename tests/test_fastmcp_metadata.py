@@ -92,12 +92,19 @@ class BridgeFastMcpConstructionTests(unittest.TestCase):
         self.assertIn("instructions", kwarg_names)
 
     def test_instructions_text_preserved(self):
-        """原 metadata 文本应完整保留在 instructions= 中。"""
+        """instructions 承载行为契约（feat-mcp-tool-guidance §1.3 重写）。
+
+        旧断言（OPUS 一句话 metadata）已由本 change 取代；完整契约断言
+        （四要点关键词 + ≤1200 字符 + initialize 可见性）在
+        tests/test_tool_guidance.py。这里只做轻量回归：文本含 Houdini 与
+        行为契约关键词。
+        """
         lit = _literal_kwargs(self.call)
         self.assertIn("instructions", lit)
         text = lit["instructions"]
         self.assertIn("Houdini", text)
-        self.assertIn("OPUS", text)
+        self.assertIn("execute_code", text)
+        self.assertIn("verify_hou_api", text)
 
 
 class McpInitializeProtocolTests(unittest.TestCase):

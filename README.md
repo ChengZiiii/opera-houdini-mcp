@@ -22,16 +22,17 @@
 5. [自进化知识库](#自进化知识库)
 6. [RAG 文档检索与版本化索引](#rag-文档检索与版本化索引)
 7. [Console 日志与命令审计](#console-日志与命令审计feat-mcp-console-log-audit)
-8. [`execute_code` 安全模型](#execute_code-安全模型)
-9. [AI 调用 hou API 的硬约束](#ai-调用-hou-api-的硬约束)
-10. [Configuration](#configuration)
-11. [Upstream Sync Policy](#upstream-sync-policy)
-12. [Testing](#testing)
-13. [Troubleshooting](#troubleshooting)
-14. [Edge Cases & 集成陷阱](#edge-cases--集成陷阱)
-15. [Contributing](#contributing)
-16. [Security](#security)
-17. [License & Acknowledgement](#license--acknowledgement)
+8. [AI 调用引导](#ai-调用引导feat-mcp-tool-guidance)
+9. [`execute_code` 安全模型](#execute_code-安全模型)
+10. [AI 调用 hou API 的硬约束](#ai-调用-hou-api-的硬约束)
+11. [Configuration](#configuration)
+12. [Upstream Sync Policy](#upstream-sync-policy)
+13. [Testing](#testing)
+14. [Troubleshooting](#troubleshooting)
+15. [Edge Cases & 集成陷阱](#edge-cases--集成陷阱)
+16. [Contributing](#contributing)
+17. [Security](#security)
+18. [License & Acknowledgement](#license--acknowledgement)
 
 ---
 
@@ -353,6 +354,50 @@ python scripts/build_rag_index.py --source "$HFS/houdini/help" --version-dir 21.
 
 ---
 
+## AI 调用引导（feat-mcp-tool-guidance）
+
+把「引导 AI 正确使用这套 MCP」内建到协议元数据与返回文本本身（用户工作区外
+AGENTS.md 不可控，MCP 必须自带行为契约）。四个机制：
+
+### Tool annotations（三分类映射）
+
+- `_tool_annotations.py` 在 bridge 启动时后处理全部工具的 `annotations`：
+  以 server 命令三分类为锚——READ_ONLY 工具 `readOnlyHint=true`（含
+  `idempotentHint=true`）；破坏性语义（节点删除 / 场景载入新建 / execute_code
+  变更档 / 磁盘清写类，12 个）`destructiveHint=true`；其余变更类显式
+  `readOnlyHint=false, destructiveHint=false`。
+- 对账测试双向守卫：annotations 注册表 ↔ server 三分类集合（含 7 对 bridge
+  工具名 ↔ server 命令名改名映射），任一侧增删都会红。
+- 规范语义：annotations 是对客户端的**提示而非安全边界**；权威执行层仍是
+  server 三分类 + render policy。
+
+### instructions 行为契约
+
+`initialize` 响应的 `instructions`（≤1200 字符）承载四要点：专用工具优先 /
+`execute_code` 最后手段、写 hou API 前先 `verify_hou_api`、遇错或第 2 次重试
+失败先查 `search_lessons` / `get_best_practices`、渲染走 `start_render` +
+截图取证用 `capture_pane_screenshot`。
+
+### execute_code 失败引导（`_ai_hint` / `_hint`）
+
+- 返回文本含 `hou.*` 异常模式（Traceback / Stderr 段）时，末尾追加
+  `_ai_hint:` 行——列出提取到的 API 名（去重 ≤3）+ `verify_hou_api` /
+  `get_houdini_help` 指引；无 `hou.*` 模式不追加（零噪音）。
+- 会话内 `execute_code` 调用达到阈值（默认 5）后每次返回追加 `_hint:` 行，
+  提示 `set_parameters` / `create_wrangle` / `connect_nodes` / `batch` 替代。
+  `HOUDINI_MCP_EXEC_HINT_THRESHOLD=0` 关闭。
+- hint 为**文本行追加**（返回仍为 str，不改 envelope 形态）。
+
+### 描述瘦身与 lint
+
+全部工具 description 两层拆分：调用方信息（何时用 / 参数 / 边界 / 失败先查
+什么）留 docstring；实现备忘（PR 编号 / 设计史 / 路径怪癖）搬家到函数体注释。
+`tests/test_tool_description_lint.py` 守卫：pattern 禁令（`PR \d` / issue 号 /
+change 代号 / `§`）+ 长度上限（默认 ≤1200 字符）+ help 类首行触发时机 +
+备忘搬家抽查（20 工具跨五批）。
+
+---
+
 ## `execute_code` 安全模型
 
 | Policy | mutation | dangerous | heavy_geometry | import hou | 默认 bypass |
@@ -412,6 +457,7 @@ python scripts/build_rag_index.py --source "$HFS/houdini/help" --version-dir 21.
 | `HOUDINI_MCP_AUDIT_DIR` | `$TEMP/houdini_mcp/audit` | 审计 JSONL 目录覆盖 | 全部工具（bridge 审计） |
 | `HOUDINI_MCP_AUDIT_KEEP` | `30` | 审计保留段数 | 全部工具（bridge 审计） |
 | `HOUDINI_MCP_AUDIT_SEGMENT_MIN` | `15` | 审计分段间隔（分钟） | 全部工具（bridge 审计） |
+| `HOUDINI_MCP_EXEC_HINT_THRESHOLD` | `5` | `execute_houdini_code` 会话计数达阈值后每次返回附 `_hint:` 专用工具指引行；`0` 关闭 | `execute_houdini_code` |
 | `RAPIDAPI_KEY` | 未设 | OPUS 资产库 API key | `_opus.py` |
 | `RAPIDAPI_HOST` | `opus5.p.rapidapi.com` | OPUS API host | `_opus.py` |
 | `RAPIDAPI_HOST_URL` | `https://opus5.p.rapidapi.com/` | OPUS API base URL | `_opus.py` |
@@ -474,7 +520,7 @@ RAPIDAPI_KEY=<your-key>
 ## Testing
 
 ```bash
-# 全量回归（推荐入口；2026-09-26 口径：72 个测试文件 / 2273 passed / 0 failed）
+# 全量回归（推荐入口；2026-09-26 口径：74 个测试文件 / 2298 passed / 0 failed）
 cd external/houdinimcp
 pytest tests/
 

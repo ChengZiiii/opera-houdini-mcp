@@ -113,6 +113,20 @@ try:
 except ImportError:
     import _audit_log as _alog  # type: ignore
 
+# tool annotations 注册表后处理（feat-mcp-tool-guidance §1）：以 server 命令
+# 三分类为锚批量设置 Tool.annotations；含 bridge 工具名 ↔ 命令名改名对。
+try:
+    from . import _tool_annotations as _tann
+except ImportError:
+    import _tool_annotations as _tann  # type: ignore
+
+# execute_code 失败路径引导（feat-mcp-tool-guidance §2）：_ai_hint + 计数
+# _hint，文本行追加、不改 str 返回形态。
+try:
+    from . import _exec_hint as _ehint
+except ImportError:
+    import _exec_hint as _ehint  # type: ignore
+
 # OPUS RapidAPI 可选模块（refactor-opus-optional-and-debt-cleanup）。
 # 容错加载：package 与 flat 两种布局均尝试；加载失败时仅五个委托给
 # ``_opus`` 的 wrapper 返回 module unavailable，``opus_import_model_url``
@@ -881,13 +895,26 @@ def get_houdini_connection() -> HoudiniConnection:
 
 
 # Now define the MCP server that Claude will talk to over stdio
+# instructions 为会话级行为契约（feat-mcp-tool-guidance §1.3，≤1200 字符）：
+# 使用侧 AI 多在 CsrLib 工作区之外，看不到工作区纪律（AGENTS.md），行为引导
+# 必须内建 MCP 自身——initialize 时 client-visible 注入四要点。历史文本
+# （OPUS 集成一句话）由 README「OPUS 集成（可选）」章节承接。
 mcp = FastMCP(
     "HoudiniMCP",
     # refactor-opus-optional-and-debt-cleanup：mcp 1.12.2 接收但忽略
     # ``description=``（不会成为 client-visible instructions）；mcp >=1.12.3
-    # 显式拒绝 ``description``。改用正式参数 ``instructions=``，使原 metadata
-    # 文本经 MCP initialize 协议对 client 可见，并消除升级时的构造错误。
-    instructions="A bridging server that connects Claude to Houdini via MCP stdio + TCP, with OPUS API integration."
+    # 显式拒绝 ``description``。改用正式参数 ``instructions=``，使契约文本
+    # 经 MCP initialize 协议对 client 可见，并消除升级时的构造错误。
+    instructions=(
+        "使用 Houdini 前先读：① 优先用专用工具（find_nodes / "
+        "get_parameter_schema / set_parameters / create_wrangle / "
+        "connect_nodes / batch 等），execute_code 仅在无专用工具覆盖时使用；"
+        "② 调 hou API 前先用 verify_hou_api 核对当前版本签名，不确定节点参数"
+        "先 get_parameter_schema；③ 遇报错或第 2 次重试失败：先 search_lessons "
+        "/ get_best_practices 查既往经验，再查 get_houdini_help / search_docs；"
+        "④ 渲染走 start_render（长任务 background=true），截图走 "
+        "capture_pane_screenshot。"
+    )
 )
 
 @asynccontextmanager
@@ -943,24 +970,23 @@ def unsubscribe_houdini_events(ctx, types=None):
 # -------------------------------------------------------------------
 @mcp.tool()
 def get_best_practices(ctx, query=None, category=None, id=None):
-    """查询 fork 人工审查的 BEST_PRACTICES advisory recipes（bridge-local）。
-
-    本工具 **不建立 Houdini TCP 连接**，直接在 bridge 进程内加载并查询
-    BEST_PRACTICES.md。recipe 是 advisory，不替代 verify_hou_api /
-    get_houdini_help，也不替代目标 Houdini 版本的 live verification。
+    """遇报错或第 2 次重试仍未解决时先查本工具——检索 fork 人工审查的
+    BEST_PRACTICES advisory recipes（bridge-local，**不建立 Houdini TCP
+    连接**，bridge 进程内直接加载查询）。advisory，不替代 verify_hou_api /
+    get_houdini_help 与目标 Houdini 版本的 live verification。
 
     参数说明：
     - query: 可选，对 problem/symptom/fix/category/source 做 casefold
       子串匹配。
     - category: 可选，精确匹配 category 字段。
     - id: 可选，精确匹配 recipe id（如 "BP-001"）。
-    多个参数组合为 AND。
+    多参数组合为 AND。
 
-    返回统一 envelope：status（success/error）、practices（实际返回列表）、
+    返回 envelope：status（success/error）、practices（实际返回列表）、
     total_indexed（过滤前索引数）、matched_count（过滤命中数）、
-    returned_count（cap 后实际返回数，恒等于 len(practices)）、truncated
-    （matched > returned 时为 true）。error 时 error={code,message,details}，
-    且 practices 为空、三个 count 为 0。响应整体过 apply_response_cap。
+    returned_count（恒等于 len(practices)）、truncated（matched >
+    returned 时 true）；error 时 practices 空、三计数为 0，error=
+    {code,message,details}。
     """
     return _bp.get_best_practices(
         query=query, category=category, bp_id=id,
@@ -977,31 +1003,19 @@ def get_best_practices(ctx, query=None, category=None, id=None):
 # -------------------------------------------------------------------
 @mcp.tool()
 def search_docs(ctx, query, limit: int = 10):
-    """跨 Houdini 文档做 BM25 检索（bridge-local，无 Houdini 连接）。
-
-    本工具 **不建立 Houdini TCP 连接**，直接在 bridge 进程内加载并查询
-    本地 RAG 索引（``index.v1.json``）。与 ``get_houdini_help`` /
-    ``verify_hou_api`` 互补：那两个面向单条 API / 节点的结构化查询
-    （local-help-first + 在线回退），本工具面向「跨文档主题检索」，
-    如「怎么搭 pyro 网络」「karma 采样设置」。
+    """「怎么搭 pyro 网络」这类跨文档主题问题先调本工具（bridge-local BM25
+    检索，无 Houdini 连接）；单条 API / 节点的结构化查询走 get_houdini_help
+    / verify_hou_api（local-help-first + 在线回退），与本工具互补。
 
     参数说明：
-    - query: 检索文本；tokenizer 会保留 hou.xxx() API 与 /obj/geo1 节点
-      路径整体语义，下划线复合词同时按完整与拆分匹配。
+    - query: 检索文本；tokenizer 保留 hou.xxx() API 与 /obj/geo1 节点路径
+      整体语义，下划线复合词同时按完整与拆分匹配。
     - limit: 可选，返回条目上限，clamp 到 [1, 50]，默认 10。
 
-    返回统一 envelope：status（success/error）、query、limit、matched
-    （response cap 前所有 BM25 正分文档总数）、returned（cap 后实际
-    results 长度，恒等于 len(results)）、results（每条含 path / title /
-    score / 围绕首个命中位置的 snippet）。索引缺失返回
-    rag_index_missing；损坏 / 不兼容返回 rag_index_unavailable；命中
-    stale 缓存时附 _index_warning。响应整体过 apply_response_cap。
-
-    版本化生命周期（versioned-rag-index）：首次调用经 TCP 向 server 查
-    当前 Houdini 版本并路由到 ``rag/<ver>/`` 索引；缺失时后台自动构建
-    （envelope 附 ``building: true`` + ``eta_hint``，本轮回退
-    ``get_houdini_help``）；索引存在但预热未完时快速返回
-    ``warming_up: true``（不阻塞 bridge 事件循环）。
+    返回 envelope：status / query / limit / matched / returned（恒等于
+    len(results)）/ results（每条含 path / title / score / 围绕首个命中位置
+    的 snippet）。索引缺失 → rag_index_missing；损坏/不兼容 →
+    rag_index_unavailable；命中 stale 缓存附 _index_warning。
     """
     gate = _raglc.pre_tool_gate(
         tcp_call=_houdini_call,
@@ -1142,38 +1156,36 @@ def search_lessons(ctx: Context, query, category=None, severity=None,
                    node_type=None, houdini_version=None, scope=None):
     """跨全部可用知识库 root 检索既往经验（published lessons + root recipes）。
 
-    触发时机：agent 在 Houdini 操作遇到报错、重试第 2 次仍未解决、或遇到
-    不认识的 API/参数时，先调用本工具检索既往经验；命中后用 read_lesson
-    拉全文。本工具是 advisory，不替代 verify_hou_api / get_houdini_help /
-    get_best_practices，也不替代目标 Houdini 版本的 live verification。
+    遇到报错、重试第 2 次仍未解决、或不认识 API/参数时先调本工具；命中后用
+    read_lesson 拉全文。advisory，不替代 verify_hou_api / get_houdini_help /
+    get_best_practices 与 live verification。
 
-    主动沉淀工作流（advisory 行为注解，非强制协议）：用户完成 HDA / 节点流
-    / VEX 工作流后说"沉淀这些知识"时，agent SHALL 依次：get_selection 定位
-    → capture_workflow_snapshot 取快照 → 组织为 recipe（用法文档，走
-    save_recipe）或 lesson（经验，走 save_lesson）→ 写入后向用户汇报写入的
-    id / root / 状态。
-
-    加深与研究方法论（advisory 引导，非强制）：用户要求"加深 / 改造 / 优化"
-    既有沉淀时，agent SHALL 先调用本工具定位既有 recipe/lesson id，再用
-    capture_workflow_snapshot（自制 HDA 带 include_hda_internals=True）
-    重新研究，最后 save_recipe(recipe_id=...) 原地更新，**不得新增重复
-    知识**。沉淀目标是原理 / 设计意图 / 为什么（方法论优先），参数按需收录
-    （用户显式要求除外）；正文索引用资产级标识（type_full / hda 资产全名 +
-    版本），实例名仅辅助，**禁止本机路径入正文**（HDA 库路径 / hip 完整
-    路径，团队知识库跨机器误导源）。
+    主动沉淀触发时机：用户说"沉淀这些知识"时依次 get_selection →
+    capture_workflow_snapshot → save_recipe（用法）/ save_lesson（经验）。
+    加深/改造既有沉淀：先本工具定位 id，再 save_recipe(recipe_id=...)
+    原地更新，不得新增一条重复知识；沉淀方法论为原理优先、正文禁
+    本机路径。
 
     参数说明：
     - query: 检索文本（可为空串 → 按新鲜度/priority 基线浏览）。
     - category / severity: 精确过滤（severity: low/medium/high/critical）。
     - node_type: doc 文本子串过滤（如 /obj/geo1、sop/attribwrangle）。
     - houdini_version: affected_versions 子串过滤（如 H21.0）。
-    - scope: 可选 root 名（如 "personal"）或 "all"；缺省检索全部 root。
+    - scope: 可选 root 名或 "all"；缺省检索全部 root。
 
-    返回统一 envelope：status/query/top_k/matched/returned_count/truncated/
-    results（紧凑摘要，含 source_root）/draft_suggestions；unavailable root
-    附 _warning。错误为 status=error + error={code,message,details}
-    （未知 scope → ls_unknown_root）。整体过 apply_response_cap。
+    返回 envelope：status/query/top_k/matched/returned_count/truncated/results
+    （紧凑摘要，含 source_root）/draft_suggestions；unavailable root 附
+    _warning。未知 scope → status=error + error.code=ls_unknown_root。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：
+    # - 主动沉淀工作流（advisory）：用户说"沉淀这些知识"时依次 get_selection
+    #   → capture_workflow_snapshot → save_recipe（用法）/ save_lesson（经验）
+    #   → 向用户汇报 id / root / 状态。
+    # - 加深方法论（advisory）：改造/优化既有沉淀时先本工具定位 id，再
+    #   capture_workflow_snapshot（自制 HDA 带 include_hda_internals=True）
+    #   重研，最后 save_recipe(recipe_id=...) 原地更新，不得新增重复知识；
+    #   沉淀目标为原理/设计意图，正文禁本机路径，资产用 type_full / hda
+    #   全名 + 版本索引，实例名仅辅助。
     try:
         result = _lessons_search.search_lessons(
             query=query, category=category, severity=severity,
@@ -1196,38 +1208,35 @@ def save_lesson(ctx: Context, problem, symptom, fix, category, severity,
                 affected_versions, verified_versions=None, root=None):
     """把解决一个 Houdini 问题的经验沉淀为 lesson（写入个人库 draft 状态）。
 
-    触发时机：agent 在解决一个 Houdini 问题后主动沉淀经验。写入个人库
-    draft 状态，不立即进入检索索引；同 symptom 再次出现会自动累积
-    strength（只累积不覆盖）。团队 root 默认只读，写入返回
-    root_not_writable。沉淀的是 advisory 经验，不替代 verify_hou_api /
-    get_houdini_help / get_best_practices 与目标 Houdini 版本 live
-    verification。
+    解决一个 Houdini 问题后主动沉淀时用本工具。写入 draft 不立即进检索索引；
+    同 symptom 再现自动累积 strength（只累积不覆盖）；团队 root 只读
+    （写返 root_not_writable）。
 
-    主动沉淀工作流（advisory 行为注解，非强制协议）：用户完成 HDA / 节点流
-    / VEX 工作流后说"沉淀这些知识"时，agent SHALL 依次：get_selection 定位
-    → capture_workflow_snapshot 取快照 → 组织为 recipe（用法文档，走
-    save_recipe）或 lesson（经验，走本工具）→ 写入后向用户汇报写入的
-    id / root / 状态。
-
-    加深与研究方法论（advisory 引导，非强制）：用户要求"加深 / 改造 / 优化"
-    既有沉淀时，agent SHALL 先 search_lessons 定位既有 id，再用
-    capture_workflow_snapshot（自制 HDA 带 include_hda_internals=True）
-    重新研究，最后 save_recipe(recipe_id=...) 原地更新（recipe 通道），
-    **不得新增重复知识**。沉淀目标是原理 / 设计意图 / 为什么（方法论优先），
-    参数按需收录（用户显式要求除外）；正文索引用资产级标识（type_full /
-    hda 资产全名 + 版本），实例名仅辅助，**禁止本机路径入正文**。
+    主动沉淀触发时机：用户说"沉淀这些知识"时依次 get_selection →
+    capture_workflow_snapshot → 组织为 recipe（用法，走 save_recipe）或
+    lesson（经验，走本工具）。加深/改造：先 search_lessons 定位 id 再
+    原地更新，不得新增一条重复知识；沉淀方法论为原理优先、正文禁
+    本机路径；advisory，不替代 verify_hou_api 与 live verification。
 
     参数说明：
     - problem / symptom / fix / category / affected_versions: 必填。
-    - severity: 必填，取值 low / medium / high / critical。
+    - severity: 必填，low / medium / high / critical。
     - verified_versions: 可选；缺省 "unknown"。
     - root: 可选 root 名；缺省 personal（唯一可写 root）。
 
     返回：新 lesson → {status:success, lesson_id, lesson_status:"draft",
     strength:1, root}；同 fingerprint 已存在 → strength 递增且内容保留。
-    错误为 status=error + error={code,message,details}（非法 severity →
-    ls_write_error 并列出合法值；只读团队 root → root_not_writable）。
+    非法 severity → ls_write_error；只读团队 root → root_not_writable。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：
+    # - 主动沉淀工作流（advisory）：用户说"沉淀这些知识"时依次 get_selection
+    #   → capture_workflow_snapshot → 组织为 recipe（用法，走 save_recipe）或
+    #   lesson（经验，走本工具）→ 向用户汇报 id / root / 状态。
+    # - 加深方法论（advisory）：先 search_lessons 定位既有 id，再
+    #   capture_workflow_snapshot（自制 HDA 带 include_hda_internals=True）
+    #   重研，最后 save_recipe(recipe_id=...) 原地更新（recipe 通道），不得
+    #   新增重复知识；沉淀目标为原理/设计意图/为什么，参数按需收录；正文用
+    #   type_full / hda 全名+版本索引，禁止本机路径入正文。
     try:
         if severity not in _lessons.SEVERITIES:
             return _lessons_capped({
@@ -1354,69 +1363,54 @@ def capture_workflow_snapshot(ctx, node_path=None, include_vex: bool = True,
                               include_connected: bool = False,
                               include_hda_internals: bool = None,
                               offset: int = None, limit: int = None):
-    """把用户选中（或 node_path 指定）的节点子网络捕获为结构化工作流快照
-    （add-workflow-knowledge-capture，readOnly relay，不修改场景）。
-
-    触发时机（advisory）：用户完成 HDA / 节点流 / VEX 工作流后说"沉淀这些
-    知识"时，agent 先调用 get_selection 定位，再调本工具取快照，组织为
-    recipe（用法文档，走 save_recipe）或 lesson（经验，走 save_lesson）。
-    本工具是 advisory，不替代 verify_hou_api / get_houdini_help /
-    get_best_practices，也不替代目标 Houdini 版本的 live verification。
+    """把选中（或 node_path 指定）的节点子网络捕获为结构化工作流快照（只读，
+    不改场景、不调 LLM）。用户说"沉淀这些知识"时：get_selection 定位 →
+    本工具取快照 → save_recipe（用法）/ save_lesson（经验）。
 
     参数说明：
-    - node_path: 可选；省略时取当前节点选择（空选择返回 no_selection
-      结构化错误，不静默回退）；指定时捕获以该节点为根的闭包子网络。
-    - include_vex: 可选，默认 True；包含 Attribute Wrangle 的 VEX snippet。
-    - max_nodes: 可选，默认 50；闭包节点硬上限，超限截断并标记 truncated。
-    - probe_mode: 可选，缺省 None（未指定，服务端映射为 auto）；分层探测
-      深度：
-      - ``auto``：按节点状态逐层判定——锁定官方 + 有 EditableNodes 声明
-        （如 rbdbulletsolver1 的 dopnet/forces）→ **只探 editable 子树**；
-        解锁实例（isEditable()=true，含解锁官方 HDA 嵌入式定义，如
-        transformpieces1）→ **整棵渗透**；锁定用户数字资产（如
-        csr_voronoi_advanced1）→ **只记节点名**；锁定官方无声明 → 仅参数。
-      - ``expand_all``：全部整棵展开（显式覆盖锁定资产）。
-      - ``editable_only``：只展开 EditableNodes 段路径子树。
-      - ``none``：完全不展开内部。
-      **不能用 isEditable() 判定"children 不可读"**：isEditable() 只用于
-      正向解锁判定（True → 需渗透）；锁定态不代表 children 不可读。
-    - include_connected: 可选，默认 False；True 时沿 inputs/outputs 连线
-      扩展（用剩余预算，强制子树优先；默认只沿 children 方向展开，避免
-      无关子树耗尽预算）。
-    - include_hda_internals: 兼容旧参数；**仅在 probe_mode 未显式传入时
-      生效**：True → probe_mode=auto，False → probe_mode=none；显式
-      probe_mode 一律优先，MUST NOT 被本参数覆盖（如
-      probe_mode="expand_all" + include_hda_internals=False → expand_all）。
-    - offset/limit: 可选；完整快照超阈值（512KB）返回精简摘要时，传
-      offset/limit 分页续读全量详情节点（page.total / next_offset）。
+    - node_path: 可选；省略取当前节点选择（空选择返 no_selection 错误，
+      不静默回退）；指定时捕获以该节点为根的闭包子网络。
+    - include_vex: 默认 True，含 Attribute Wrangle 的 VEX snippet。
+    - max_nodes: 默认 50，闭包节点硬上限，超限截断标记 truncated。
+    - probe_mode: 分层探测深度——auto（按锁定态/EditableNodes 声明逐层
+      判定，缺省）、expand_all（整棵展开，显式覆盖锁定资产）、
+      editable_only（只展开 EditableNodes 段）、none（不展开内部）。
+    - include_connected: 默认 False；True 沿 inputs/outputs 连线扩展
+      （子树优先，用剩余预算）。
+    - include_hda_internals: 兼容旧参数，仅在 probe_mode 缺省时映射
+      （True→auto / False→none）；显式 probe_mode 一律优先不被覆盖。
+    - offset/limit: 完整快照超 512KB 返精简摘要时，分页续读全量详情节点
+      （page.total / next_offset）。
 
-    返回结构：{status:success, root, node_count, truncated, hip_file,
-    nodes, sticky_notes, connections}，超限截断时 truncated=true；超大
-    快照返回 {summary:true, summary_file（全量落盘 basename，**响应不含
-    敏感路径**）, nodes: 精简行}；API 降级附 _warning。节点表每项含资产级
-    标识 type_full（nameWithCategory，API 缺失降级 type）与 is_hda
-    （**用户数字资产实例**：definition() 非 None 且库文件非
-    $HFS/houdini/otls 内建库——H21 上 attribwrangle 等 HDA 化内建类型也
-    有 definition，纯 definition 判定会误标），hda 字段为 {type_name,
-    version(可选), definition_source: embedded|external}，**绝不输出
-    library_path 或任何本机路径**（跨机器复现误导源）；顶层 hip_file 只取
-    basename（隐私安全）。快照只含节点表（path/name/type/type_full/
-    is_hda/comment/非默认参数/vex/hda/errors/warnings）+ sticky note +
-    连线，**不含几何数据**，readOnly 不修改场景，纯规则读取**不调用 LLM /
-    嵌入模型**。错误为 status=error + error={code,message,details}
-    （no_selection / invalid_node_path / invalid_probe_mode /
-    selection_read_failed / capture_connection_error）。整体过
-    apply_response_cap。
+    返回 {status, root, node_count, truncated, hip_file, nodes,
+    sticky_notes, connections}；超大快照返 {summary:true, summary_file,
+    nodes:精简行}（summary_file 仅 basename，响应不含本机路径）；节点项含
+    type_full / is_hda / 非默认参数 / vex / hda 等。错误码：no_selection /
+    invalid_node_path / invalid_probe_mode / selection_read_failed /
+    capture_connection_error。
 
-    方法论沉淀协议（advisory，非强制）：沉淀目标是工作流的**原理 / 设计
-    意图 / 为什么这么搭**，不是节点名与参数的复制粘贴；参数仅在用户要求
-    或直接影响复现时收录。正文索引用 type_full / hda 资产标识，实例名仅
-    辅助；**禁止本机路径入正文**（HDA 库路径 / hip 完整路径，团队知识库
-    跨机器误导源），资产只用全名 + 版本索引。分层探测语义：未解锁且有
-    editable nodes 的官方节点只探 editable nodes；解锁节点（含官方）需
-    整棵渗透；锁定自定义 HDA 无专门沉淀时只记节点名。自制 HDA 先
-    probe_mode="auto" 研究内部原理再组织为 recipe。
+    沉淀方法论：知识索引用 type_full / hda 资产标识（实例 name 仅辅助），
+    禁本机路径；研究自制 HDA 内部原理传 probe_mode="auto" 并按需上调
+    max_nodes。本工具纯规则读取，advisory，不替代 verify_hou_api /
+    live verification。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：
+    # - probe_mode=auto 细则：锁定官方 + 有 EditableNodes 声明（如
+    #   rbdbulletsolver1 的 dopnet/forces）→ 只探 editable 子树；解锁实例
+    #   （isEditable()=true，含解锁官方 HDA 嵌入式定义，如 transformpieces1）
+    #   → 整棵渗透；锁定用户数字资产（如 csr_voronoi_advanced1）→ 只记
+    #   节点名；锁定官方无声明 → 仅参数。不能用 isEditable() 判定
+    #   "children 不可读"（只用于正向解锁判定，锁定态不代表不可读）。
+    # - is_hda 判定坑：H21 上 attribwrangle 等 HDA 化内建类型也有
+    #   definition()，纯 definition 判定会误标——须同时要求库文件非
+    #   $HFS/houdini/otls 内建库。hda 字段 {type_name, version(可选),
+    #   definition_source: embedded|external}，绝不输出 library_path。
+    # - 顶层 hip_file 只取 basename（隐私）；快照只含节点表 + sticky note +
+    #   连线，不含几何数据；整体过 apply_response_cap。
+    # - 方法论沉淀协议（advisory）：沉淀目标是原理/设计意图/为什么这么搭，
+    #   不是节点名与参数的复制粘贴；参数仅在用户要求或直接影响复现时收录；
+    #   正文用 type_full / hda 资产标识，实例名仅辅助，禁止本机路径入正文；
+    #   自制 HDA 先 probe_mode="auto" 研究内部原理再组织为 recipe。
     try:
         env = _houdini_call("capture_workflow_snapshot", {
             "node_path": node_path,
@@ -1453,52 +1447,41 @@ def capture_workflow_snapshot(ctx, node_path=None, include_vex: bool = True,
 def save_recipe(ctx, title, problem, symptom, fix, category, severity,
                 affected_versions, verified_versions=None, recipe_id=None,
                 root=None):
-    """把一条用法/流程知识写入指定 root 的 recipes 文件
-    （add-workflow-knowledge-capture，write，bridge-local 不连接 Houdini）。
+    """把一条用法/流程知识沉淀为 recipe，写入指定 root 的 recipes 文件
+    （写入即可被 search_lessons 检索，无 draft 门槛）。用法/流程文档走本
+    工具；错误经验走 save_lesson（draft 门槛 + 指纹累积）。
 
-    触发时机（advisory）：用户完成工作流后说"沉淀这些知识"时，agent 先用
-    get_selection 定位，再调 capture_workflow_snapshot 取快照；用法/流程
-    文档（"怎么用这个 HDA""这个网络怎么搭"）走本工具 save_recipe（写入即被
-    search_lessons 检索，无 draft 门槛），错误经验走 save_lesson（draft
-    门槛 + 指纹累积）。本工具是 advisory，不替代 verify_hou_api /
-    get_houdini_help / get_best_practices，也不替代目标 Houdini 版本的
-    live verification。
+    加深/改造既有知识：先 search_lessons 定位 id，再传 recipe_id 原地更新，
+    不得新增一条重复知识。沉淀方法论：原理/设计意图优先，资产用 type_full /
+    hda 标识，正文禁本机路径；advisory，不替代 live verification。
 
     参数说明：
     - title / problem / symptom / fix / category / severity /
-      affected_versions: 必填；**title/problem/symptom/fix 全部单行存储**
-      （strict parser 的 field 值为单行；校验失败错误信息列出全部受限
-      字段名，可在单行内用中文标点 / 分号压缩长内容）；title 渲染为块
-      上方 ``> title`` 注释行。
-    - severity: 必填，recipes severity 合法取值 low / medium / high
-      （3 值，与 lesson 的 4 值不同）。
+      affected_versions: 必填。title/problem/symptom/fix 全部单行存储
+      （超长用中文标点 / 分号在单行内压缩）；title 渲染为块上方
+      ``> title`` 注释行。
+    - severity: 合法取值 low / medium / high（3 值，与 lesson 的 4 值不同）。
     - verified_versions: 可选；缺省 "unknown"。
-    - recipe_id: 可选；引用**既有** ``### BP-NNN`` 块 id（格式
-      ``BP-\\d{3}``，非自定义新 id）。提供时**原地替换**该块 9 字段、
-      不新增块（首块 ``> title`` 行同步更新），响应 action=updated；
-      未提供时维持自增追加，响应 action=created。
-    - root: 可选 root 名；缺省 personal（唯一默认可写 root）。
+    - recipe_id: 可选；引用既有 BP-NNN 块 id 时原地替换该块、不新增
+      （响应 action=updated）；缺省自增追加（action=created）。不接受
+      自定义新 id。
+    - root: 可选；缺省 personal（唯一默认可写 root）。
 
-    返回：{status:success, recipe_id, root, severity, source,
-    immediately_searchable:true, action:created|updated}；recipe_id 为
-    BP-NNN 自动生成（扫描既有块最大序号 + 1），**不接受自定义 id**；团队
-    root 写入 source 自动附 ``@<用户名>``（系统标注）。错误为 status=error
-    + error={code,message,details}（非法 severity → ls_write_error 并列出
-    合法值；recipe_id 格式非法 → ls_write_error；引用不存在的 id →
-    ls_recipe_not_found 且 message 附既有 id 列表；只读团队 root →
-    root_not_writable；未知/不可用 root → ls_unknown_root）。整体过
-    apply_response_cap。
-
-    方法论沉淀协议（advisory，非强制）：
-    - 沉淀内容是工作流的**原理 / 设计意图 / 方法论**（为什么这么搭），
-      不是节点名与参数的复制粘贴；参数仅在用户要求或直接影响复现时收录。
-    - 正文索引用资产级标识（capture_workflow_snapshot 的 type_full / hda
-      资产全名 + 版本），实例名仅辅助。
-    - **禁止本机路径入正文**：不写 HDA 库路径 / hip 完整路径（团队知识库
-      跨机器误导源）。
-    - 改造 / 加深既有知识时先 search_lessons 定位既有 id，再传 recipe_id
-      **原地更新**，**不得新增一条重复知识**。
+    返回 {status, recipe_id, root, severity, source,
+    immediately_searchable:true, action:created|updated}；团队 root 写入
+    source 自动附 ``@<用户名>``。错误码：ls_write_error（非法 severity /
+    recipe_id 格式）、ls_recipe_not_found（引用不存在 id，message 附既有
+    id 列表）、root_not_writable、ls_unknown_root。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：
+    # - recipe_id 格式 BP-\d{3}（strict parser），自增 = 扫描既有块最大序号
+    #   + 1；原地替换时首块 ``> title`` 行同步更新；非法格式与非法 severity
+    #   同返 ls_write_error。
+    # - 方法论协议（advisory）：沉淀原理/设计意图/方法论而非节点参数复制；
+    #   正文用资产级标识（capture_workflow_snapshot 的 type_full / hda 全名
+    #   + 版本），实例名仅辅助；禁止本机路径入正文（HDA 库路径 / hip 完整
+    #   路径）；改造/加深既有知识先 search_lessons 定位 id 再传 recipe_id
+    #   原地更新，不得新增重复知识。
     try:
         if severity not in _lessons.RECIPE_SEVERITIES:
             # fail-fast 预检：recipes severity 只有 3 值（与 lesson 的 4 值
@@ -1596,38 +1579,45 @@ def create_node(ctx: Context, node_type: str, parent_path: str = "/obj", name: s
 
 @mcp.tool()
 def execute_houdini_code(ctx: Context, code: str,
-                          policy: str = "normal",
-                          allow_dangerous: bool = False,
-                          allow_heavy_geometry: bool = False,
-                          capture_diff: bool = False) -> str:
-    """
-    Execute arbitrary Python code in Houdini's environment. LAST RESORT:
+                         policy: str = "normal",
+                         allow_dangerous: bool = False,
+                         allow_heavy_geometry: bool = False,
+                         capture_diff: bool = False) -> str:
+    """Execute arbitrary Python code in Houdini's environment. LAST RESORT:
     prefer the dedicated tools (connect_nodes, set_parameters, create_wrangle,
     get_geometry_info, ...) — they validate input, report structured errors
     and are undoable as a single step. Use this only for operations no
     dedicated tool covers.
 
-    执行模型（feat-mcp-round2-hardening §1，主线程同步执行）：
-    - 代码在 Houdini **主线程同步执行**：调用期间整个 MCP 服务阻塞至代码
-      自然结束。死循环 / 卡死脚本 = 服务不可用直至 Houdini 重启——执行前
-      务必先用 verify_hou_api / get_houdini_help 核实将调用的 hou API，
-      避免已知会 hang 的调用（如 H21 OBJ setInput 30s+ hang）。
-    - **undo 真实生效**：normal / privileged 策略下场景变更包在
-      hou.undos.group 内，可经 performUndo() / Ctrl+Z 回滚；read-only 不包组
-      （写 API 在 policy 层被拦截）。
-    - 无超时中断机制：不存在"超时后代码仍在跑"的窗口；响应 audit 恒
-      timed_out=false，附 execution_mode="main_thread" 与
-      timeout_ignored=true。
+    执行模型：代码在 Houdini 主线程同步执行——调用期间整个 MCP 服务阻塞
+    至代码自然结束，死循环 / 卡死脚本 = 服务不可用直至 Houdini 重启（执行
+    前先 verify_hou_api / get_houdini_help 核实将调用的 hou API，避开已知
+    会 hang 的调用）。normal / privileged 策略下场景变更包在
+    hou.undos.group 内，可 Ctrl+Z 回滚；read-only 不包组（写 API 在
+    policy 层被拦截）。无超时中断机制（audit 恒 timed_out=false）。
 
     Args:
         code: Python source to exec inside Houdini.
-        policy: "read-only" / "normal" / "privileged" (PR 4 safety policy).
+        policy: "read-only" / "normal" / "privileged".
         allow_dangerous: explicit per-call dangerous-code override (privileged only).
         allow_heavy_geometry: explicit per-call heavy-geometry override.
         capture_diff: when True, server snapshots scene state before & after.
 
     Returns status, any stdout/stderr, and an optional audit block.
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：执行模型出自
+    # feat-mcp-round2-hardening 第 1 批（worker 线程改主线程同步）；audit 附
+    # execution_mode="main_thread" 与 timeout_ignored=true。
+    # feat-mcp-tool-guidance §2：统一出口后处理——失败引导 _ai_hint +
+    # 会话计数 _hint（文本行追加，不改 str 返回形态）
+    return _ehint.apply_execute_hints(_execute_houdini_code_impl(
+        ctx, code, policy, allow_dangerous, allow_heavy_geometry,
+        capture_diff))
+
+
+def _execute_houdini_code_impl(ctx, code, policy, allow_dangerous,
+                               allow_heavy_geometry, capture_diff):
+    """execute_houdini_code 的实现主体（未注册为 MCP 工具）。"""
     try:
         conn = get_houdini_connection()
         response = conn.send_command("execute_code", {
@@ -1733,9 +1723,11 @@ def save_scene(ctx: Context, file_path: str | None = None) -> dict:
 def load_scene(ctx: Context, file_path: str) -> dict:
     """Load a .hip file as the current Houdini scene.
 
-    Server-side also calls cmn.invalidate_all_caches() so downstream caches
-    (NodeTypeCache coming in PR 6) reset on scene switch.
+    场景切换同时使 server 侧节点类型缓存失效，切换后的发现类查询能看到
+    新场景内容。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 6——server 侧
+    # 调 cmn.invalidate_all_caches()，NodeTypeCache 随场景切换重置。
     return _houdini_call("load_scene", {"file_path": file_path})
 
 
@@ -1777,9 +1769,10 @@ def list_node_types(ctx: Context, category: str = None,
                     cursor: int = None) -> dict:
     """List Houdini node types with optional category / name filter, paginated.
 
-    PR 6: relays to server-side disc.list_node_types, which populates the
-    NodeTypeCache on first call and reuses it across invocations.
+    首次调用填充 server 侧 NodeTypeCache，后续调用复用（显著更快）。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 6——relay 到
+    # server 侧 disc.list_node_types。
     return _houdini_call("list_node_types", {
         "category": category,
         "name_filter": name_filter,
@@ -1795,9 +1788,9 @@ def list_children(ctx: Context, node_path: str = "/",
                   limit: int = 50, cursor: int = None) -> dict:
     """List the children of node_path. With recursive=True walk the subtree up
     to max_depth. compact=True returns only {path, type, children_count}.
-
-    PR 6: relays to server-side disc.list_children.
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 6——relay 到
+    # server 侧 disc.list_children。
     return _houdini_call("list_children", {
         "node_path": node_path,
         "recursive": recursive,
@@ -1815,9 +1808,9 @@ def find_nodes(ctx: Context, root_path: str = "/", pattern: str = None,
                cursor: int = None) -> dict:
     """Find nodes under root_path matching a glob / substring pattern or
     node_type. Default root_path is "/".
-
-    PR 6: relays to server-side disc.find_nodes.
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 6——relay 到
+    # server 侧 disc.find_nodes。
     return _houdini_call("find_nodes", {
         "root_path": root_path,
         "pattern": pattern,
@@ -1829,19 +1822,20 @@ def find_nodes(ctx: Context, root_path: str = "/", pattern: str = None,
 
 @mcp.tool()
 def manage_cache(ctx: Context, action: str = "stats") -> dict:
-    """Manage the Houdini-side NodeTypeCache.
+    """管理 Houdini 侧 NodeTypeCache。
 
-    action="stats"     -> return per-cache stats aligned with the main spec:
-                          {node_types: {valid, hits, misses, hit_rate,
-                          invalidations, entry_count, last_populate_ms},
-                          parameter_schemas: {same shape}}
-    action="invalidate"-> clear all registered caches (calls
-                          cmn.invalidate_all_caches under the hood)
-    action="warmup"    -> pre-populate the NodeTypeCache
+    action 取值：
+    - "stats"：返回 per-cache 统计 {node_types: {valid, hits, misses,
+      hit_rate, invalidations, entry_count, last_populate_ms},
+      parameter_schemas: {同构}}。
+    - "invalidate"：清空全部已注册缓存。
+    - "warmup"：预填充 NodeTypeCache。
 
-    PR 6: relays to server-side disc.manage_cache. ValueError on unknown
-    action surfaces as an error dict with origin="houdini".
+    未知 action → ValueError 以 origin="houdini" 的 error dict 返回。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 6——relay
+    # 到 server 侧 disc.manage_cache（invalidate 底层调
+    # cmn.invalidate_all_caches）。
     return _houdini_call("manage_cache", {"action": action})
 
 # -------------------------------------------------------------------
@@ -2088,14 +2082,14 @@ def layout_network(ctx: Context, path: str) -> dict:
 @mcp.tool()
 def find_error_nodes(ctx, root_path="/", include_warnings: bool = True,
                      max_warnings: int = 50, max_errors: int = None):
-    """扫描场景中的错误与警告节点。
+    """扫描场景中的错误与警告节点（一次性体检，比逐节点 cook_node 快）。
 
-    从 root_path 出发，单次调用 node.allSubChildren() 收集所有后代节点，
-    返回 errors 与 warnings 双列表。include_warnings 默认 True（PR 11 行为）；
-    max_warnings 限制警告条目数（超过返 _warnings_truncated 标记）；
-    max_errors 限制错误条目数（None 表示不限）。适合场景构建完成后做
-    一次性体检，比逐节点 cook_node 更快。
+    从 root_path 出发单次收集所有后代节点，返回 errors 与 warnings 双
+    列表。include_warnings 默认 True；max_warnings 限制警告条数（超过返
+    _warnings_truncated）；max_errors 限制错误条数（None 不限）。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 11 行为——
+    # include_warnings 默认 True。
     return _houdini_call("find_error_nodes", {
         "root_path": root_path,
         "include_warnings": include_warnings,
@@ -2207,37 +2201,34 @@ def render_single_view(ctx: Context,
                        render_engine: str = "opengl",
                        karma_engine: str = "cpu",
                        consent_token: str = None) -> dict:
+    """渲单视图并返回结构化 dict。redirect 语义：本机（H21 缺 OGL 3.3）的
+    opengl / karma 视口渲染会被强制 redirect——opengl → SceneViewer 截图，
+    karma_cpu/xpu → flipbook；响应的 actual_backend 告知实际执行路径，
+    renderer 仅为兼容字段（= requested_renderer）。karma 磁盘渲染改用
+    start_render。
+
+    参数说明：
+    - render_engine / karma_engine: 引擎选择（默认 opengl）。
+    - rotation / orthographic: 视角参数。
+    - consent_token: 可选，karma 路径重调时携带。
+    - render_path: 可选输出目录；缺省由 server 落 $TEMP/houdini_mcp/<日期>/
+      规范目录（7 天清理）。渲染自建的 MCP_* 临时节点渲完清理，清理失败
+      响应附 _cleanup_warning。
+
+    返回 dict 含 renderer / image_path / size_bytes / requested_renderer /
+    actual_backend 等（而非 str）。
     """
-    IMPORTANT (fork-render-policy-redirect-and-consent):
-        在用户机 H21 缺 OGL 3.3 环境下，本工具的 opengl renderer 已被 fork
-        强制 redirect 到 ``capture_pane_screenshot(SceneViewer)``（不再
-        触发 opengl output node 链路，避免 Houdini 主线程死锁）；karma_cpu /
-        karma_xpu 视口渲染同样无条件 redirect 到 flipbook（2026-09-10 实证：
-        karma ROP render() 在本机触发 OpenGL fatal 并导致 Houdini 进程退出，
-        consent 不足以防御）。karma disk 渲染请改用 ``start_render``
-        （background 优先）。详见 ``_render_policy.py``。
-
-    Render a single view inside Houdini and return a structured result dict.
-
-    feat-mcp-round2-hardening §2:
-        - render_path 默认 None：MUST NOT 默认发送 "C:/temp/"；server 端
-          缺省时回退 ``$TEMP/houdini_mcp/<日期>/`` 规范目录（纳入 7 天
-          清理）。显式传参行为不变。
-        - 渲染流程自建的 MCP_* 临时节点（rig + ROP）在渲染结束后由
-          server 端清理；清理失败时响应附 ``_cleanup_warning``。
-        - 响应含 ``requested_renderer``（请求值）与 ``actual_backend``
-          （实际执行路径：opengl_rop / husk / flipbook / qscreen_fallback
-          等）；``renderer`` 为兼容字段，语义 = requested_renderer，
-          不代表实际执行的后端。
-
-    Returns a dict (carrying renderer / image_path / size_bytes / etc.)
-    instead of a string. Pydantic-typed MCP output models reject dicts
-    when the return annotation is `str`; this tool is the one that broke
-    live with `1 validation error for render_single_viewOutput / result
-    Input should be a valid string [type=string_type, input_type=dict]`.
-    Server-side always returns a dict; we forward it verbatim and only
-    fall back to an error envelope on exception.
-    """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：
+    # - redirect 实证史：opengl renderer redirect 到 capture_pane_screenshot
+    #   (SceneViewer)，避免 opengl output node 链路主线程死锁；karma_cpu/xpu
+    #   视口渲染无条件 redirect 到 flipbook（2026-09-10 实证 karma ROP
+    #   render() 触发 OpenGL fatal 杀 Houdini 进程，consent 不足以防御）。
+    #   详见 _render_policy.py。
+    # - render_path 默认 None，MUST NOT 默认发送 "C:/temp/"。
+    # - dict-vs-str 背景：Pydantic MCP output 模型在 return annotation 为
+    #   str 时拒收 dict（本工具曾以 1 validation error ... string_type 线上
+    #   炸过）；server 侧恒返 dict，bridge 原样转发，仅异常时落 error
+    #   envelope。
     policy_resp = _apply_render_policy_to_engine(
         render_engine, karma_engine, consent_token=consent_token,
         command="render_single_view")
@@ -2274,31 +2265,22 @@ def render_quad_views(ctx: Context,
                       render_engine: str = "opengl",
                       karma_engine: str = "cpu",
                       consent_token: str = None) -> dict:
+    """渲 4 个正交规范视图并返回结构化 dict（4 views × {image_path,
+    size_bytes, ...}）。redirect 语义同 render_single_view：opengl / karma
+    视口渲染在本机会被强制 redirect（actual_backend 告知实际路径）；karma
+    磁盘渲染改用 start_render。
+
+    参数说明：
+    - render_engine / karma_engine / consent_token: 同 render_single_view。
+    - render_path: 可选输出目录；缺省 server 端规范临时目录（7 天清理）。
+      多视图渲染建一次 MCP_* rig、渲完清一次，清理失败附 _cleanup_warning。
+
+    响应含 requested_renderer / actual_backend；renderer 为兼容字段。
     """
-    IMPORTANT (fork-render-policy-redirect-and-consent):
-        在用户机 H21 缺 OGL 3.3 环境下，本工具的 opengl renderer 已被 fork
-        强制 redirect 到 ``capture_pane_screenshot(SceneViewer)``；karma_cpu
-        / karma_xpu 视口渲染同样无条件 redirect 到 flipbook（2026-09-10
-        实证 GL fatal 杀进程，consent 不足以防御）。karma disk 渲染改用
-        ``start_render``。详见 ``_render_policy.py``。
-
-    Render 4 canonical views from Houdini and return a structured result dict.
-
-    feat-mcp-round2-hardening §2:
-        - render_path 默认 None（MUST NOT 默认发送 "C:/temp/"）；server
-          端缺省回退 ``$TEMP/houdini_mcp/<日期>/`` 规范目录（7 天清理）。
-          显式传参行为不变。
-        - 多视图渲染建一次 MCP_* rig、渲完清一次；清理失败响应附
-          ``_cleanup_warning``。
-        - 响应含 ``requested_renderer`` / ``actual_backend``（实际执行
-          路径）；``renderer`` 为兼容字段（= requested_renderer）。
-
-    Returns a dict (4 views × {image_path, size_bytes, ...}) instead of a
-    string. See render_single_view docstring for the dict-vs-str Pydantic
-    background. The legacy bridge command name is `render_quad_view`
-    (singular) — kept for backward compatibility with the server-side
-    handler dictionary in opera-houdini-mcp/server.py.
-    """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：redirect 实证史
+    # 同 render_single_view（详见 _render_policy.py）。旧 bridge 命令名
+    # render_quad_view（单数）保留，向后兼容 server 端 handler 字典。
+    # dict-vs-str 背景同 render_single_view。
     policy_resp = _apply_render_policy_to_engine(
         render_engine, karma_engine, consent_token=consent_token,
         command="render_quad_view")
@@ -2334,29 +2316,20 @@ def render_specific_camera(ctx: Context,
                            render_engine: str = "opengl",
                            karma_engine: str = "cpu",
                            consent_token: str = None) -> dict:
+    """从指定相机渲一帧并返回结构化 dict（renderer / image_path /
+    size_bytes）。redirect 语义同 render_single_view（opengl / karma 视口
+    渲染在本机被强制 redirect；响应含 requested_renderer（请求值）与
+    actual_backend（实际执行路径），renderer 为兼容字段；karma 磁盘渲染
+    改用 start_render）。
+
+    参数说明：
+    - camera_path: 相机节点路径。
+    - render_engine / karma_engine / consent_token / render_path: 同
+      render_single_view。只清理本流程创建的 MCP_* ROP 节点（用户相机
+      不动），清理失败附 _cleanup_warning。
     """
-    IMPORTANT (fork-render-policy-redirect-and-consent):
-        在用户机 H21 缺 OGL 3.3 环境下，本工具的 opengl renderer 已被 fork
-        强制 redirect 到 ``capture_pane_screenshot(SceneViewer)``；karma_cpu
-        / karma_xpu 视口渲染同样无条件 redirect 到 flipbook（2026-09-10
-        实证 GL fatal 杀进程，consent 不足以防御）。karma disk 渲染改用
-        ``start_render``。详见 ``_render_policy.py``。
-
-    Render from a specific camera path in the Houdini scene.
-
-    feat-mcp-round2-hardening §2:
-        - render_path 默认 None（MUST NOT 默认发送 "C:/temp/"）；server
-          端缺省回退 ``$TEMP/houdini_mcp/<日期>/`` 规范目录（7 天清理）。
-          显式传参行为不变。
-        - 只清理本流程创建的 MCP_* ROP 节点（用户相机不动）；清理失败
-          响应附 ``_cleanup_warning``。
-        - 响应含 ``requested_renderer`` / ``actual_backend``（实际执行
-          路径）；``renderer`` 为兼容字段（= requested_renderer）。
-
-    Returns a structured dict (renderer / image_path / size_bytes) instead
-    of a string. See render_single_view docstring for the dict-vs-str
-    Pydantic background.
-    """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：redirect 实证史
+    # 同 render_single_view（详见 _render_policy.py）；dict-vs-str 背景同。
     policy_resp = _apply_render_policy_to_engine(
         render_engine, karma_engine, consent_token=consent_token,
         command="render_specific_camera")
@@ -2589,19 +2562,21 @@ def layout_children(ctx, parent_path=None, parent=None,
                     horizontal_spacing: float = None,
                     vertical_spacing: float = None,
                     direction=None):
-    """布局父节点下的子节点（按间距参数手动 setPosition，跨 Houdini
-    版本可移植）。
+    """布局父节点下的子节点（按间距参数手动 setPosition，跨 Houdini 版本
+    可移植）。
 
     参数说明：
-    - parent_path: 父节点路径（PR 9 推荐命名）。
-    - parent: 旧版别名；若同时传 parent_path 与 parent，以 parent_path 为准。
+    - parent_path: 父节点路径。
+    - parent: 旧版别名；同时传时以 parent_path 为准。
     - horizontal_spacing: 水平间距（Houdini units），缺省 2.0。
     - vertical_spacing: 垂直间距，缺省 1.5。
     - direction: "horizontal"（默认）或 "vertical"。
 
-    返回 dict 包含 parent_path / children_count / direction / spacing
-    四项。后向兼容：现有调用 layout_children(ctx, parent) 仍 work。
+    返回 {parent_path, children_count, direction, spacing}。旧调用形式
+    layout_children(ctx, parent) 仍可用。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 9 推荐
+    # parent_path 命名（parent 为兼容别名）。
     effective_parent = parent_path if parent_path is not None else parent
     if horizontal_spacing is not None or vertical_spacing is not None \
             or direction is not None:
@@ -2893,61 +2868,63 @@ def render_specific_camera_base64(ctx, camera_path, resolution=(640, 480),
 # -------------------------------------------------------------------
 @mcp.tool()
 def get_frame(ctx):
-    """读取当前帧 / 时间 / fps / 三组 range / increment，全部 float（PR 19）。
+    """读取当前帧 / 时间 / fps / 三组 range / increment，全部 float。
 
-    返回 dict 字段：frame / time / fps / frame_range /
-    playback_range / frame_increment；任一 hou 调用抛异常时降级为
-    status=error 而非向调用方抛异常。仅读取时间线状态，不修改场
-    景或参数（READ_ONLY_COMMANDS）。响应整体过 server 端
-    ``apply_response_cap`` 截断大 payload（虽然规模小，仍保持
-    defense-in-depth）。
+    返回 frame / time / fps / frame_range / playback_range /
+    frame_increment；任一 hou 调用异常降级为 status=error 而非抛异常。
+    只读。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 19（时间线
+    # 批次）；响应整体过 apply_response_cap（defense-in-depth）。
     return _houdini_call("get_frame", {})
 
 
 @mcp.tool()
 def set_frame(ctx, frame: float):
-    """设置当前帧（PR 19，运行态时间线写，no-undo）。
+    """设置当前帧（运行态时间线写，no-undo）。
 
-    ``frame`` 接受 int / float；拒绝 bool / NaN / ±inf / 非数值；
-    hou 接受 float 值并保留 sub-frame。任何 hou 异常降级为 error
-    dict。该命令在 NO_UNDO_COMMANDS 中，batch dispatcher 会在调
-    用前自动关闭当前 undo segment，确保不进入 ``hou.undos.group``。
+    ``frame`` 接受 int / float（保留 sub-frame）；拒绝 bool / NaN / ±inf /
+    非数值；hou 异常降级为 error dict。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 19；归
+    # NO_UNDO_COMMANDS——batch dispatcher 调用前自动关闭 undo segment。
     return _houdini_call("set_frame", {"frame": frame})
 
 
 @mcp.tool()
 def set_frame_range(ctx, start: float, end: float):
-    """设置全局 frame range（PR 19，场景写，可 undo）。
+    """设置全局 frame range（场景写，可 undo）。
 
-    ``start`` / ``end`` 必须为有限浮点且 ``start <= end``；end
-    可 sub-frame。错误（如 start > end）返回 status=error 不写；
-    成功时由 hou.playbar.setFrameRange 持久化。
+    ``start`` / ``end`` 必须为有限浮点且 ``start <= end``（end 可
+    sub-frame）；错误返回 status=error 不写；成功由
+    hou.playbar.setFrameRange 持久化。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 19。
     return _houdini_call("set_frame_range",
                          {"start": start, "end": end})
 
 
 @mcp.tool()
 def set_playback_range(ctx, start: float, end: float):
-    """设置 playback range（PR 19，场景写，可 undo）。
+    """设置 playback range（场景写，可 undo）。
 
     校验同 ``set_frame_range``；调 ``hou.playbar.setPlaybackRange``。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 19。
     return _houdini_call("set_playback_range",
                          {"start": start, "end": end})
 
 
 @mcp.tool()
 def set_keyframe(ctx, path, parameter, frame: float, value: float):
-    """单关键帧写入（PR 19，场景写，可 undo）。
+    """单关键帧写入（场景写，可 undo）。
 
-    ``path`` / ``parameter`` 必为非空字符串；``frame`` / ``value``
-    必须为有限浮点。value 创建 ``hou.Keyframe(float(value))`` 并
-    ``keyframe.setFrame(float(frame))`` 后 ``parm.setKeyframe``。
-    字符串参数 / NaN / inf 等返回 status=error 不写。
+    ``path`` / ``parameter`` 必为非空字符串；``frame`` / ``value`` 必须
+    为有限浮点。字符串参数 / NaN / inf 返回 status=error 不写。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 19——value 经
+    # hou.Keyframe(float(value)) 且 setFrame(float(frame)) 后
+    # parm.setKeyframe。
     return _houdini_call("set_keyframe", {
         "path": path,
         "parameter": parameter,
@@ -2958,27 +2935,26 @@ def set_keyframe(ctx, path, parameter, frame: float, value: float):
 
 @mcp.tool()
 def set_keyframes(ctx, keyframes):
-    """批量关键帧写入（PR 19，场景写，可 undo）。
+    """批量关键帧写入（场景写，可 undo）。
 
-    ``keyframes`` 为 list，每项 dict 至少含 ``path`` /
-    ``parameter`` / ``frame`` / ``value``；任一项无效则**整调
-    用**失败、零写入（在 server 上层预校验拒绝）。全部有效时
-    在单个 ``hou.undos.group`` 内逐项写入并返回 ``set_count`` /
-    ``requested``。错误列表同样受 server 端 ``apply_response_cap``
-    截断保护。
+    ``keyframes`` 为 list，每项 dict 至少含 ``path`` / ``parameter`` /
+    ``frame`` / ``value``；任一项无效则整调用失败、零写入。全部有效时在
+    单个 undo group 内逐项写入并返回 ``set_count`` / ``requested``。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 19——server
+    # 上层预校验拒绝无效项；错误列表过 apply_response_cap 截断保护。
     return _houdini_call("set_keyframes",
                          {"keyframes": keyframes})
 
 
 @mcp.tool()
 def delete_keyframe(ctx, path, parameter, frame: float):
-    """删除指定帧的关键帧（PR 19，场景写，可 undo）。
+    """删除指定帧的关键帧（场景写，可 undo）。
 
-    ``frame`` 必须为有限浮点（删除 sub-frame 精确点）。目标帧
-    不存在返回 status=error（"no keyframe found at frame ..."），
-    不写。实际删除后再次读取 keyframes 列表验证已消失。
+    ``frame`` 必须为有限浮点（sub-frame 精确点）。目标帧不存在返回
+    status=error 不写；删除后重读 keyframes 列表验证已消失。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 19。
     return _houdini_call("delete_keyframe", {
         "path": path,
         "parameter": parameter,
@@ -2988,32 +2964,29 @@ def delete_keyframe(ctx, path, parameter, frame: float):
 
 @mcp.tool()
 def get_keyframes(ctx, path, parameter):
-    """读取 parm 的全部关键帧（PR 19，只读）。
+    """读取 parm 的全部关键帧（只读）。
 
-    返回 list 中每项 ``{"frame": float, "value": float}``，不
-    做 ``int()`` 截断；空关键帧列表返回 ``keyframes=[]``。本
-    工具仅查询状态（READ_ONLY_COMMANDS），不会修改场景或参数。
+    返回 list，每项 ``{"frame": float, "value": float}``（不做 int 截
+    断）；空列表返回 ``keyframes=[]``。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 19——归
+    # READ_ONLY_COMMANDS。
     return _houdini_call("get_keyframes",
                          {"path": path, "parameter": parameter})
 
 
 @mcp.tool()
 def playbar_control(ctx, action):
-    """playbar 播放 / 步进 / 跳转（PR 19，运行态时间线写，no-undo）。
+    """playbar 播放 / 步进 / 跳转（运行态时间线写，no-undo）。
 
-    ``action`` 取值：
-    - ``play`` / ``reverse`` / ``stop``：直接调 SideFX HOM 同名方法。
-    - ``step_forward`` / ``step_backward``：仅通过
-      ``hou.setFrame(current ± hou.playbar.frameIncrement())``
-      路径并 clamp 到当前 playback range 闭区间，**不引入其
-      他 step helper**（increment 非有限正数 / range 不可用
-      → error 且 **不**调 hou.setFrame）。
-    - ``goto_start`` / ``goto_end``：直接设 playback range 端点。
-
-    整个 action 集在 NO_UNDO_COMMANDS 中，batch dispatcher 在
-    该命令前关闭 undo segment，保证不进入 ``hou.undos.group``。
+    ``action`` 取值：play / reverse / stop（HOM 同名方法）、
+    step_forward / step_backward（按 frameIncrement 步进并 clamp 到
+    playback range 闭区间）、goto_start / goto_end（设 range 端点）。
+    increment 非有限正数 / range 不可用时返回 error 且不调 hou.setFrame。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 19——step 仅走
+    # hou.setFrame(current ± frameIncrement) 路径，不引入其他 step helper；
+    # 归 NO_UNDO_COMMANDS（batch dispatcher 关闭 undo segment）。
     return _houdini_call("playbar_control",
                          {"action": action})
 
@@ -3021,14 +2994,14 @@ def playbar_control(ctx, action):
 @mcp.tool()
 def set_expression(ctx, path, parameter, expression,
                    language="hscript"):
-    """写入 parm 表达式（PR 19，参数通道持久写，**可 undo**）。
+    """写入 parm 表达式（参数通道持久写，可 undo）。
 
-    ``language`` 接受 ``hscript`` / ``python``，映射到对应
-    ``hou.exprLanguage``；其他值（包括大小写变体）一律
-    status=error。该命令属于参数通道数据写
-    （MUTATING_COMMANDS），**不**归为只读或 no-undo；与其他
-    关键帧 / 范围写共用 undo group 策略。
+    ``language`` 接受 ``hscript`` / ``python``，映射 ``hou.exprLanguage``；
+    其他值（含大小写变体）返回 status=error。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 19——归
+    # MUTATING_COMMANDS（不归只读 / no-undo），与其他关键帧 / 范围写共用
+    # undo group 策略。
     return _houdini_call("set_expression", {
         "path": path,
         "parameter": parameter,
@@ -3212,32 +3185,34 @@ def start_render(ctx: Context, node_path: str, policy_renderer: str,
                  consent_token: str = None,
                  background: bool = False) -> dict:
     """启动一次 ROP 渲染（缺省同步；``background=True`` 派生 detached
-    hython 子进程）；四层防御见 ``_render_jobs.start_render``。
+    hython 子进程渲染磁盘上已保存的 hip 快照）。
 
     Args:
         node_path: 真实 ROP 节点路径（如 ``/out/mantra1``）。
         policy_renderer: 必填提示，bridge Layer 1 用其初筛（``mantra`` /
-            ``opengl`` / ``karma_cpu`` / ``karma_xpu``）；不替换真实
-            node 推断。
-        frame_range: 可选 2 或 3 元 ``[start, end[, inc]]``，缺省走
-            ROP 自身设置。
+            ``opengl`` / ``karma_cpu`` / ``karma_xpu``）；不替换真实 node
+            推断。
+        frame_range: 可选 2 或 3 元 ``[start, end[, inc]]``，缺省走 ROP
+            自身设置。
         consent_token: 可选，karma 路径重调时携带。
-        background: 可选（perf-mcp-round3 §5）。``True`` 时四层 policy
-            全部 allow 后派生 **detached hython 子进程**渲染**磁盘上
-            已保存的 hip 快照**——H21 实测无 ``render(background=)`` /
-            ``renderThreaded`` / hscript 后台标志，异步只能真出进程。
-            前置要求 hip 已保存（未保存返回结构化 error 提示先
-            ``save_scene``）；MUST NOT 自动保存用户场景。成功响应
-            ``state="launched_background"`` + ``pid`` / ``log_path`` /
-            ``output_paths`` / ``monitor_hint``。``background`` 不参与
-            任何层 policy 判定（不影响 redirect / consent 语义）。
+        background: 可选。``True`` 时四层 policy 全部 allow 后派生 detached
+            hython 子进程渲染**磁盘上已保存的 hip 快照**。前置要求 hip 已
+            保存（未保存返回结构化 error 提示先 ``save_scene``；不自动保存
+            用户场景）；成功响应 ``state="launched_background"`` + ``pid`` /
+            ``log_path`` / ``output_paths`` / ``monitor_hint``。
+            ``background`` 不参与任何层 policy 判定（不影响 redirect /
+            consent 语义）。
 
     Returns:
         dict: 直接 relay server 响应；blocked 时为 redirect / interrupt /
-        error 字典；同步完成时为 ``status=success`` 含
-        ``state / elapsed / frame_range``；background 启动成功时为
+        error 字典；同步完成时为 ``status=success`` 含 ``state / elapsed /
+        frame_range``；background 启动成功时为
         ``state="launched_background"``。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：background 模式
+    # 出自 perf-mcp-round3 第 5 批——H21 实测无 render(background=) /
+    # renderThreaded / hscript 后台标志，异步只能真出进程；四层防御见
+    # _render_jobs.start_render。
     preflight = _rp.evaluate_render_policy_command(
         "start_render", {
             "policy_renderer": policy_renderer,
@@ -3270,29 +3245,30 @@ def list_render_nodes(ctx: Context, parent_path: str = "/out") -> dict:
 
 @mcp.tool()
 def get_render_settings(ctx: Context, node_path: str) -> dict:
-    """读取 ``node_path`` 的白名单 parm 值（design.md §"设置白名单"）。
+    """读取 ROP 节点白名单 parm 值（``ifd`` / ``opengl`` / ``karmarender``）。
 
-    仅返回 ``ifd`` / ``opengl`` / ``karmarender`` 实际存在且数据安全的
-    parm；script / callback / command / executable 类型拒绝。整体
-    过 ``apply_response_cap``。
+    只返回实际存在且数据安全的 parm；script / callback / command /
+    executable 类型拒绝。整体过 ``apply_response_cap``。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：白名单定义见
+    # design.md「设置白名单」节。
     return _houdini_call("get_render_settings", {"node_path": node_path})
 
 
 @mcp.tool()
 def set_render_settings(ctx: Context, node_path: str,
                          parameters: Dict[str, Any]) -> dict:
-    """受限可撤销写入（design.md §"set_render_settings"）。
+    """受限可撤销地写 ROP 节点 parm（白名单同 get_render_settings）。
 
-    完整预校验所有 key/value/parm 可写性/prospective engine 后快
-    照旧值；应用失败显式恢复快照旧值，**不**依赖 undo 自动 rollback。
-    全部成功 -> ``status=success``；恢复成功 ->
-    ``status=error, error_code=render_settings_apply_failed,
-    restored=true``；任一恢复失败 ->
-    ``status=error, error_code=render_settings_restore_failed,
-    restored=false`` + ``restore_errors``。响应过
-    ``apply_response_cap``。
+    完整预校验所有 key/value/parm 可写性/prospective engine 后快照旧值；
+    应用失败显式恢复快照旧值，不依赖 undo 自动 rollback。全部成功 →
+    ``status=success``；恢复成功 → ``error_code=
+    render_settings_apply_failed, restored=true``；任一恢复失败 →
+    ``error_code=render_settings_restore_failed, restored=false`` +
+    ``restore_errors``。响应过 ``apply_response_cap``。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：受限策略细节见
+    # design.md「set_render_settings」节。
     return _houdini_call("set_render_settings", {
         "node_path": node_path, "parameters": parameters})
 
@@ -3302,12 +3278,13 @@ def create_render_node(ctx: Context, node_type: str,
                         parent_path: str = "/out",
                         name: str = None,
                         parameters: Dict[str, Any] = None) -> dict:
-    """受限创建可分类 ROP 节点（design.md §"create_render_node"）。
+    """受限创建可分类 ROP 节点：仅允许 ``ifd`` / ``opengl`` / ``karmarender``。
 
-    仅允许 ``ifd`` / ``opengl`` / ``karmarender``；创建后通过同一
-    白名单设置参数并校验 renderer 可识别。未知 node type 整体
-    error。响应过 ``apply_response_cap``。
+    创建后通过同一白名单设置参数并校验 renderer 可识别；未知 node type
+    整体 error。响应过 ``apply_response_cap``。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：受限面定义见
+    # design.md「create_render_node」节。
     params = {"node_type": node_type, "parent_path": parent_path}
     if name is not None:
         params["name"] = name
@@ -3906,18 +3883,19 @@ def list_materials(ctx, parent_path="/mat"):
 @mcp.tool()
 def list_material_types(ctx, category="Vop", limit: int = 100,
                         cursor: int = 0):
-    """枚举材质 category 下的 node types（add-scene-context-selection-materials，READ_ONLY，分页信封）。
+    """枚举材质 category 下的 node types（READ_ONLY，分页信封）。
 
-    ``category`` 仅接受 ``Vop`` / ``Shop``；使用对应 category 的
-    ``nodeTypes()``，稳定排序返回 ``name / node_type / category /
-    description``，``node_type`` 走 ``nameWithCategory()`` 完整
-    类别名。未知 / 不支持 category 返 ``unsupported_category``。
-    分页（feat-mcp-round2-hardening §4b）：``limit`` clamp [1,500]、
-    多取 1 判 ``has_more``（lookahead 项不返回）、越界 ``cursor``
-    返回空页且 ``cursor=None``；信封含 ``total``，全量翻页拼接的
-    type 数 == total（不再被 response cap 截到前 ~150 项）。
-    响应过 server 端 ``apply_response_cap``。
+    ``category`` 仅接受 ``Vop`` / ``Shop``；稳定排序返回 ``name / node_type
+    / category / description``（``node_type`` 为 nameWithCategory 完整
+    类别名）。未知 / 不支持 category 返 ``unsupported_category``。
+
+    分页：``limit`` clamp [1,500]、多取 1 判 ``has_more``（lookahead 项不
+    返回）、越界 ``cursor`` 返回空页且 ``cursor=None``；信封含 ``total``，
+    全量翻页拼接的 type 数 == total（不被 response cap 截断）。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：出自
+    # add-scene-context-selection-materials；分页信封来自
+    # feat-mcp-round2-hardening 第 4b 批。响应过 apply_response_cap。
     return _houdini_call("list_material_types", {
         "category": category,
         "limit": limit,
@@ -4671,30 +4649,31 @@ def clear_console_log(ctx):
 # -------------------------------------------------------------------
 @mcp.tool()
 def check_connection(ctx):
-    """检查 Houdini 端连接信息（PR 16 连接诊断）。
+    """检查 Houdini 端连接信息（长会话开头调用一次，获取当前 Houdini 版本
+    与场景规模）。
 
-    返回 dict 包含 hou_version / hou_build / hip_file / hip_file_basename /
-    is_untitled / node_count / desktop_count / _status 八个字段。返回结构
-    与 server.py 中 HoudiniMCPServer.check_connection 保持一致。仅做只读
-    查询，不会修改 .hip 文件、节点或网络；适合 AI agent 在长会话开头调用
-    一次以获取当前 Houdini 版本与场景规模。
+    返回 hou_version / hou_build / hip_file / hip_file_basename /
+    is_untitled / node_count / desktop_count / _status。只读，不修改
+    .hip 文件、节点或网络。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 16（连接诊断
+    # 批次）——返回结构与 server 端 check_connection 保持一致。
     return _houdini_call("check_connection", {})
 
 
 @mcp.tool()
 def ping_houdini(ctx, timeout: float = 5):
-    """轻量级 Houdini 端 ping，验证响应时间（PR 16 连接诊断）。
+    """轻量级 Houdini 端 ping（健康检查 / 网络抖动快速探测）。
 
     参数说明：
-    - timeout: 最长等待秒数（默认 5），超过则 within_timeout=False
+    - timeout: 最长等待秒数（默认 5），超过则 within_timeout=False。
 
-    返回 dict 包含 pong / elapsed_ms / within_timeout / hou_version 四项；
-    hou 抛异常时返 pong=False 并带 error 字段。该 ping 不持久化新连接，
-    只在既有 hou 上下文里调用一次 hou.version()；适合作为健康检查或
-    网络抖动场景下的快速探测。注意：与 bridge 协议的 "ping" 命令不同，
-    后者只验证 socket / 帧协议，本工具测量 Houdini 端的实际响应时间。
+    返回 pong / elapsed_ms / within_timeout / hou_version；hou 异常时
+    pong=False 并带 error 字段。测量的是 Houdini 端实际响应时间（区别于
+    只验证 socket / 帧协议的 bridge 协议层 "ping"）。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 16——不持久化
+    # 新连接，只在既有 hou 上下文调一次 hou.version()。
     return _houdini_call("ping_houdini", {"timeout": timeout})
 
 
@@ -4706,16 +4685,21 @@ def ping_houdini(ctx, timeout: float = 5):
 # -------------------------------------------------------------------
 @mcp.tool()
 def get_houdini_help(ctx, help_type, item_name, timeout: int = 10):
-    """从 SideFX 在线文档查询 Houdini 节点、VEX 函数或 hou 方法的帮助（PR 15）。
+    """不确定 API 名或参数、或遇报错时先查本工具：Houdini 节点 / VEX 函数 /
+    hou 方法的帮助（本地 help server 优先，不可达自动回退在线）。
 
-    help_type 支持 11 种："sop" / "obj" / "dop" / "cop2" / "chop" /
-    "vop" / "lop" / "top" / "rop" / "vex_function" / "python_hou"。
-    item_name 是节点名 / VEX 函数名 / hou 方法名。timeout 是 HTTP 请求
-    超时秒数（默认 10）。返回 dict 包含 title / summary / parameters /
-    inputs / outputs / methods / status 等字段，HTML 解析使用 stdlib
-    html.parser（零新增 pip 依赖）。HTTP 4xx / 5xx / 网络错误 / 超时
-    全部降级为 status=error，不抛异常。响应整体过 apply_response_cap。
+    参数说明：
+    - help_type: sop / obj / dop / cop2 / chop / vop / lop / top / rop /
+      vex_function / python_hou（11 种）。
+    - item_name: 节点名 / VEX 函数名 / hou 方法名。
+    - timeout: HTTP 请求超时秒数（默认 10）。
+
+    返回 dict 含 title / summary / parameters / inputs / outputs / methods /
+    status；HTTP 4xx / 5xx / 网络错误 / 超时全部降级为 status=error，不抛
+    异常。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 15（help 链路
+    # 批次）；HTML 解析用 stdlib html.parser（零新增 pip 依赖）。
     return _houdini_call("get_houdini_help", {
         "help_type": help_type,
         "item_name": item_name,
@@ -4731,21 +4715,21 @@ def get_houdini_help(ctx, help_type, item_name, timeout: int = 10):
 # -------------------------------------------------------------------
 @mcp.tool()
 def verify_hou_api(ctx, item_name, help_type="python_hou", timeout: int = 10):
-    """AI-friendly wrapper over get_houdini_help（PR 18）。
+    """调 hou API 前先调本工具核对当前版本签名（遇报错 / 不认识的 API 时
+    同样先查）；AI-friendly wrapper，响应末尾附可直接使用的 _ai_hint。
 
     参数说明：
-    - item_name: 要查询的 hou API / 节点 / VEX 函数名，如
-      "ObjNode.setDisplayNode" 或 "Node.setInput"。
-    - help_type: 可选，帮助类型，默认 "python_hou"；其他支持值见
-      get_houdini_help（sop / obj / dop / cop2 / chop / vop / lop /
-      top / rop / vex_function）。
-    - timeout: 可选，HTTP 请求超时秒数，默认 10。
+    - item_name: hou API / 节点 / VEX 函数名，如 "ObjNode.setDisplayNode"、
+      "Node.setInput"。
+    - help_type: 可选，默认 "python_hou"；其余取值同 get_houdini_help。
+    - timeout: 可选，HTTP 超时秒数，默认 10。
 
-    返回 dict 包含 title / summary / parameters / inputs / outputs /
-    methods / status 等字段，并在响应末尾附 `_ai_hint` 字段，给 AI
-    一个可直接使用的简短提示（命中方法签名 / F-C pattern /
-    SideFX 不可达 fallback）。响应整体过 apply_response_cap。
+    返回 dict 含 title / summary / parameters / inputs / outputs / methods /
+    status / _ai_hint（命中方法签名 / F-C pattern / SideFX 不可达 fallback
+    提示）。
     """
+    # 实现备忘（feat-mcp-tool-guidance 搬家自 docstring）：PR 18（wrapper
+    # 批次）；底层 = get_houdini_help，跨工具说明见 README。
     return _houdini_call("verify_hou_api", {
         "item_name": item_name,
         "help_type": help_type,
@@ -5278,6 +5262,16 @@ def _install_capture_hook():
     manager.call_tool = _wrapped_call_tool
     manager._lessons_capture_installed = True
 
+
+# feat-mcp-tool-guidance §1.2：tool annotations 注册表后处理（全部注册
+# 完成后批量设置；幂等，失败仅 warning 不影响工具可用性）。
+try:
+    _annotated = _tann.apply_tool_annotations(mcp)
+    if _annotated:
+        logger.info("Tool annotations applied to %d tools", _annotated)
+except Exception as _annot_err:
+    logger.warning("Tool annotations 应用失败（不影响服务）: %s",
+                   _annot_err)
 
 _install_capture_hook()
 
