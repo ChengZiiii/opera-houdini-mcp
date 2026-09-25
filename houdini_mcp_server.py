@@ -106,6 +106,13 @@ try:
 except ImportError:
     import _lessons_search as _lessons_search  # type: ignore
 
+# MCP 命令 JSONL 审计（feat-mcp-console-log-audit §2）：旁挂 bridge 进程，
+# 不 import hou、不经 TCP；包装 ToolManager.call_tool 记录全部工具调用。
+try:
+    from . import _audit_log as _alog
+except ImportError:
+    import _audit_log as _alog  # type: ignore
+
 # OPUS RapidAPI 可选模块（refactor-opus-optional-and-debt-cleanup）。
 # 容错加载：package 与 flat 两种布局均尝试；加载失败时仅五个委托给
 # ``_opus`` 的 wrapper 返回 module unavailable，``opus_import_model_url``
@@ -4624,6 +4631,39 @@ def write_cache(ctx, node_path):
 
 
 # -------------------------------------------------------------------
+# Console 日志（feat-mcp-console-log-audit §1.3；放置在 PR 16 / PR 15 /
+# PR 18 / PR 7 section headers 之前，避免被这些无上界扫描的 AST probe 误捕）
+# -------------------------------------------------------------------
+@mcp.tool()
+def get_console_log(ctx, offset: int = 0, limit: int = 200, tail=None,
+                    last_seconds=None):
+    """只读分页读取 Houdini 进程 Python 层 console 输出环形缓冲。
+
+    与截图配合做问题取证。``last_seconds`` 时间窗过滤（最近 N 秒）优先
+    于 ``tail``（最近 N 行）；``offset``/``limit`` 分页。每行含 ts/ts_iso/
+    stream/text。覆盖边界：仅 Python 层输出（节点 PythonModule、
+    execute_code、server 自身日志）；C++ 层直写 console 的输出不在范围。
+    参数非法返回 error envelope。归 READ_ONLY_COMMANDS。
+    """
+    return _houdini_call("get_console_log", {
+        "offset": offset,
+        "limit": limit,
+        "tail": tail,
+        "last_seconds": last_seconds,
+    })
+
+
+@mcp.tool()
+def clear_console_log(ctx):
+    """清空 console 环形缓冲（内存态运行写，no-undo）。
+
+    返回 {status, cleared}——cleared 为清空前条数。清空后
+    get_console_log 返回空 lines 且 total==0。
+    """
+    return _houdini_call("clear_console_log", {})
+
+
+# -------------------------------------------------------------------
 # PR 16 Connection Diagnostic Tools (placed before PR 15 / PR 7 sections
 # so existing test_bridge_style (PR 7) and test_help PR 15 probes — which
 # scan @mcp.tool() strictly after their own header lines — do not pick it
@@ -5240,6 +5280,16 @@ def _install_capture_hook():
 
 
 _install_capture_hook()
+
+# feat-mcp-console-log-audit §2.3：MCP 命令 JSONL 审计（与 lessons capture
+# hook 同层链式共存；旁路失败不影响任何工具调用）。安装点必须在
+# ``_install_capture_hook()`` 之后，使审计在外层、lessons 捕获在内层，
+# duration_ms 覆盖完整调用链。
+try:
+    if _alog.install_audit_hook(mcp):
+        logger.info("MCP audit hook installed (dir=%s)", _alog.audit_dir())
+except Exception as _audit_err:
+    logger.warning("MCP audit hook 安装失败（不影响服务）: %s", _audit_err)
 
 
 def main():

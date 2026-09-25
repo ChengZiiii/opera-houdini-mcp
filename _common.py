@@ -1082,6 +1082,18 @@ def _run_code_sync(code, namespace):
             pass
     elapsed_ms = int((time.time() - start) * 1000)
 
+    # feat-mcp-console-log-audit：execute_code 执行期输出被本函数的
+    # redirect_stdout/stderr 接管、绕过 console tee——在这里把捕获文本
+    # 同步进环形缓冲（spec「execute_code 输出同步入缓冲」场景）。
+    # lazy import + 静默失败：_console_log 仅用标准库，但保持本模块
+    # 「模块头零包内依赖」的降级韧性。
+    try:
+        from . import _console_log as _clog
+        _clog.append_capture("stdout", stdout_capture.getvalue())
+        _clog.append_capture("stderr", stderr_capture.getvalue())
+    except Exception:
+        pass
+
     return {
         "stdout": stdout_capture.getvalue(),
         "stderr": stderr_capture.getvalue(),

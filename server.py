@@ -31,6 +31,7 @@ except ImportError:
 import io
 from contextlib import redirect_stdout, redirect_stderr
 from . import _common as cmn
+from . import _console_log as clog
 from . import _scene as scn
 from . import _error_nodes as en
 from . import _discovery as disc
@@ -961,6 +962,9 @@ class HoudiniMCPServer:
         # 参数 / HDA 引用 / error-warning 探测），**不**修改场景，归
         # READ_ONLY_COMMANDS（不进 undo group）。
         "capture_workflow_snapshot",
+        # feat-mcp-console-log-audit: console 环形缓冲只读查询，纯内存
+        # 切片无 hou 依赖，归 READ_ONLY_COMMANDS。
+        "get_console_log",
     })
 
     NO_UNDO_COMMANDS = frozenset({
@@ -972,6 +976,10 @@ class HoudiniMCPServer:
         "render_viewport_base64", "render_quad_views_base64",
         "render_specific_camera_base64",
         "get_pending_events", "subscribe_events", "unsubscribe_events",
+        # feat-mcp-console-log-audit: clear_console_log 清内存环形缓冲，
+        # 运行态写无 HIP 持久副作用，归 NO_UNDO_COMMANDS（与
+        # clear_cache 同类别——磁盘/运行态清理不可由 HIP undo 恢复）。
+        "clear_console_log",
         # PR 19: 运行态时间线写 — 帧和播放控制不产生可撤销场景编辑。
         # batch dispatcher 在 NO_UNDO 命令前关闭 undo segment，确保这些
         # 命令永远不在 hou.undos.group 中执行。
@@ -1102,6 +1110,17 @@ class HoudiniMCPServer:
                       + str(callback_error))
             print(f"HoudiniMCP server started on {self.host}:{self.port} "
                   f"(poll interval {interval}ms)")
+
+            # feat-mcp-console-log-audit：启动时安装 console tee（幂等；
+            # HOUDINI_MCP_CONSOLE_LOG=0 时跳过）。失败不影响 MCP 服务。
+            try:
+                wrapped_out, wrapped_err = clog.install_tee()
+                if wrapped_out or wrapped_err:
+                    print("HoudiniMCP console tee installed (stdout={0}, "
+                          "stderr={1})".format(wrapped_out, wrapped_err))
+            except Exception as tee_err:
+                print("HoudiniMCP console tee 安装失败（不影响服务）: "
+                      + str(tee_err))
 
             # Bug C（PR 21）：启动时清理 > 7 天的过期截图 / 渲染目录。
             # 不抛异常（启动失败不影响 MCP 服务本身）。
@@ -1400,6 +1419,8 @@ class HoudiniMCPServer:
         # MUTATING_COMMANDS / READ_ONLY_COMMANDS / NO_UNDO_COMMANDS。
         # 全部走 _animation 模块 + apply_response_cap）。
         "get_frame": self.get_frame,
+        "get_console_log": self.get_console_log,
+        "clear_console_log": self.clear_console_log,
         "set_frame": self.set_frame,
         "set_frame_range": self.set_frame_range,
         "set_playback_range": self.set_playback_range,
@@ -3960,6 +3981,75 @@ class HoudiniMCPServer:
     #   写，batch 中由 dispatcher 在 NO_UNDO 前关闭 undo segment，保证
     #   不进入 hou.undos.group。
     # -------------------------------------------------------------------------
+    def get_console_log(self, offset=0, limit=200, tail=None,
+                        last_seconds=None):
+        """feat-mcp-console-log-audit：只读分页读取 console 环形缓冲。
+
+        ``last_seconds`` 时间窗过滤优先于 ``tail`` 尾读（同给时时间窗
+        生效并在 ``filter_mode`` 说明）；``offset`` / ``limit`` 分页。
+        响应 envelope：{status, lines, offset, limit, total, filter_mode,
+        truncated}（cap 截断时另附 _truncated / _original_size），整体
+        过 ``apply_response_cap``。参数非法返回 error envelope 不抛异常。
+        归 READ_ONLY_COMMANDS。
+        """
+        try:
+            offset_i = int(offset)
+            limit_i = int(limit)
+            tail_i = int(tail) if tail is not None else None
+            ls_f = float(last_seconds) if last_seconds is not None else None
+        except (TypeError, ValueError):
+            return {
+                "status": "error",
+                "error": {
+                    "code": "invalid_arguments",
+                    "message": "offset/limit/tail/last_seconds 必须是数值",
+                },
+            }
+        if offset_i < 0 or limit_i < 0:
+            return {
+                "status": "error",
+                "error": {
+                    "code": "invalid_arguments",
+                    "message": "offset/limit/last_seconds 不得为负",
+                },
+            }
+        if (tail_i is not None and tail_i <= 0) or (
+                ls_f is not None and ls_f < 0):
+            return {
+                "status": "error",
+                "error": {
+                    "code": "invalid_arguments",
+                    "message": "tail 必须为正数；last_seconds 不得为负",
+                },
+            }
+        rows, total, mode = clog.query(
+            offset=offset_i, limit=limit_i, tail=tail_i, last_seconds=ls_f)
+        result = {
+            "status": "success",
+            "lines": rows,
+            "offset": offset_i,
+            "limit": limit_i,
+            "total": total,
+            "filter_mode": mode,
+        }
+        result = cmn.apply_response_cap(result)
+        if result.get("_truncated"):
+            result["truncated"] = True
+        else:
+            result["truncated"] = False
+        return result
+
+    def clear_console_log(self):
+        """feat-mcp-console-log-audit：清空 console 环形缓冲（NO_UNDO 运行态写）。
+
+        返回 {status, cleared}——cleared 为清空前的条数。清空后
+        get_console_log 返回空 lines 且 total==0。
+        """
+        return {
+            "status": "success",
+            "cleared": clog.clear(),
+        }
+
     def get_frame(self):
         """PR 19：读取当前帧 / 时间 / fps / 三组 range / increment，全部 float。
 

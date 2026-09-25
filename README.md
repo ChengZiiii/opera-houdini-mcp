@@ -19,22 +19,25 @@
 2. [Architecture](#architecture)
 3. [Embedding as a git submodule](#embedding-as-a-git-submodule)
 4. [Tier 1 工具清单](#tier-1-工具清单)
-5. [`execute_code` 安全模型](#execute_code-安全模型)
-6. [AI 调用 hou API 的硬约束](#ai-调用-hou-api-的硬约束)
-7. [Configuration](#configuration)
-8. [Upstream Sync Policy](#upstream-sync-policy)
-9. [Testing](#testing)
-10. [Troubleshooting](#troubleshooting)
-11. [Edge Cases & 集成陷阱](#edge-cases--集成陷阱)
-12. [Contributing](#contributing)
-13. [Security](#security)
-14. [License & Acknowledgement](#license--acknowledgement)
+5. [自进化知识库](#自进化知识库)
+6. [RAG 文档检索与版本化索引](#rag-文档检索与版本化索引)
+7. [Console 日志与命令审计](#console-日志与命令审计feat-mcp-console-log-audit)
+8. [`execute_code` 安全模型](#execute_code-安全模型)
+9. [AI 调用 hou API 的硬约束](#ai-调用-hou-api-的硬约束)
+10. [Configuration](#configuration)
+11. [Upstream Sync Policy](#upstream-sync-policy)
+12. [Testing](#testing)
+13. [Troubleshooting](#troubleshooting)
+14. [Edge Cases & 集成陷阱](#edge-cases--集成陷阱)
+15. [Contributing](#contributing)
+16. [Security](#security)
+17. [License & Acknowledgement](#license--acknowledgement)
 
 ---
 
 ## Features
 
-- **174 个已注册 MCP 工具**（perf-mcp-round3 §4.4 对账口径：`houdini_mcp_server.py` 中**活动**的 `@mcp.tool` 装饰器数，即 AI 工具 `tools/list` 可见数；另有 9 个工具的装饰器按 slim-mcp-toolset 计划注释停用——6 个 OPUS 资产 + 3 个 base64 渲染——不计入）
+- **176 个已注册 MCP 工具**（feat-mcp-console-log-audit 后口径：`houdini_mcp_server.py` 中**活动**的 `@mcp.tool` 装饰器数，即 AI 工具 `tools/list` 可见数（174 + `get_console_log` / `clear_console_log`）；另有 9 个工具的装饰器按 slim-mcp-toolset 计划注释停用——6 个 OPUS 资产 + 3 个 base64 渲染——不计入）
 - **13 个 Tier 1 工具** — 场景 CRUD / 节点发现 / 图编辑 / 错误扫描（含 warnings）/ 几何摘要 / 材质 / 截图 / 文档查询 / 缓存管理 / 诊断，独立模块化
 - **`execute_code` 三档安全 policy** — `read-only` / `normal` / `privileged` × dangerous / heavy / mutation 三类黑名单（正则 + AST 别名双检）
 - **双开关 bypass** — 任何 dangerous / heavy / privileged 操作都需「请求端参数 + 服务端 `HOUDINI_MCP_ALLOW_BYPASS=1`」同时开启
@@ -311,6 +314,45 @@ python scripts/build_rag_index.py --source "$HFS/houdini/help" --version-dir 21.
 
 ---
 
+## Console 日志与命令审计（feat-mcp-console-log-audit）
+
+两个旁路能力：AI 排障取证（console 日志）+「AI 让 Houdini 干了什么」的事后追溯（命令审计）。
+
+### Console 日志（server 侧）
+
+- `get_console_log`（READ_ONLY）：读 Houdini 进程内 Python 层 console 环形缓冲。
+  参数 `offset` / `limit`（分页）、`tail`（末尾 N 条）、`last_seconds`（时间窗，**优先于 tail**）。
+  envelope `{status, lines, offset, limit, total, filter_mode, truncated}` 过 `apply_response_cap`；
+  每行 `{ts, ts_iso, stream, text}`（stream 区分 stdout / stderr）。
+- `clear_console_log`（NO_UNDO）：清空缓冲，返回清空前条数。
+- **覆盖边界**：tee 只包装 Python 层 `sys.stdout` / `sys.stderr`（`print`、Python traceback、
+  `execute_code` 捕获输出自动同步入缓冲）；**不覆盖** Houdini 原生 C++ 层输出与独立 hython 进程输出。
+- 典型用法：AI 遇到报错时截图（视觉证据）+ `get_console_log(last_seconds=120)`（文本证据）联合定位。
+- 关闭开关：`HOUDINI_MCP_CONSOLE_LOG=0` 时启动完全跳过 tee 安装（缓冲恒空，两工具仍可调但无数据）。
+
+### 命令审计（bridge 侧 JSONL）
+
+- bridge 进程内**每次 MCP 工具调用**（全部工具，含 bridge-local 与只读查询）在结束时
+  append 一行 JSON 到 `$TEMP/houdini_mcp/audit/audit-<yyyymmdd>-<seq>.jsonl`；
+  字段：`ts`（ISO8601 毫秒）/ `session_id`（bridge 进程 UUID4）/ `tool` / `ok`（响应
+  `status == "success"` 判定；str 响应按成功记）/ `duration_ms` / `args`（≤256 截断），
+  失败附 `error_code` / `error_message`。
+- 分段与保留：空闲超 15 分钟开新段（seq 续接当日最大，重启不覆盖）；保留上限 30 段，超限删最旧。
+- 旁路语义：落盘失败（磁盘满 / 权限）仅进程内 warning，绝不影响工具调用；审计内容不注入任何响应。
+- **隐私边界**：`args` 摘要可能含用户本机路径，本机单用户信任边界内不脱敏；文件仅供人工与离线分析。
+- **v1 只记录不重放**：不提供任何重放/回放工具（读回、重执行历史命令）；重放为未来扩展，引入时另立 change。
+
+### env
+
+| 环境变量 | 默认 | 作用 |
+|----------|------|------|
+| `HOUDINI_MCP_CONSOLE_LOG_LINES` | `4000` | console 环形缓冲行数 |
+| `HOUDINI_MCP_AUDIT_DIR` | `$TEMP/houdini_mcp/audit` | 审计目录覆盖 |
+| `HOUDINI_MCP_AUDIT_KEEP` | `30` | 审计保留段数 |
+| `HOUDINI_MCP_AUDIT_SEGMENT_MIN` | `15` | 审计分段间隔（分钟） |
+
+---
+
 ## `execute_code` 安全模型
 
 | Policy | mutation | dangerous | heavy_geometry | import hou | 默认 bypass |
@@ -365,6 +407,11 @@ python scripts/build_rag_index.py --source "$HFS/houdini/help" --version-dir 21.
 | `HOUDINI_MCP_LOCAL_HELP_COOLDOWN` | `60` | 本地失败后 cooldown 窗口（秒，clamp `[0.0, 600.0]`） | `get_houdini_help` / `verify_hou_api` |
 | `HOUDINI_MCP_LOCAL_HELP_DISABLE` | 未设 | `1` / `true` / `yes` / `on` 时完全禁用 local-first，退化到"仅在线" | `get_houdini_help` / `verify_hou_api` |
 | `HOUDINI_MCP_RAG_INDEX_DIR` | bridge 路由时自动设为 `~/.opera-houdini-mcp/rag/<ver>/` | RAG 索引目录覆盖；bridge 首次 RAG 调用时查 Houdini 版本自动指向版本目录（versioned-rag-index）；手工预设则整体跳过路由。未设且路由失败时解析序 home 目录（存在即用）→ 旧 fork 模块目录（兼容）。索引由 `scripts/build_rag_index.py` 生成（默认自动构建，手动命令见「RAG 文档检索与版本化索引」章节） | `search_docs` / `get_doc` |
+| `HOUDINI_MCP_CONSOLE_LOG` | 未设（开） | `0` 时 Houdini server 启动完全跳过 console tee 安装（`get_console_log` 恒空） | `get_console_log` / `clear_console_log` |
+| `HOUDINI_MCP_CONSOLE_LOG_LINES` | `4000` | console 环形缓冲行数 | `get_console_log` |
+| `HOUDINI_MCP_AUDIT_DIR` | `$TEMP/houdini_mcp/audit` | 审计 JSONL 目录覆盖 | 全部工具（bridge 审计） |
+| `HOUDINI_MCP_AUDIT_KEEP` | `30` | 审计保留段数 | 全部工具（bridge 审计） |
+| `HOUDINI_MCP_AUDIT_SEGMENT_MIN` | `15` | 审计分段间隔（分钟） | 全部工具（bridge 审计） |
 | `RAPIDAPI_KEY` | 未设 | OPUS 资产库 API key | `_opus.py` |
 | `RAPIDAPI_HOST` | `opus5.p.rapidapi.com` | OPUS API host | `_opus.py` |
 | `RAPIDAPI_HOST_URL` | `https://opus5.p.rapidapi.com/` | OPUS API base URL | `_opus.py` |
@@ -427,7 +474,7 @@ RAPIDAPI_KEY=<your-key>
 ## Testing
 
 ```bash
-# 全量回归（推荐入口；2026-09-22 口径：70 个测试文件 / 2230 passed / 0 failed）
+# 全量回归（推荐入口；2026-09-26 口径：72 个测试文件 / 2273 passed / 0 failed）
 cd external/houdinimcp
 pytest tests/
 
